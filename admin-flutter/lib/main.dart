@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'api_client.dart';
 
@@ -787,6 +788,7 @@ enum _Section {
   incidents,
   notifications,
   projects,
+  agents,
 }
 
 class _DashboardShell extends StatefulWidget {
@@ -810,6 +812,7 @@ class _DashboardShellState extends State<_DashboardShell> {
   List<Map<String, dynamic>> _resources = [];
   List<Map<String, dynamic>> _monitors = [];
   List<Map<String, dynamic>> _incidents = [];
+  List<Map<String, dynamic>> _agents = [];
   bool _loading = true;
   String? _loadError;
 
@@ -830,12 +833,14 @@ class _DashboardShellState extends State<_DashboardShell> {
         widget.api.resources(),
         widget.api.monitors(),
         widget.api.incidents(),
+        widget.api.agents(),
       ]);
       setState(() {
         _projects = values[0];
         _resources = values[1];
         _monitors = values[2];
         _incidents = values[3];
+        _agents = values[4];
       });
     } catch (error) {
       setState(
@@ -1021,6 +1026,123 @@ class _DashboardShellState extends State<_DashboardShell> {
     }
   }
 
+  Future<void> _showResourceMetrics(Map<String, dynamic> resource) async {
+    try {
+      final result = await widget.api.resourceMetrics(resource['id'] as String);
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        builder: (_) => _MetricsDialog(resource: resource, result: result),
+      );
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _createAgentEnrollment() async {
+    if (widget.user['role'] != 'ADMIN') {
+      _notice('只有管理员可以签发 Agent 注册令牌', isError: true);
+      return;
+    }
+    final hosts = _resources
+        .where((resource) => resource['type'] == 'HOST')
+        .toList();
+    if (hosts.isEmpty) {
+      _notice('请先添加一个主机类型资源', isError: true);
+      return;
+    }
+    final resourceId = await showDialog<String>(
+      context: context,
+      builder: (_) => _AgentResourceDialog(resources: hosts),
+    );
+    if (resourceId == null) return;
+    try {
+      final enrollment = await widget.api.createAgentEnrollment(resourceId);
+      if (!mounted) return;
+      final token = enrollment['token'] as String;
+      showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('一次性 Agent 注册令牌'),
+          content: SizedBox(
+            width: 480,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '令牌仅显示这一次，15 分钟后过期。请通过安全方式传到目标主机。',
+                  style: TextStyle(fontSize: 12, height: 1.5),
+                ),
+                const SizedBox(height: 12),
+                SelectableText(
+                  token,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '绑定资源：${hosts.firstWhere((item) => item['id'] == resourceId)['name']}',
+                  style: const TextStyle(color: _muted, fontSize: 11),
+                ),
+                Text(
+                  '过期时间：${_dateTime(enrollment['expiresAt'] as String?)}',
+                  style: const TextStyle(color: _muted, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton.icon(
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: token));
+                if (dialogContext.mounted) {
+                  Navigator.pop(dialogContext);
+                  _notice('注册令牌已复制，请安全保存');
+                }
+              },
+              icon: const Icon(Icons.copy_rounded, size: 17),
+              label: const Text('复制并关闭'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('关闭'),
+            ),
+          ],
+        ),
+      );
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _revokeAgent(Map<String, dynamic> agent) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('吊销 Agent 凭据？'),
+        content: Text('“${agent['hostname']}”将无法继续拉取配置或提交指标。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('吊销'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.api.revokeAgent(agent['id'] as String);
+      await _reload();
+      if (mounted) _notice('Agent 凭据已吊销');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
   void _notice(String message, {bool isError = false}) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -1092,6 +1214,7 @@ class _DashboardShellState extends State<_DashboardShell> {
         loading: _loading,
         onCreate: _createResource,
         onDelete: _deleteResource,
+        onMetrics: _showResourceMetrics,
       ),
       _Section.monitors => _MonitorsPage(
         monitors: _monitors,
@@ -1119,6 +1242,13 @@ class _DashboardShellState extends State<_DashboardShell> {
       _Section.projects => _ProjectsPage(
         projects: _projects,
         onCreate: _createProject,
+      ),
+      _Section.agents => _AgentsPage(
+        agents: _agents,
+        loading: _loading,
+        isAdmin: widget.user['role'] == 'ADMIN',
+        onCreateEnrollment: _createAgentEnrollment,
+        onRevoke: _revokeAgent,
       ),
     };
   }
@@ -1209,6 +1339,12 @@ class _SideNavigation extends StatelessWidget {
           label: '项目管理',
           selected: section == _Section.projects,
           onTap: () => onSelect(_Section.projects),
+        ),
+        _NavItem(
+          icon: Icons.memory_outlined,
+          label: 'Agent 节点',
+          selected: section == _Section.agents,
+          onTap: () => onSelect(_Section.agents),
         ),
         const Spacer(),
         Container(
@@ -1394,6 +1530,7 @@ class _BottomNavigation extends StatelessWidget {
   @override
   Widget build(BuildContext context) => NavigationBar(
     selectedIndex: section.index,
+    labelBehavior: NavigationDestinationLabelBehavior.onlyShowSelected,
     onDestinationSelected: (index) => onSelect(_Section.values[index]),
     destinations: const [
       NavigationDestination(
@@ -1414,6 +1551,7 @@ class _BottomNavigation extends StatelessWidget {
         label: '通知',
       ),
       NavigationDestination(icon: Icon(Icons.folder_outlined), label: '项目'),
+      NavigationDestination(icon: Icon(Icons.memory_outlined), label: 'Agent'),
     ],
   );
 }
@@ -1930,6 +2068,7 @@ class _ResourcesPage extends StatelessWidget {
     required this.loading,
     required this.onCreate,
     required this.onDelete,
+    required this.onMetrics,
   });
 
   final List<Map<String, dynamic>> resources;
@@ -1937,6 +2076,7 @@ class _ResourcesPage extends StatelessWidget {
   final bool loading;
   final VoidCallback onCreate;
   final ValueChanged<Map<String, dynamic>> onDelete;
+  final ValueChanged<Map<String, dynamic>> onMetrics;
 
   @override
   Widget build(BuildContext context) => _PageScroll(
@@ -2051,14 +2191,29 @@ class _ResourcesPage extends StatelessWidget {
                                   ),
                                 ),
                                 DataCell(
-                                  IconButton(
-                                    tooltip: '移除资源',
-                                    onPressed: () => onDelete(resource),
-                                    icon: const Icon(
-                                      Icons.delete_outline_rounded,
-                                      color: _muted,
-                                      size: 18,
-                                    ),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (resource['type'] == 'HOST')
+                                        IconButton(
+                                          tooltip: '查看主机指标曲线',
+                                          onPressed: () => onMetrics(resource),
+                                          icon: const Icon(
+                                            Icons.show_chart_rounded,
+                                            color: _blue,
+                                            size: 18,
+                                          ),
+                                        ),
+                                      IconButton(
+                                        tooltip: '移除资源',
+                                        onPressed: () => onDelete(resource),
+                                        icon: const Icon(
+                                          Icons.delete_outline_rounded,
+                                          color: _muted,
+                                          size: 18,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ],
@@ -2075,6 +2230,479 @@ class _ResourcesPage extends StatelessWidget {
     ),
   );
 }
+
+class _AgentsPage extends StatelessWidget {
+  const _AgentsPage({
+    required this.agents,
+    required this.loading,
+    required this.isAdmin,
+    required this.onCreateEnrollment,
+    required this.onRevoke,
+  });
+
+  final List<Map<String, dynamic>> agents;
+  final bool loading;
+  final bool isAdmin;
+  final VoidCallback onCreateEnrollment;
+  final ValueChanged<Map<String, dynamic>> onRevoke;
+
+  @override
+  Widget build(BuildContext context) => _PageScroll(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _PageHeading(
+          eyebrow: 'LINUX AGENTS',
+          title: 'Agent 节点',
+          subtitle: '查看节点在线状态、配置版本并单独吊销节点凭据。',
+          actions: [
+            if (isAdmin)
+              FilledButton.icon(
+                onPressed: onCreateEnrollment,
+                icon: const Icon(Icons.add_rounded),
+                label: const Text('注册主机 Agent'),
+              ),
+          ],
+        ),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 12, 18, 16),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        '已注册节点',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      '${agents.length} 个',
+                      style: const TextStyle(color: _muted, fontSize: 11),
+                    ),
+                  ],
+                ),
+                const Divider(height: 20),
+                if (loading && agents.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(34),
+                    child: CircularProgressIndicator(),
+                  )
+                else if (agents.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 34),
+                    child: _EmptyState(
+                      icon: Icons.memory_outlined,
+                      title: '还没有 Agent 节点',
+                      subtitle: '为主机资源签发一次性注册令牌，然后在 Linux 主机运行采集器。',
+                    ),
+                  )
+                else
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: DataTable(
+                      columnSpacing: 22,
+                      headingRowHeight: 42,
+                      dataRowMinHeight: 58,
+                      dataRowMaxHeight: 66,
+                      columns: const [
+                        DataColumn(label: Text('主机资源')),
+                        DataColumn(label: Text('节点')),
+                        DataColumn(label: Text('操作系统')),
+                        DataColumn(label: Text('版本')),
+                        DataColumn(label: Text('状态')),
+                        DataColumn(label: Text('最后上报')),
+                        DataColumn(label: Text('')),
+                      ],
+                      rows: agents.map((agent) {
+                        final status = agent['status'] as String? ?? 'OFFLINE';
+                        return DataRow(
+                          cells: [
+                            DataCell(
+                              Text(
+                                agent['resourceName'] as String? ?? '主机',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            DataCell(
+                              Text(
+                                agent['hostname'] as String? ?? '',
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                            ),
+                            DataCell(
+                              Text(
+                                agent['operatingSystem'] as String? ?? '',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: _muted,
+                                ),
+                              ),
+                            ),
+                            DataCell(
+                              Text(
+                                agent['agentVersion'] as String? ?? '',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: _muted,
+                                ),
+                              ),
+                            ),
+                            DataCell(_AgentStatusTag(status: status)),
+                            DataCell(
+                              Text(
+                                _dateTime(agent['lastSeenAt'] as String?),
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  color: _muted,
+                                ),
+                              ),
+                            ),
+                            DataCell(
+                              isAdmin && status != 'REVOKED'
+                                  ? IconButton(
+                                      tooltip: '吊销凭据',
+                                      onPressed: () => onRevoke(agent),
+                                      icon: const Icon(
+                                        Icons.key_off_outlined,
+                                        size: 18,
+                                        color: _muted,
+                                      ),
+                                    )
+                                  : const SizedBox(width: 32),
+                            ),
+                          ],
+                        );
+                      }).toList(),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class _AgentStatusTag extends StatelessWidget {
+  const _AgentStatusTag({required this.status});
+  final String status;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = switch (status) {
+      'ONLINE' => const Color(0xFF2C8B66),
+      'REVOKED' => const Color(0xFF963F38),
+      _ => const Color(0xFF7B8794),
+    };
+    final label = switch (status) {
+      'ONLINE' => '在线',
+      'REVOKED' => '已吊销',
+      _ => '离线',
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color,
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
+class _AgentResourceDialog extends StatefulWidget {
+  const _AgentResourceDialog({required this.resources});
+  final List<Map<String, dynamic>> resources;
+
+  @override
+  State<_AgentResourceDialog> createState() => _AgentResourceDialogState();
+}
+
+class _AgentResourceDialogState extends State<_AgentResourceDialog> {
+  late String _resourceId = widget.resources.first['id'] as String;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('签发 Agent 注册令牌'),
+    content: SizedBox(
+      width: 440,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '选择要绑定的主机资源。令牌一次有效，15 分钟后过期。',
+            style: TextStyle(fontSize: 12, height: 1.5),
+          ),
+          const SizedBox(height: 14),
+          DropdownButtonFormField<String>(
+            initialValue: _resourceId,
+            decoration: const InputDecoration(labelText: '主机资源'),
+            items: widget.resources
+                .map(
+                  (resource) => DropdownMenuItem(
+                    value: resource['id'] as String,
+                    child: Text(
+                      '${resource['name']} · ${resource['projectName']}',
+                    ),
+                  ),
+                )
+                .toList(),
+            onChanged: (value) {
+              if (value != null) setState(() => _resourceId = value);
+            },
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(
+        onPressed: () => Navigator.pop(context, _resourceId),
+        child: const Text('签发令牌'),
+      ),
+    ],
+  );
+}
+
+class _MetricsDialog extends StatelessWidget {
+  const _MetricsDialog({required this.resource, required this.result});
+  final Map<String, dynamic> resource;
+  final Map<String, dynamic> result;
+
+  @override
+  Widget build(BuildContext context) {
+    final rawSeries = result['series'] as List? ?? const [];
+    final series = rawSeries
+        .map((value) => Map<String, dynamic>.from(value as Map))
+        .toList();
+    final stepSeconds = result['stepSeconds'] as int? ?? 60;
+    return AlertDialog(
+      title: Text('${resource['name']} · 主机指标'),
+      content: SizedBox(
+        width: 760,
+        height: 540,
+        child: series.isEmpty
+            ? const _EmptyState(
+                icon: Icons.show_chart_rounded,
+                title: '当前时间范围没有可信指标',
+                subtitle: 'Agent 开始上报后，主机趋势会显示在这里。',
+              )
+            : ListView.separated(
+                itemCount: series.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 10),
+                itemBuilder: (context, index) {
+                  final item = series[index];
+                  final labels = Map<String, dynamic>.from(
+                    item['labels'] as Map? ?? const {},
+                  );
+                  final points = (item['points'] as List? ?? const [])
+                      .map((point) => Map<String, dynamic>.from(point as Map))
+                      .toList();
+                  return _MetricChartCard(
+                    metricName: item['metricName'] as String? ?? '',
+                    labels: labels,
+                    points: points,
+                    stepSeconds: stepSeconds,
+                  );
+                },
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('关闭'),
+        ),
+      ],
+    );
+  }
+}
+
+class _MetricChartCard extends StatelessWidget {
+  const _MetricChartCard({
+    required this.metricName,
+    required this.labels,
+    required this.points,
+    required this.stepSeconds,
+  });
+  final String metricName;
+  final Map<String, dynamic> labels;
+  final List<Map<String, dynamic>> points;
+  final int stepSeconds;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = labels.entries
+        .map((entry) => '${entry.key}: ${entry.value}')
+        .join(' · ');
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 11, 14, 9),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _metricName(metricName),
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                if (label.isNotEmpty)
+                  Text(
+                    label,
+                    style: const TextStyle(fontSize: 10, color: _muted),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 140,
+              child: CustomPaint(
+                painter: _MetricChartPainter(
+                  points: points,
+                  stepSeconds: stepSeconds,
+                ),
+                child: const SizedBox.expand(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MetricChartPainter extends CustomPainter {
+  _MetricChartPainter({required this.points, required this.stepSeconds});
+  final List<Map<String, dynamic>> points;
+  final int stepSeconds;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const left = 8.0;
+    const right = 8.0;
+    const top = 8.0;
+    const bottom = 8.0;
+    final chart = Rect.fromLTRB(
+      left,
+      top,
+      size.width - right,
+      size.height - bottom,
+    );
+    final gridPaint = Paint()
+      ..color = const Color(0xFFE8EDF2)
+      ..strokeWidth = 1;
+    for (var index = 0; index <= 3; index++) {
+      final y = chart.top + chart.height * index / 3;
+      canvas.drawLine(Offset(chart.left, y), Offset(chart.right, y), gridPaint);
+    }
+    final parsed = <(DateTime, double)>[];
+    for (final point in points) {
+      final time = DateTime.tryParse(point['bucketAt'] as String? ?? '');
+      final value = (point['average'] as num?)?.toDouble();
+      if (time != null && value != null && value.isFinite) {
+        parsed.add((time, value));
+      }
+    }
+    if (parsed.isEmpty) {
+      return;
+    }
+    final start = parsed.first.$1;
+    final end = parsed.last.$1;
+    var minValue = parsed
+        .map((value) => value.$2)
+        .reduce((a, b) => a < b ? a : b);
+    var maxValue = parsed
+        .map((value) => value.$2)
+        .reduce((a, b) => a > b ? a : b);
+    if (minValue == maxValue) {
+      minValue -= 1;
+      maxValue += 1;
+    }
+    final span = maxValue - minValue;
+    final duration = end.difference(start).inMilliseconds;
+    Offset position((DateTime, double) item) {
+      final x = duration <= 0
+          ? chart.center.dx
+          : chart.left +
+                chart.width *
+                    item.$1.difference(start).inMilliseconds /
+                    duration;
+      final y = chart.bottom - chart.height * (item.$2 - minValue) / span;
+      return Offset(x, y);
+    }
+
+    final linePaint = Paint()
+      ..color = _blue
+      ..strokeWidth = 2.2
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final pointPaint = Paint()
+      ..color = _blue
+      ..style = PaintingStyle.fill;
+    var path = Path();
+    var priorTime = parsed.first.$1;
+    var hasSegment = false;
+    for (var index = 0; index < parsed.length; index++) {
+      final item = parsed[index];
+      final current = position(item);
+      final gap = item.$1.difference(priorTime).inSeconds;
+      if (index == 0 || gap > stepSeconds * 1.5) {
+        if (hasSegment) canvas.drawPath(path, linePaint);
+        path = Path()..moveTo(current.dx, current.dy);
+        hasSegment = false;
+      } else {
+        path.lineTo(current.dx, current.dy);
+        hasSegment = true;
+      }
+      canvas.drawCircle(current, 2.4, pointPaint);
+      priorTime = item.$1;
+    }
+    if (hasSegment) canvas.drawPath(path, linePaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _MetricChartPainter oldDelegate) =>
+      oldDelegate.points != points || oldDelegate.stepSeconds != stepSeconds;
+}
+
+String _metricName(String value) => switch (value) {
+  'cpu_usage_percent' => 'CPU 使用率（%）',
+  'load_1m' => '系统负载（1 分钟）',
+  'memory_used_percent' => '内存使用率（%）',
+  'memory_available_bytes' => '可用内存（字节）',
+  'swap_used_percent' => 'Swap 使用率（%）',
+  'disk_used_percent' => '磁盘使用率（%）',
+  'disk_inode_used_percent' => 'inode 使用率（%）',
+  'network_receive_bytes_per_second' => '网络接收（字节/秒）',
+  'network_transmit_bytes_per_second' => '网络发送（字节/秒）',
+  _ => value,
+};
 
 class _ProjectsPage extends StatelessWidget {
   const _ProjectsPage({required this.projects, required this.onCreate});

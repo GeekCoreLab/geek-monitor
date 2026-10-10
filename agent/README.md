@@ -1,0 +1,76 @@
+# Geek Monitor Linux Agent
+
+The Agent is a small Linux-only Go program that collects CPU usage, load, memory, swap, disk space/inodes, and network throughput. It uses only the Go standard library and makes outbound requests to Geek Monitor; the center never connects back to the host.
+
+## Build
+
+Use Go 1.24 or newer:
+
+```sh
+cd agent
+go build -trimpath -o geek-monitor-agent ./...
+```
+
+The collector reads Linux `/proc` data and filesystem statistics. It needs no root privileges for these metrics.
+
+## Enroll a host
+
+1. In the admin console, add a resource with type **HOST**, open **Agent 节点**, and issue a registration token for that resource. The token expires in 15 minutes and can be used once.
+2. Install the binary and create a service account and private state directory:
+
+   ```sh
+   sudo install -m 0755 geek-monitor-agent /usr/local/bin/geek-monitor-agent
+   sudo useradd --system --home-dir /var/lib/geek-monitor --create-home --shell /usr/bin/nologin geek-monitor
+   sudo install -d -o geek-monitor -g geek-monitor -m 0700 /etc/geek-monitor
+   sudo install -o geek-monitor -g geek-monitor -m 0600 enrollment.token /etc/geek-monitor/enrollment.token
+   ```
+
+3. Start the Agent once. Replace the URL with the center's HTTPS URL. HTTP is accepted only for localhost development.
+
+   ```sh
+   sudo -u geek-monitor /usr/local/bin/geek-monitor-agent \
+     -server https://monitor.example.com \
+     -config /var/lib/geek-monitor/agent.json \
+     -enrollment-token-file /etc/geek-monitor/enrollment.token
+   ```
+
+   After the console shows the node online, stop the foreground process and remove the consumed token file. The Agent stores its long-lived credential in `agent.json` with mode `0600` inside a directory restricted to mode `0700`.
+
+## systemd
+
+After the first enrollment and token removal, use this unit as `/etc/systemd/system/geek-monitor-agent.service`:
+
+```ini
+[Unit]
+Description=Geek Monitor Linux Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=geek-monitor
+Group=geek-monitor
+StateDirectory=geek-monitor
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/geek-monitor-agent -server https://monitor.example.com -config /var/lib/geek-monitor/agent.json
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/geek-monitor
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable it with `sudo systemctl daemon-reload && sudo systemctl enable --now geek-monitor-agent`. Re-enrollment is required after an administrator revokes the node credential.
+
+## Collection and delivery behavior
+
+- The Agent polls its collection configuration and samples immediately on startup, then follows the server interval (30 seconds by default).
+- CPU and network rates need a previous counter sample, so their first sample is omitted.
+- Failed uploads are stored in a local JSONL queue, capped at 64 MiB and seven days. Once over the cap, the oldest batches are dropped. The Agent retries queued batches in order, at most one batch per collection interval.
+- Every batch carries a boot ID, sequence, sample time, config version, and the last client clock offset measured against server time. The API is idempotent for repeated batches; an unsynced Agent or a reported clock offset beyond five minutes is untrusted. Delayed samples from a synced host remain available in history, while samples older than 30 days are rejected.
+- The API currently stores and graphs trusted host metrics. Database collectors, heartbeat jobs, metric threshold evaluation, and Agent-loss incidents remain planned work.

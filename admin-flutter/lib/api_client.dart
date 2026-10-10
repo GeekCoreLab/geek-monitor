@@ -125,6 +125,28 @@ class ApiClient {
     await _send('DELETE', '/api/v1/resources/${Uri.encodeComponent(id)}');
   }
 
+  Future<Map<String, dynamic>> resourceMetrics(String id) async =>
+      (await _send(
+            'GET',
+            '/api/v1/resources/${Uri.encodeComponent(id)}/metrics',
+          ))
+          as Map<String, dynamic>;
+
+  Future<List<Map<String, dynamic>>> agents() async =>
+      _asMapList(await _send('GET', '/api/v1/agents'));
+
+  Future<Map<String, dynamic>> createAgentEnrollment(String resourceId) async =>
+      (await _send(
+            'POST',
+            '/api/v1/agent-enrollments',
+            body: {'resourceId': resourceId},
+          ))
+          as Map<String, dynamic>;
+
+  Future<void> revokeAgent(String id) async {
+    await _send('POST', '/api/v1/agents/${Uri.encodeComponent(id)}/revoke');
+  }
+
   Future<List<Map<String, dynamic>>> monitors({String? resourceId}) async {
     final query = resourceId == null
         ? ''
