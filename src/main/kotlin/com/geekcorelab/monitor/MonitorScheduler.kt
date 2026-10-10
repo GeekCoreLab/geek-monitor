@@ -125,10 +125,13 @@ class MonitorScheduler {
         dataSource.connection.use { connection ->
             connection.autoCommit = false
             try {
+                val processedAt = connection.prepareStatement("SELECT now()").use { statement ->
+                    statement.executeQuery().use { rows -> rows.next(); rows.getTimestamp(1).toInstant() }
+                }
                 connection.prepareStatement(
                     "UPDATE check_execution SET finished_at = ?, result_status = ?, error_code = ?, error_summary = ?, duration_ms = ?, http_status = ? WHERE id = ?",
                 ).use { statement ->
-                    statement.setObject(1, java.sql.Timestamp.from(Instant.parse(result.checkedAt)))
+                    statement.setObject(1, java.sql.Timestamp.from(processedAt))
                     statement.setString(2, result.status)
                     statement.setString(3, result.errorCode)
                     statement.setString(4, result.summary)
@@ -139,7 +142,7 @@ class MonitorScheduler {
                 }
 
                 val monitor = connection.prepareStatement(
-                    "SELECT current_state, consecutive_failures, consecutive_successes, failure_threshold, recovery_threshold, critical, deleted_at FROM monitor WHERE id = ? FOR UPDATE",
+                    "SELECT current_state, consecutive_failures, consecutive_successes, failure_threshold, recovery_threshold, critical, deleted_at, last_result_at FROM monitor WHERE id = ? FOR UPDATE",
                 ).use { statement ->
                     statement.setObject(1, task.id)
                     statement.executeQuery().use { rows ->
@@ -151,19 +154,56 @@ class MonitorScheduler {
                             rows.getInt("recovery_threshold"),
                             rows.getBoolean("critical"),
                             rows.getTimestamp("deleted_at") != null,
+                            rows.getTimestamp("last_result_at")?.toInstant(),
                         ) else null
                     }
                 } ?: run {
                     connection.commit()
                     return
                 }
+                val maintenanceBoundaryCrossed = monitor.lastResultAt?.let { lastResultAt ->
+                    connection.prepareStatement(
+                        """SELECT EXISTS (
+                            WITH windows AS (
+                                SELECT w.id, w.starts_at, LEAST(COALESCE(w.canceled_at, w.ends_at), w.ends_at) AS effective_end
+                                FROM maintenance_window w JOIN monitored_resource r ON r.project_id = w.project_id
+                                WHERE r.id = ? AND (w.resource_id IS NULL OR w.resource_id = r.id)
+                            ), boundaries AS (
+                                SELECT id, starts_at AS boundary_at, 'START' AS boundary_type FROM windows
+                                    WHERE starts_at > ? AND starts_at <= ? AND starts_at < effective_end
+                                UNION ALL
+                                SELECT id, effective_end AS boundary_at, 'END' AS boundary_type FROM windows
+                                    WHERE effective_end > ? AND effective_end <= ? AND starts_at < effective_end
+                            )
+                            SELECT 1 FROM boundaries b WHERE
+                                (b.boundary_type = 'START' AND NOT EXISTS (
+                                    SELECT 1 FROM windows other WHERE other.id <> b.id
+                                        AND other.starts_at < b.boundary_at AND other.effective_end >= b.boundary_at
+                                )) OR
+                                (b.boundary_type = 'END' AND NOT EXISTS (
+                                    SELECT 1 FROM windows other WHERE other.id <> b.id
+                                        AND other.starts_at <= b.boundary_at AND other.effective_end > b.boundary_at
+                                ))
+                        )""",
+                    ).use { statement ->
+                        statement.setObject(1, task.resourceId)
+                        statement.setTimestamp(2, java.sql.Timestamp.from(lastResultAt))
+                        statement.setTimestamp(3, java.sql.Timestamp.from(processedAt))
+                        statement.setTimestamp(4, java.sql.Timestamp.from(lastResultAt))
+                        statement.setTimestamp(5, java.sql.Timestamp.from(processedAt))
+                        statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) }
+                    }
+                } ?: false
+                val maintenanceActive = isMaintenanceActive(connection, task.resourceId, processedAt)
+                val previousFailures = if (maintenanceBoundaryCrossed) 0 else monitor.consecutiveFailures
+                val previousSuccesses = if (maintenanceBoundaryCrossed) 0 else monitor.consecutiveSuccesses
                 val success = result.status == "UP"
                 val failure = result.status == "DOWN"
                 val failures = when {
                     success || !failure -> 0
-                    else -> monitor.consecutiveFailures + 1
+                    else -> previousFailures + 1
                 }
-                val successes = if (success) monitor.consecutiveSuccesses + 1 else 0
+                val successes = if (success) previousSuccesses + 1 else 0
                 val nextState = when {
                     result.status == "UNKNOWN" && monitor.currentState == "DOWN" -> "DOWN"
                     result.status == "UNKNOWN" -> "UNKNOWN"
@@ -173,26 +213,33 @@ class MonitorScheduler {
                     else -> monitor.currentState
                 }
                 connection.prepareStatement(
-                    "UPDATE monitor SET current_state = ?, consecutive_failures = ?, consecutive_successes = ?, last_result_at = now(), updated_at = now() WHERE id = ?",
+                    "UPDATE monitor SET current_state = ?, consecutive_failures = ?, consecutive_successes = ?, last_result_at = ?, updated_at = now() WHERE id = ?",
                 ).use { statement ->
                     statement.setString(1, nextState)
                     statement.setInt(2, failures)
                     statement.setInt(3, successes)
-                    statement.setObject(4, task.id)
+                    statement.setTimestamp(4, java.sql.Timestamp.from(processedAt))
+                    statement.setObject(5, task.id)
                     statement.executeUpdate()
                 }
 
-                if (!monitor.deleted && monitor.currentState != nextState) {
-                    when (nextState) {
-                        "DOWN" -> openIncident(connection, task, result)
-                        "UP" -> resolveIncident(connection, task)
-                    }
-                } else if (!monitor.deleted && nextState == "DOWN" && failure) {
-                    connection.prepareStatement(
-                        "UPDATE incident SET occurrence_count = occurrence_count + 1 WHERE monitor_id = ? AND status IN ('OPEN', 'ACKNOWLEDGED')",
+                if (!monitor.deleted && nextState == "UP" && monitor.currentState != "UP") {
+                    resolveIncident(connection, task)
+                }
+                if (!monitor.deleted && nextState == "DOWN" && failure) {
+                    val activeIncident = connection.prepareStatement(
+                        "SELECT id FROM incident WHERE monitor_id = ? AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
                     ).use { statement ->
                         statement.setObject(1, task.id)
-                        statement.executeUpdate()
+                        statement.executeQuery().use { rows -> if (rows.next()) rows.getObject("id", UUID::class.java) else null }
+                    }
+                    if (activeIncident != null) {
+                        connection.prepareStatement("UPDATE incident SET occurrence_count = occurrence_count + 1 WHERE id = ?").use { statement ->
+                            statement.setObject(1, activeIncident)
+                            statement.executeUpdate()
+                        }
+                    } else if (!maintenanceActive && failures >= monitor.failureThreshold) {
+                        openIncident(connection, task, result)
                     }
                 }
 
@@ -204,6 +251,20 @@ class MonitorScheduler {
             }
         }
     }
+
+    private fun isMaintenanceActive(connection: Connection, resourceId: UUID, at: Instant): Boolean =
+        connection.prepareStatement(
+            """SELECT EXISTS (
+                SELECT 1 FROM maintenance_window w JOIN monitored_resource r ON r.project_id = w.project_id
+                WHERE r.id = ? AND w.canceled_at IS NULL AND w.starts_at <= ? AND w.ends_at > ?
+                  AND (w.resource_id IS NULL OR w.resource_id = r.id)
+            )""",
+        ).use { statement ->
+            statement.setObject(1, resourceId)
+            statement.setTimestamp(2, java.sql.Timestamp.from(at))
+            statement.setTimestamp(3, java.sql.Timestamp.from(at))
+            statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) }
+        }
 
     private fun openIncident(connection: Connection, task: CheckTask, result: CheckResponse) {
         val incidentId = UUID.randomUUID()
@@ -330,6 +391,7 @@ class MonitorScheduler {
         val recoveryThreshold: Int,
         val critical: Boolean,
         val deleted: Boolean,
+        val lastResultAt: Instant?,
     )
 
     private data class ResourceAggregate(val total: Int, val hasDown: Boolean, val hasUnknown: Boolean, val hasPending: Boolean)

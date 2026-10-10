@@ -1112,6 +1112,7 @@ class _DashboardShellState extends State<_DashboardShell> {
       _Section.notifications => _NotificationsPage(
         api: widget.api,
         projects: _projects,
+        resources: _resources,
         readOnly: widget.user['role'] == 'READ_ONLY',
         onNotice: _notice,
       ),
@@ -2221,12 +2222,14 @@ class _NotificationsPage extends StatefulWidget {
   const _NotificationsPage({
     required this.api,
     required this.projects,
+    required this.resources,
     required this.readOnly,
     required this.onNotice,
   });
 
   final ApiClient api;
   final List<Map<String, dynamic>> projects;
+  final List<Map<String, dynamic>> resources;
   final bool readOnly;
   final ValueChanged<String> onNotice;
 
@@ -2237,6 +2240,7 @@ class _NotificationsPage extends StatefulWidget {
 class _NotificationsPageState extends State<_NotificationsPage> {
   List<Map<String, dynamic>> _channels = [];
   List<Map<String, dynamic>> _deliveries = [];
+  List<Map<String, dynamic>> _maintenanceWindows = [];
   bool _loading = true;
   String? _testingId;
 
@@ -2252,16 +2256,68 @@ class _NotificationsPageState extends State<_NotificationsPage> {
       final results = await Future.wait([
         widget.api.notificationChannels(),
         widget.api.notificationDeliveries(),
+        widget.api.maintenanceWindows(),
       ]);
       if (!mounted) return;
       setState(() {
         _channels = results[0];
         _deliveries = results[1];
+        _maintenanceWindows = results[2];
       });
     } catch (error) {
       if (mounted) widget.onNotice('加载通知记录失败：$error');
     } finally {
       if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _createMaintenanceWindow() async {
+    if (widget.projects.isEmpty) {
+      widget.onNotice('请先创建项目');
+      return;
+    }
+    final draft = await showDialog<_MaintenanceWindowDraft>(
+      context: context,
+      builder: (_) => _MaintenanceWindowDialog(
+        projects: widget.projects,
+        resources: widget.resources,
+      ),
+    );
+    if (draft == null) return;
+    try {
+      await widget.api.createMaintenanceWindow(draft.toJson());
+      await _load();
+      if (mounted) widget.onNotice('维护窗口已创建');
+    } catch (error) {
+      if (mounted) widget.onNotice('创建维护窗口失败：$error');
+    }
+  }
+
+  Future<void> _cancelMaintenanceWindow(Map<String, dynamic> window) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('取消维护窗口？'),
+        content: Text('“${window['name']}”取消后会立即恢复该范围内的通知。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('保留'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('取消窗口'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.api.cancelMaintenanceWindow(window['id'] as String);
+      await _load();
+      if (mounted) widget.onNotice('维护窗口已取消');
+    } catch (error) {
+      if (mounted) widget.onNotice('取消维护窗口失败：$error');
     }
   }
 
@@ -2353,8 +2409,8 @@ class _NotificationsPageState extends State<_NotificationsPage> {
       children: [
         _PageHeading(
           eyebrow: 'ALERT DELIVERY',
-          title: '通知渠道',
-          subtitle: '故障和恢复事件通过项目渠道发送；失败投递会自动重试并保留记录。',
+          title: '告警与通知',
+          subtitle: '维护窗口保留检查结果并抑制通知；故障和恢复事件通过项目渠道发送。',
           actions: [
             OutlinedButton.icon(
               onPressed: _loading ? null : _load,
@@ -2369,6 +2425,102 @@ class _NotificationsPageState extends State<_NotificationsPage> {
               ),
           ],
         ),
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                '维护窗口',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+              ),
+            ),
+            Text(
+              '${_maintenanceWindows.where((window) => window['status'] == 'ACTIVE' || window['status'] == 'SCHEDULED').length} 个有效窗口',
+              style: const TextStyle(color: _muted, fontSize: 11),
+            ),
+            if (!widget.readOnly) ...[
+              const SizedBox(width: 10),
+              FilledButton.tonalIcon(
+                onPressed: _createMaintenanceWindow,
+                icon: const Icon(Icons.schedule_rounded, size: 17),
+                label: const Text('安排维护'),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (_maintenanceWindows.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: _EmptyState(
+                icon: Icons.event_busy_outlined,
+                title: '暂无维护窗口',
+                subtitle: '维护期间继续保存检查结果，并抑制该项目或资源的故障通知。',
+              ),
+            ),
+          )
+        else
+          ..._maintenanceWindows.map(
+            (window) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Card(
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(
+                    window['status'] == 'ACTIVE'
+                        ? Icons.pause_circle_outline_rounded
+                        : Icons.event_available_outlined,
+                    color: window['status'] == 'ACTIVE' ? _blue : _muted,
+                  ),
+                  title: Text(
+                    window['name'] as String? ?? '维护窗口',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  subtitle: Text(
+                    '${window['projectName']} · ${window['resourceName'] ?? '全部资源'} · ${_dateTime(window['startsAt'] as String?)} 至 ${_dateTime(window['endsAt'] as String?)}${(window['description'] as String? ?? '').isEmpty ? '' : ' · ${window['description']}'}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 10, color: _muted),
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _MaintenanceWindowStatus(
+                        status: window['status'] as String? ?? 'ENDED',
+                      ),
+                      if (!widget.readOnly &&
+                          (window['status'] == 'ACTIVE' ||
+                              window['status'] == 'SCHEDULED'))
+                        IconButton(
+                          tooltip: '取消维护窗口',
+                          onPressed: () => _cancelMaintenanceWindow(window),
+                          icon: const Icon(Icons.close_rounded, size: 18),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        const SizedBox(height: 20),
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                '通知渠道',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+              ),
+            ),
+            Text(
+              '${_channels.length} 个渠道',
+              style: const TextStyle(color: _muted, fontSize: 11),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
         if (_loading && _channels.isEmpty)
           const Center(
             child: Padding(
@@ -2549,6 +2701,249 @@ class _DeliveryStatus extends StatelessWidget {
       child: Text(label, style: TextStyle(color: color, fontSize: 10)),
     );
   }
+}
+
+class _MaintenanceWindowStatus extends StatelessWidget {
+  const _MaintenanceWindowStatus({required this.status});
+  final String status;
+
+  @override
+  Widget build(BuildContext context) {
+    final (color, label) = switch (status) {
+      'ACTIVE' => (_blue, '生效中'),
+      'SCHEDULED' => (const Color(0xFF2C8B66), '待开始'),
+      'CANCELLED' => (_muted, '已取消'),
+      _ => (_muted, '已结束'),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: .1),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(label, style: TextStyle(color: color, fontSize: 10)),
+    );
+  }
+}
+
+class _MaintenanceWindowDraft {
+  const _MaintenanceWindowDraft({
+    required this.projectId,
+    required this.resourceId,
+    required this.name,
+    required this.description,
+    required this.startsAt,
+    required this.endsAt,
+  });
+
+  final String projectId;
+  final String? resourceId;
+  final String name;
+  final String description;
+  final DateTime startsAt;
+  final DateTime endsAt;
+
+  Map<String, dynamic> toJson() => {
+    'projectId': projectId,
+    'resourceId': resourceId,
+    'name': name,
+    'description': description,
+    'startsAt': startsAt.toUtc().toIso8601String(),
+    'endsAt': endsAt.toUtc().toIso8601String(),
+  };
+}
+
+class _MaintenanceWindowDialog extends StatefulWidget {
+  const _MaintenanceWindowDialog({
+    required this.projects,
+    required this.resources,
+  });
+
+  final List<Map<String, dynamic>> projects;
+  final List<Map<String, dynamic>> resources;
+
+  @override
+  State<_MaintenanceWindowDialog> createState() =>
+      _MaintenanceWindowDialogState();
+}
+
+class _MaintenanceWindowDialogState extends State<_MaintenanceWindowDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _name = TextEditingController();
+  final _description = TextEditingController();
+  late String _projectId = widget.projects.first['id'] as String;
+  String _resourceSelection = '';
+  late DateTime _startsAt = DateTime.now().add(const Duration(minutes: 5));
+  late DateTime _endsAt = DateTime.now().add(const Duration(hours: 1));
+  String? _timeError;
+
+  List<Map<String, dynamic>> get _projectResources => widget.resources
+      .where((resource) => resource['projectId'] == _projectId)
+      .toList();
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _description.dispose();
+    super.dispose();
+  }
+
+  Future<DateTime?> _pickDateTime(DateTime initial) async {
+    final today = DateTime.now();
+    final date = await showDatePicker(
+      context: context,
+      initialDate: initial.isBefore(today) ? today : initial,
+      firstDate: DateTime(today.year, today.month, today.day),
+      lastDate: DateTime(today.year + 5, today.month, today.day),
+    );
+    if (date == null || !mounted) return null;
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(initial),
+    );
+    if (time == null) return null;
+    return DateTime(date.year, date.month, date.day, time.hour, time.minute);
+  }
+
+  String _formatDateTime(BuildContext context, DateTime value) =>
+      '${MaterialLocalizations.of(context).formatMediumDate(value)} ${MaterialLocalizations.of(context).formatTimeOfDay(TimeOfDay.fromDateTime(value))}';
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('安排维护窗口'),
+    content: SizedBox(
+      width: 490,
+      child: Form(
+        key: _formKey,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              DropdownButtonFormField<String>(
+                initialValue: _projectId,
+                decoration: const InputDecoration(labelText: '所属项目'),
+                items: widget.projects
+                    .map(
+                      (project) => DropdownMenuItem(
+                        value: project['id'] as String,
+                        child: Text(project['name'] as String),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (value) => setState(() {
+                  _projectId = value!;
+                  _resourceSelection = '';
+                }),
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(
+                key: ValueKey(_projectId),
+                initialValue: _resourceSelection,
+                decoration: const InputDecoration(labelText: '维护范围'),
+                items: [
+                  const DropdownMenuItem(value: '', child: Text('项目内全部资源')),
+                  ..._projectResources.map(
+                    (resource) => DropdownMenuItem(
+                      value: resource['id'] as String,
+                      child: Text(resource['name'] as String),
+                    ),
+                  ),
+                ],
+                onChanged: (value) =>
+                    setState(() => _resourceSelection = value ?? ''),
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _name,
+                maxLength: 160,
+                decoration: const InputDecoration(labelText: '维护名称'),
+                validator: (value) =>
+                    value == null || value.trim().isEmpty ? '请输入维护名称' : null,
+              ),
+              TextFormField(
+                controller: _description,
+                maxLength: 1000,
+                maxLines: 2,
+                decoration: const InputDecoration(labelText: '说明（可选）'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  final value = await _pickDateTime(_startsAt);
+                  if (value != null) {
+                    setState(() {
+                      _startsAt = value;
+                      _timeError = null;
+                    });
+                  }
+                },
+                icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                label: Text('开始：${_formatDateTime(context, _startsAt)}'),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  final value = await _pickDateTime(_endsAt);
+                  if (value != null) {
+                    setState(() {
+                      _endsAt = value;
+                      _timeError = null;
+                    });
+                  }
+                },
+                icon: const Icon(Icons.stop_rounded, size: 18),
+                label: Text('结束：${_formatDateTime(context, _endsAt)}'),
+              ),
+              if (_timeError != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  _timeError!,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(
+        onPressed: () {
+          if (!_formKey.currentState!.validate()) return;
+          if (_startsAt.isBefore(
+                DateTime.now().subtract(const Duration(minutes: 5)),
+              ) ||
+              !_endsAt.isAfter(_startsAt) ||
+              !_endsAt.isAfter(DateTime.now())) {
+            setState(() => _timeError = '请设置有效的开始和结束时间');
+            return;
+          }
+          Navigator.pop(
+            context,
+            _MaintenanceWindowDraft(
+              projectId: _projectId,
+              resourceId: _resourceSelection.isEmpty
+                  ? null
+                  : _resourceSelection,
+              name: _name.text.trim(),
+              description: _description.text.trim(),
+              startsAt: _startsAt,
+              endsAt: _endsAt,
+            ),
+          );
+        },
+        child: const Text('创建维护窗口'),
+      ),
+    ],
+  );
 }
 
 class _NotificationChannelDraft {

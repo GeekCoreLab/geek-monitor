@@ -139,3 +139,26 @@ data class NotificationDeliveryResponse(
     val createdAt: String,
     val finishedAt: String,
 )
+
+data class MaintenanceWindowRequest(
+    val projectId: String?,
+    val resourceId: String? = null,
+    val name: String?,
+    val description: String? = "",
+    val startsAt: String?,
+    val endsAt: String?,
+)
+
+data class MaintenanceWindowResponse(
+    val id: String,
+    val projectId: String,
+    val projectName: String,
+    val resourceId: String?,
+    val resourceName: String?,
+    val name: String,
+    val description: String,
+    val startsAt: String,
+    val endsAt: String,
+    val status: String,
+    val createdAt: String,
+)

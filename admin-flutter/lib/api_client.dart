@@ -244,6 +244,28 @@ class ApiClient {
     );
   }
 
+  Future<List<Map<String, dynamic>>> maintenanceWindows({
+    String? projectId,
+  }) async {
+    final query = projectId == null
+        ? ''
+        : '?projectId=${Uri.encodeQueryComponent(projectId)}';
+    return _asMapList(await _send('GET', '/api/v1/maintenance-windows$query'));
+  }
+
+  Future<Map<String, dynamic>> createMaintenanceWindow(
+    Map<String, dynamic> definition,
+  ) async =>
+      (await _send('POST', '/api/v1/maintenance-windows', body: definition))
+          as Map<String, dynamic>;
+
+  Future<void> cancelMaintenanceWindow(String id) async {
+    await _send(
+      'DELETE',
+      '/api/v1/maintenance-windows/${Uri.encodeComponent(id)}',
+    );
+  }
+
   Future<dynamic> _send(
     String method,
     String path, {

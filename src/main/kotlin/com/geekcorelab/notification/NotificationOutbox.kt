@@ -17,6 +17,18 @@ class NotificationOutbox {
         eventType: String,
         payload: Map<String, Any?>,
     ) {
+        val maintenanceActive = connection.prepareStatement(
+            """SELECT EXISTS (
+                SELECT 1 FROM incident i JOIN monitored_resource r ON r.id = i.resource_id
+                JOIN maintenance_window w ON w.project_id = r.project_id
+                WHERE i.id = ? AND w.canceled_at IS NULL AND w.starts_at <= now() AND w.ends_at > now()
+                  AND (w.resource_id IS NULL OR w.resource_id = r.id)
+            )""",
+        ).use { statement ->
+            statement.setObject(1, incidentId)
+            statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) }
+        }
+        if (maintenanceActive) return
         val projectId = connection.prepareStatement(
             "SELECT r.project_id FROM incident i JOIN monitored_resource r ON r.id = i.resource_id WHERE i.id = ?",
         ).use { statement ->

@@ -93,6 +93,7 @@ class NotificationDispatcher {
         val attemptNumber = envelope.attemptCount + 1
         val result = when {
             !envelope.channelEnabled || envelope.channelDeleted -> DeliveryResult(false, null, "CHANNEL_DISABLED", "通知渠道已停用", cancelled = true)
+            envelope.maintenanceActive && envelope.eventType != "TEST" -> DeliveryResult(false, null, "MAINTENANCE_ACTIVE", "维护窗口期间已抑制通知", cancelled = true)
             envelope.eventType == "OPENED" && envelope.incidentStatus == "RESOLVED" -> DeliveryResult(false, null, "EVENT_SUPERSEDED", "故障已恢复，已取消过期故障通知", cancelled = true)
             else -> runCatching { send(envelope) }.getOrElse { DeliveryResult(false, null, "DELIVERY_ERROR", "通知发送失败") }
         }
@@ -142,7 +143,12 @@ class NotificationDispatcher {
         connection.prepareStatement(
             """SELECT n.id, n.channel_id, n.event_type, n.idempotency_key, n.payload::text AS payload, n.attempt_count,
                 c.channel_type, c.config_ciphertext, c.enabled AS channel_enabled, c.deleted_at AS channel_deleted,
-                i.status AS incident_status
+                i.status AS incident_status,
+                COALESCE((SELECT EXISTS (
+                    SELECT 1 FROM monitored_resource r JOIN maintenance_window w ON w.project_id = r.project_id
+                    WHERE r.id = i.resource_id AND w.canceled_at IS NULL AND w.starts_at <= now() AND w.ends_at > now()
+                      AND (w.resource_id IS NULL OR w.resource_id = r.id)
+                )), FALSE) AS maintenance_active
                 FROM notification_outbox n JOIN notification_channel c ON c.id = n.channel_id
                 LEFT JOIN incident i ON i.id = n.incident_id WHERE n.id = ? AND n.status = 'RUNNING'""",
         ).use { statement ->
@@ -160,6 +166,7 @@ class NotificationDispatcher {
         channelDeleted = getTimestamp("channel_deleted") != null,
         eventType = getString("event_type"),
         incidentStatus = getString("incident_status"),
+        maintenanceActive = getBoolean("maintenance_active"),
         idempotencyKey = getString("idempotency_key"),
         payload = getString("payload"),
         attemptCount = getInt("attempt_count"),
@@ -246,6 +253,7 @@ class NotificationDispatcher {
         val channelDeleted: Boolean,
         val eventType: String,
         val incidentStatus: String?,
+        val maintenanceActive: Boolean,
         val idempotencyKey: String,
         val payload: String,
         val attemptCount: Int,
