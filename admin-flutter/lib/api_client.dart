@@ -191,6 +191,59 @@ class ApiClient {
         ),
       );
 
+  Future<List<Map<String, dynamic>>> notificationChannels({
+    String? projectId,
+  }) async {
+    final query = projectId == null
+        ? ''
+        : '?projectId=${Uri.encodeQueryComponent(projectId)}';
+    return _asMapList(
+      await _send('GET', '/api/v1/notification-channels$query'),
+    );
+  }
+
+  Future<Map<String, dynamic>> createNotificationChannel(
+    Map<String, dynamic> definition,
+  ) async =>
+      (await _send('POST', '/api/v1/notification-channels', body: definition))
+          as Map<String, dynamic>;
+
+  Future<Map<String, dynamic>> updateNotificationChannel(
+    String id,
+    Map<String, dynamic> definition,
+  ) async =>
+      (await _send(
+            'PATCH',
+            '/api/v1/notification-channels/${Uri.encodeComponent(id)}',
+            body: definition,
+          ))
+          as Map<String, dynamic>;
+
+  Future<void> deleteNotificationChannel(String id) async {
+    await _send(
+      'DELETE',
+      '/api/v1/notification-channels/${Uri.encodeComponent(id)}',
+    );
+  }
+
+  Future<Map<String, dynamic>> testNotificationChannel(String id) async =>
+      (await _send(
+            'POST',
+            '/api/v1/notification-channels/${Uri.encodeComponent(id)}/test',
+          ))
+          as Map<String, dynamic>;
+
+  Future<List<Map<String, dynamic>>> notificationDeliveries({
+    String? channelId,
+  }) async {
+    final query = channelId == null
+        ? ''
+        : '?channelId=${Uri.encodeQueryComponent(channelId)}';
+    return _asMapList(
+      await _send('GET', '/api/v1/notification-deliveries$query'),
+    );
+  }
+
   Future<dynamic> _send(
     String method,
     String path, {

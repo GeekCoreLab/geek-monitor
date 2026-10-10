@@ -7,6 +7,8 @@ import org.eclipse.microprofile.config.inject.ConfigProperty
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -18,6 +20,8 @@ import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLHandshakeException
 import kotlin.math.max
 
+data class WebhookResult(val delivered: Boolean, val statusCode: Int?, val errorCode: String?, val summary: String?)
+
 @ApplicationScoped
 class HttpCheckService {
     @Inject @field:ConfigProperty(name = "geek-monitor.network.allow-private-targets", defaultValue = "false")
@@ -25,6 +29,61 @@ class HttpCheckService {
 
     @Inject @field:ConfigProperty(name = "geek-monitor.network.allowed-cidrs", defaultValue = "none")
     lateinit var allowedCidrsConfig: String
+
+    fun sendWebhook(targetUrl: String, bearerToken: String?, payload: String, idempotencyKey: String): WebhookResult {
+        if (payload.toByteArray(Charsets.UTF_8).size > MAX_WEBHOOK_BYTES) {
+            return WebhookResult(false, null, "PAYLOAD_TOO_LARGE", "通知内容超过限制")
+        }
+        val allowedNetworks = parseAllowedNetworks()
+        val uri = try {
+            validateUri(URI(targetUrl.trim())).also {
+                require(it.scheme.equals("https", true) || (allowPrivateTargets && it.scheme.equals("http", true)))
+            }
+        } catch (_: Exception) {
+            return WebhookResult(false, null, "TARGET_INVALID", "Webhook 必须使用有效的 HTTPS 地址")
+        }
+        if (hasBlockedIpLiteral(uri.host, allowedNetworks)) {
+            return WebhookResult(false, null, "TARGET_BLOCKED", "Webhook 目标地址不在允许范围内")
+        }
+        val dns = Dns { hostname -> resolveAndValidate(hostname, uri.host, allowedNetworks) }
+        val client = OkHttpClient.Builder()
+            .dns(dns)
+            .connectTimeout(WEBHOOK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .readTimeout(WEBHOOK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .writeTimeout(WEBHOOK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .callTimeout(WEBHOOK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .retryOnConnectionFailure(false)
+            .build()
+        val body = payload.toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url(uri.toASCIIString())
+            .post(body)
+            .header("User-Agent", "GeekMonitor/1.0")
+            .header("Accept", "application/json")
+            .header("Idempotency-Key", idempotencyKey)
+            .apply { bearerToken?.takeIf(String::isNotBlank)?.let { header("Authorization", "Bearer $it") } }
+            .build()
+        return try {
+            client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) WebhookResult(true, response.code, null, null)
+                else WebhookResult(false, response.code, "HTTP_STATUS", "Webhook 返回 HTTP ${response.code}")
+            }
+        } catch (exception: Exception) {
+            if (exception is UnknownHostException && exception.message.orEmpty().contains("network policy")) {
+                WebhookResult(false, null, "TARGET_BLOCKED", "Webhook 目标地址不在允许范围内")
+            } else {
+                val code = when (exception) {
+                    is UnknownHostException -> "DNS_FAILURE"
+                    is java.net.SocketTimeoutException -> "TIMEOUT"
+                    is SSLHandshakeException -> "TLS_FAILURE"
+                    else -> "NETWORK_FAILURE"
+                }
+                WebhookResult(false, null, code, "Webhook 投递失败")
+            }
+        }
+    }
 
     fun execute(
         targetUrl: String,
@@ -237,5 +296,7 @@ class HttpCheckService {
     companion object {
         private const val MAX_REDIRECTS = 5
         private const val MAX_RESPONSE_BYTES = 1024 * 1024
+        private const val MAX_WEBHOOK_BYTES = 64 * 1024
+        private const val WEBHOOK_TIMEOUT_SECONDS = 10L
     }
 }

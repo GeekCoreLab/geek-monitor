@@ -2,6 +2,7 @@ package com.geekcorelab.monitor
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.geekcorelab.api.CheckResponse
+import com.geekcorelab.notification.NotificationOutbox
 import io.quarkus.scheduler.Scheduled
 import jakarta.annotation.PreDestroy
 import jakarta.enterprise.context.ApplicationScoped
@@ -23,6 +24,7 @@ class MonitorScheduler {
     @Inject lateinit var dataSource: DataSource
     @Inject lateinit var objectMapper: ObjectMapper
     @Inject lateinit var checker: HttpCheckService
+    @Inject lateinit var notificationOutbox: NotificationOutbox
 
     private val threadNumber = AtomicInteger()
     private val executor = ThreadPoolExecutor(
@@ -186,7 +188,7 @@ class MonitorScheduler {
                 if (!monitor.deleted && monitor.currentState != nextState) {
                     when (nextState) {
                         "DOWN" -> openIncident(connection, task, result)
-                        "UP" -> resolveIncident(connection, task.id)
+                        "UP" -> resolveIncident(connection, task)
                     }
                 } else if (!monitor.deleted && nextState == "DOWN" && failure) {
                     connection.prepareStatement(
@@ -218,32 +220,72 @@ class MonitorScheduler {
             statement.setString(5, "${task.resourceName} · ${task.monitorName} 检查失败")
             statement.executeUpdate()
         }
+        val eventId = UUID.randomUUID()
         connection.prepareStatement(
             "INSERT INTO incident_event(id, incident_id, event_type, details) VALUES (?, ?, 'OPENED', CAST(? AS jsonb))",
         ).use { statement ->
-            statement.setObject(1, UUID.randomUUID())
+            statement.setObject(1, eventId)
             statement.setObject(2, incidentId)
             statement.setString(3, objectMapper.writeValueAsString(mapOf("errorCode" to result.errorCode, "statusCode" to result.statusCode)))
             statement.executeUpdate()
         }
+        notificationOutbox.enqueueIncident(
+            connection,
+            incidentId,
+            eventId,
+            "OPENED",
+            mapOf(
+                "eventId" to eventId.toString(),
+                "eventType" to "incident.opened",
+                "incidentId" to incidentId.toString(),
+                "title" to "${task.resourceName} · ${task.monitorName} 检查失败",
+                "message" to "${task.resourceName} 的 ${task.monitorName} 检查达到失败阈值。",
+                "resourceName" to task.resourceName,
+                "monitorName" to task.monitorName,
+                "severity" to "WARNING",
+                "status" to "DOWN",
+                "occurredAt" to result.checkedAt,
+                "errorCode" to result.errorCode,
+                "statusCode" to result.statusCode,
+            ),
+        )
     }
 
-    private fun resolveIncident(connection: Connection, monitorId: UUID) {
+    private fun resolveIncident(connection: Connection, task: CheckTask) {
         val active = connection.prepareStatement(
             "SELECT id FROM incident WHERE monitor_id = ? AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
         ).use { statement ->
-            statement.setObject(1, monitorId)
+            statement.setObject(1, task.id)
             statement.executeQuery().use { rows -> if (rows.next()) rows.getObject("id", UUID::class.java) else null }
         } ?: return
         connection.prepareStatement("UPDATE incident SET status = 'RESOLVED', resolved_at = now() WHERE id = ?").use { statement ->
             statement.setObject(1, active)
             statement.executeUpdate()
         }
+        val eventId = UUID.randomUUID()
         connection.prepareStatement("INSERT INTO incident_event(id, incident_id, event_type) VALUES (?, ?, 'RESOLVED')").use { statement ->
-            statement.setObject(1, UUID.randomUUID())
+            statement.setObject(1, eventId)
             statement.setObject(2, active)
             statement.executeUpdate()
         }
+        notificationOutbox.enqueueIncident(
+            connection,
+            active,
+            eventId,
+            "RESOLVED",
+            mapOf(
+                "eventId" to eventId.toString(),
+                "eventType" to "incident.resolved",
+                "incidentId" to active.toString(),
+                "title" to "${task.resourceName} · ${task.monitorName} 已恢复",
+                "message" to "${task.resourceName} 的 ${task.monitorName} 已连续成功并恢复。",
+                "resourceName" to task.resourceName,
+                "monitorName" to task.monitorName,
+                "severity" to "INFO",
+                "status" to "UP",
+                "occurredAt" to Instant.now().toString(),
+            ),
+        )
     }
 
     private fun updateResourceHealth(connection: Connection, resourceId: UUID) {

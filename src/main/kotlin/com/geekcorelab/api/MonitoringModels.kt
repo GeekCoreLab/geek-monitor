@@ -85,3 +85,45 @@ data class IncidentEventResponse(
     val details: Map<String, Any?>,
     val createdAt: String,
 )
+
+data class NotificationChannelRequest(
+    val projectId: String?,
+    val name: String?,
+    val type: String?,
+    val emailRecipients: List<String>? = null,
+    val webhookUrl: String? = null,
+    val webhookBearerToken: String? = null,
+    val enabled: Boolean? = true,
+    val version: Int? = null,
+)
+
+data class NotificationChannelResponse(
+    val id: String,
+    val projectId: String,
+    val projectName: String,
+    val name: String,
+    val type: String,
+    val destinationSummary: String,
+    val enabled: Boolean,
+    val version: Int,
+    val lastDeliveryStatus: String?,
+    val createdAt: String,
+)
+
+data class NotificationTestResponse(val outboxId: String, val status: String = "PENDING")
+
+data class NotificationDeliveryResponse(
+    val id: String,
+    val outboxId: String,
+    val channelId: String,
+    val channelName: String,
+    val incidentId: String?,
+    val eventType: String,
+    val status: String,
+    val attemptNumber: Int,
+    val httpStatus: Int?,
+    val errorCode: String?,
+    val errorSummary: String?,
+    val createdAt: String,
+    val finishedAt: String,
+)

@@ -39,6 +39,20 @@ Flutter 开发服务器的地址已加入开发 CORS 白名单。执行 `./gradl
 | `DB_USERNAME` | `geek_monitor` |
 | `DB_PASSWORD` | `geek_monitor` |
 
+## 通知配置
+
+通知渠道按项目管理。Webhooks 只允许 HTTPS；开发模式为了本地验收可访问已放行的内网目标。生产环境默认拒绝私网目标，如确需访问自管内网接收端，可通过 `MONITOR_ALLOWED_CIDRS` 显式列出网段。
+
+生产环境创建通知渠道前必须配置独立的 AES-256 密钥。生成 32 字节密钥并以 Base64 保存到部署密钥管理器：
+
+```sh
+openssl rand -base64 32
+```
+
+将结果注入 `GEEK_MONITOR_ENCRYPTION_KEY`。密钥不应写入仓库或数据库备份；丢失密钥后，已加密的 Webhook 配置无法解密。开发模式使用仅供本地的固定密钥。
+
+邮件使用 Quarkus Mailer 和 SMTP，可配置以下环境变量：`SMTP_HOST`、`SMTP_PORT`、`SMTP_USERNAME`、`SMTP_PASSWORD`、`SMTP_FROM` 和 `SMTP_START_TLS`。生产默认要求 STARTTLS，`SMTP_HOST` 未配置时会指向保留的 `.invalid` 域名，避免静默发送。开发模式使用 Mailer 模拟器，不会发出真实邮件；生产可设置 `SMTP_MOCK=false`（默认值）并配置真实 SMTP 服务。
+
 首次安装状态保存在数据库中。重新部署不会重置管理员或项目；重置操作需按备份与恢复流程直接管理数据库。
 
 ## 当前管理端能力
@@ -46,6 +60,9 @@ Flutter 开发服务器的地址已加入开发 CORS 白名单。执行 `./gradl
 - 首次安装、管理员登录、会话恢复和退出。
 - 创建项目并维护基本项目说明。
 - 在项目内创建、查看和软删除监控资源。
-- 总览显示资源状态计数和项目列表。
+- 配置 HTTP GET/HEAD 检查、运行试检查、查看历史记录，并按失败/恢复阈值生成去重故障。
+- 在故障中心确认故障、填写处理备注并查看事件时间线。
+- 按项目配置邮件和 Webhook 渠道；故障及恢复消息通过持久化 Outbox 发送，记录每次投递并退避重试。
+- 总览显示资源状态、监控项和活跃故障。
 
-主动检查调度、检查项配置、事件处理、通知、Agent 与指标页面仍按规划阶段继续实现。
+TCP、DNS、TLS、数据库与主机 Agent/指标、维护窗口、保留聚合、备份恢复和容量验收仍在规划阶段继续实现。

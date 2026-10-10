@@ -23,6 +23,7 @@ dependencies {
     implementation("io.quarkus:quarkus-jdbc-postgresql")
     implementation("io.quarkus:quarkus-flyway")
     implementation("io.quarkus:quarkus-scheduler")
+    implementation("io.quarkus:quarkus-mailer")
     implementation("com.squareup.okhttp3:okhttp:5.5.0")
     testImplementation("io.quarkus:quarkus-junit")
     testImplementation("io.rest-assured:rest-assured")

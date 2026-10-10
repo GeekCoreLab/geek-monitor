@@ -780,7 +780,14 @@ class _UnavailablePage extends StatelessWidget {
   );
 }
 
-enum _Section { overview, resources, monitors, incidents, projects }
+enum _Section {
+  overview,
+  resources,
+  monitors,
+  incidents,
+  notifications,
+  projects,
+}
 
 class _DashboardShell extends StatefulWidget {
   const _DashboardShell({
@@ -1100,6 +1107,12 @@ class _DashboardShellState extends State<_DashboardShell> {
         onAcknowledge: _acknowledgeIncident,
         onEvents: _showIncidentEvents,
       ),
+      _Section.notifications => _NotificationsPage(
+        api: widget.api,
+        projects: _projects,
+        readOnly: widget.user['role'] == 'READ_ONLY',
+        onNotice: _notice,
+      ),
       _Section.projects => _ProjectsPage(
         projects: _projects,
         onCreate: _createProject,
@@ -1181,6 +1194,12 @@ class _SideNavigation extends StatelessWidget {
           label: '故障中心',
           selected: section == _Section.incidents,
           onTap: () => onSelect(_Section.incidents),
+        ),
+        _NavItem(
+          icon: Icons.notifications_outlined,
+          label: '通知渠道',
+          selected: section == _Section.notifications,
+          onTap: () => onSelect(_Section.notifications),
         ),
         _NavItem(
           icon: Icons.folder_outlined,
@@ -1386,6 +1405,10 @@ class _BottomNavigation extends StatelessWidget {
       NavigationDestination(
         icon: Icon(Icons.warning_amber_rounded),
         label: '故障',
+      ),
+      NavigationDestination(
+        icon: Icon(Icons.notifications_outlined),
+        label: '通知',
       ),
       NavigationDestination(icon: Icon(Icons.folder_outlined), label: '项目'),
     ],
@@ -2189,6 +2212,527 @@ class _ProjectsPage extends StatelessWidget {
           ),
       ],
     ),
+  );
+}
+
+class _NotificationsPage extends StatefulWidget {
+  const _NotificationsPage({
+    required this.api,
+    required this.projects,
+    required this.readOnly,
+    required this.onNotice,
+  });
+
+  final ApiClient api;
+  final List<Map<String, dynamic>> projects;
+  final bool readOnly;
+  final ValueChanged<String> onNotice;
+
+  @override
+  State<_NotificationsPage> createState() => _NotificationsPageState();
+}
+
+class _NotificationsPageState extends State<_NotificationsPage> {
+  List<Map<String, dynamic>> _channels = [];
+  List<Map<String, dynamic>> _deliveries = [];
+  bool _loading = true;
+  String? _testingId;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    try {
+      final results = await Future.wait([
+        widget.api.notificationChannels(),
+        widget.api.notificationDeliveries(),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _channels = results[0];
+        _deliveries = results[1];
+      });
+    } catch (error) {
+      if (mounted) widget.onNotice('加载通知记录失败：$error');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _createChannel() async {
+    if (widget.projects.isEmpty) {
+      widget.onNotice('请先创建项目');
+      return;
+    }
+    final draft = await showDialog<_NotificationChannelDraft>(
+      context: context,
+      builder: (_) => _NotificationChannelDialog(projects: widget.projects),
+    );
+    if (draft == null) return;
+    try {
+      await widget.api.createNotificationChannel(draft.toJson());
+      await _load();
+      if (mounted) widget.onNotice('通知渠道已创建');
+    } catch (error) {
+      if (mounted) widget.onNotice('创建通知渠道失败：$error');
+    }
+  }
+
+  Future<void> _testChannel(Map<String, dynamic> channel) async {
+    final id = channel['id'] as String;
+    setState(() => _testingId = id);
+    try {
+      final result = await widget.api.testNotificationChannel(id);
+      final outboxId = result['outboxId'] as String;
+      Map<String, dynamic>? delivery;
+      for (var attempt = 0; attempt < 10; attempt++) {
+        await Future<void>.delayed(const Duration(seconds: 1));
+        final rows = await widget.api.notificationDeliveries(channelId: id);
+        delivery = rows.cast<Map<String, dynamic>?>().firstWhere(
+          (row) => row?['outboxId'] == outboxId,
+          orElse: () => null,
+        );
+        if (delivery != null) break;
+      }
+      await _load();
+      if (!mounted) return;
+      if (delivery == null) {
+        widget.onNotice('测试通知已排队，投递记录稍后刷新查看');
+      } else if (delivery['status'] == 'DELIVERED') {
+        widget.onNotice('测试通知投递成功');
+      } else {
+        widget.onNotice(
+          '测试通知未送达：${delivery['errorSummary'] ?? delivery['status']}',
+        );
+      }
+    } catch (error) {
+      if (mounted) widget.onNotice('发送测试通知失败：$error');
+    } finally {
+      if (mounted) setState(() => _testingId = null);
+    }
+  }
+
+  Future<void> _deleteChannel(Map<String, dynamic> channel) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('删除通知渠道？'),
+        content: Text('“${channel['name']}”停止接收后续故障通知，历史投递记录会保留。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.api.deleteNotificationChannel(channel['id'] as String);
+      await _load();
+      if (mounted) widget.onNotice('通知渠道已删除');
+    } catch (error) {
+      if (mounted) widget.onNotice('删除通知渠道失败：$error');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => _PageScroll(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _PageHeading(
+          eyebrow: 'ALERT DELIVERY',
+          title: '通知渠道',
+          subtitle: '故障和恢复事件通过项目渠道发送；失败投递会自动重试并保留记录。',
+          actions: [
+            OutlinedButton.icon(
+              onPressed: _loading ? null : _load,
+              icon: const Icon(Icons.refresh_rounded, size: 18),
+              label: const Text('刷新'),
+            ),
+            if (!widget.readOnly)
+              FilledButton.icon(
+                onPressed: _createChannel,
+                icon: const Icon(Icons.add_rounded, size: 18),
+                label: const Text('添加渠道'),
+              ),
+          ],
+        ),
+        if (_loading && _channels.isEmpty)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.all(36),
+              child: CircularProgressIndicator(),
+            ),
+          )
+        else if (_channels.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(32),
+              child: _EmptyState(
+                icon: Icons.notifications_none_rounded,
+                title: '还没有通知渠道',
+                subtitle: '添加邮件或 Webhook 渠道后，项目中的故障和恢复事件会进入持久化发送队列。',
+              ),
+            ),
+          )
+        else
+          ..._channels.map(
+            (channel) => Padding(
+              padding: const EdgeInsets.only(bottom: 11),
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 42,
+                        height: 42,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFEAF0FA),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Icon(
+                          channel['type'] == 'EMAIL'
+                              ? Icons.mail_outline_rounded
+                              : Icons.webhook_rounded,
+                          color: _blue,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              channel['name'] as String? ?? '通知渠道',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w700,
+                                fontSize: 13,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${channel['projectName']}  ·  ${channel['type'] == 'EMAIL' ? '邮件' : 'Webhook'}  ·  ${channel['destinationSummary']}',
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: _muted,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (!widget.readOnly) ...[
+                        IconButton(
+                          tooltip: '发送测试通知',
+                          onPressed: _testingId == channel['id']
+                              ? null
+                              : () => _testChannel(channel),
+                          icon: _testingId == channel['id']
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.send_outlined, size: 19),
+                        ),
+                        IconButton(
+                          tooltip: '删除渠道',
+                          onPressed: () => _deleteChannel(channel),
+                          icon: const Icon(
+                            Icons.delete_outline_rounded,
+                            size: 19,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        const SizedBox(height: 20),
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                '最近投递',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+              ),
+            ),
+            Text(
+              '${_deliveries.length} 条记录',
+              style: const TextStyle(color: _muted, fontSize: 11),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (_deliveries.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: _EmptyState(
+                icon: Icons.outbox_outlined,
+                title: '暂无投递记录',
+                subtitle: '故障、恢复和测试通知的每次发送结果都会显示在这里。',
+              ),
+            ),
+          )
+        else
+          Card(
+            child: Column(
+              children: _deliveries
+                  .map(
+                    (delivery) => ListTile(
+                      dense: true,
+                      leading: _DeliveryStatus(
+                        status: delivery['status'] as String? ?? 'RETRYING',
+                      ),
+                      title: Text(
+                        '${delivery['eventType']}  ·  ${delivery['channelName']}',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      subtitle: Text(
+                        '${delivery['errorSummary'] ?? '投递成功'}${delivery['httpStatus'] == null ? '' : '  ·  HTTP ${delivery['httpStatus']}'}  ·  第 ${delivery['attemptNumber']} 次',
+                        style: const TextStyle(fontSize: 10, color: _muted),
+                      ),
+                      trailing: Text(
+                        _dateTime(delivery['finishedAt'] as String?),
+                        style: const TextStyle(fontSize: 10, color: _muted),
+                      ),
+                    ),
+                  )
+                  .toList(),
+            ),
+          ),
+      ],
+    ),
+  );
+}
+
+class _DeliveryStatus extends StatelessWidget {
+  const _DeliveryStatus({required this.status});
+  final String status;
+
+  @override
+  Widget build(BuildContext context) {
+    final (color, label) = switch (status) {
+      'DELIVERED' => (const Color(0xFF2C8B66), '成功'),
+      'FAILED' => (const Color(0xFFB44438), '失败'),
+      'CANCELLED' => (const Color(0xFF7B8794), '取消'),
+      _ => (const Color(0xFFC8743E), '重试'),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: .1),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(label, style: TextStyle(color: color, fontSize: 10)),
+    );
+  }
+}
+
+class _NotificationChannelDraft {
+  const _NotificationChannelDraft({
+    required this.projectId,
+    required this.name,
+    required this.type,
+    required this.emailRecipients,
+    required this.webhookUrl,
+    required this.webhookBearerToken,
+  });
+
+  final String projectId;
+  final String name;
+  final String type;
+  final List<String> emailRecipients;
+  final String webhookUrl;
+  final String webhookBearerToken;
+
+  Map<String, dynamic> toJson() => {
+    'projectId': projectId,
+    'name': name,
+    'type': type,
+    'emailRecipients': type == 'EMAIL' ? emailRecipients : null,
+    'webhookUrl': type == 'WEBHOOK' ? webhookUrl : null,
+    'webhookBearerToken': type == 'WEBHOOK' ? webhookBearerToken : null,
+  };
+}
+
+class _NotificationChannelDialog extends StatefulWidget {
+  const _NotificationChannelDialog({required this.projects});
+  final List<Map<String, dynamic>> projects;
+
+  @override
+  State<_NotificationChannelDialog> createState() =>
+      _NotificationChannelDialogState();
+}
+
+class _NotificationChannelDialogState
+    extends State<_NotificationChannelDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late String _projectId = widget.projects.first['id'] as String;
+  String _type = 'EMAIL';
+  final _name = TextEditingController();
+  final _recipients = TextEditingController();
+  final _url = TextEditingController();
+  final _token = TextEditingController();
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _recipients.dispose();
+    _url.dispose();
+    _token.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('添加通知渠道'),
+    content: SizedBox(
+      width: 490,
+      child: Form(
+        key: _formKey,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              DropdownButtonFormField<String>(
+                initialValue: _projectId,
+                decoration: const InputDecoration(labelText: '所属项目'),
+                items: widget.projects
+                    .map(
+                      (project) => DropdownMenuItem(
+                        value: project['id'] as String,
+                        child: Text(project['name'] as String),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (value) {
+                  if (value != null) setState(() => _projectId = value);
+                },
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _name,
+                autofocus: true,
+                maxLength: 120,
+                decoration: const InputDecoration(labelText: '渠道名称'),
+                validator: (value) =>
+                    value == null || value.trim().isEmpty ? '请输入渠道名称' : null,
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(
+                initialValue: _type,
+                decoration: const InputDecoration(labelText: '渠道类型'),
+                items: const [
+                  DropdownMenuItem(value: 'EMAIL', child: Text('邮件')),
+                  DropdownMenuItem(value: 'WEBHOOK', child: Text('通用 Webhook')),
+                ],
+                onChanged: (value) {
+                  if (value != null) setState(() => _type = value);
+                },
+              ),
+              const SizedBox(height: 12),
+              if (_type == 'EMAIL')
+                TextFormField(
+                  controller: _recipients,
+                  keyboardType: TextInputType.emailAddress,
+                  maxLines: 2,
+                  decoration: const InputDecoration(
+                    labelText: '收件人邮箱',
+                    hintText: 'ops@example.com, owner@example.com',
+                    helperText: '多个邮箱用逗号分隔，最多 20 个。',
+                  ),
+                  validator: (value) {
+                    final values = (value ?? '')
+                        .split(',')
+                        .map((item) => item.trim())
+                        .where((item) => item.isNotEmpty);
+                    return values.isEmpty ||
+                            values.any((item) => !item.contains('@'))
+                        ? '请输入有效邮箱地址'
+                        : null;
+                  },
+                )
+              else ...[
+                TextFormField(
+                  controller: _url,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: 'Webhook URL',
+                    hintText: 'https://hooks.example.com/…',
+                    helperText: '生产环境要求 HTTPS；重定向不会跟随。',
+                  ),
+                  validator: (value) {
+                    final uri = Uri.tryParse((value ?? '').trim());
+                    return uri == null ||
+                            !{'https', 'http'}.contains(uri.scheme) ||
+                            uri.host.isEmpty
+                        ? '请输入有效的 HTTP(S) 地址'
+                        : null;
+                  },
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _token,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'Bearer Token（可选）',
+                    helperText: '保存后加密，之后不会再次显示。',
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(
+        onPressed: () {
+          if (!_formKey.currentState!.validate()) return;
+          Navigator.pop(
+            context,
+            _NotificationChannelDraft(
+              projectId: _projectId,
+              name: _name.text.trim(),
+              type: _type,
+              emailRecipients: _recipients.text
+                  .split(',')
+                  .map((value) => value.trim())
+                  .where((value) => value.isNotEmpty)
+                  .toList(),
+              webhookUrl: _url.text.trim(),
+              webhookBearerToken: _token.text,
+            ),
+          );
+        },
+        child: const Text('保存'),
+      ),
+    ],
   );
 }
 
