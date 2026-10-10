@@ -24,6 +24,7 @@ dependencies {
     implementation("io.quarkus:quarkus-flyway")
     implementation("io.quarkus:quarkus-scheduler")
     implementation("io.quarkus:quarkus-mailer")
+    implementation("dnsjava:dnsjava:3.6.5")
     implementation("com.squareup.okhttp3:okhttp:5.5.0")
     testImplementation("io.quarkus:quarkus-junit")
     testImplementation("io.rest-assured:rest-assured")

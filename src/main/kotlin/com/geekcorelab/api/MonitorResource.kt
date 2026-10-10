@@ -1,7 +1,7 @@
 package com.geekcorelab.api
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.geekcorelab.monitor.HttpCheckService
+import com.geekcorelab.monitor.ProtocolCheckService
 import jakarta.inject.Inject
 import jakarta.ws.rs.Consumes
 import jakarta.ws.rs.DELETE
@@ -29,7 +29,7 @@ class MonitorResource {
     @Inject lateinit var dataSource: DataSource
     @Inject lateinit var objectMapper: ObjectMapper
     @Inject lateinit var authenticator: SessionAuthenticator
-    @Inject lateinit var httpCheckService: HttpCheckService
+    @Inject lateinit var protocolCheckService: ProtocolCheckService
 
     @GET
     @Path("/monitors")
@@ -78,18 +78,19 @@ class MonitorResource {
             connection.prepareStatement(
                 """INSERT INTO monitor(id, resource_id, name, type, config, interval_seconds, timeout_seconds,
                     failure_threshold, recovery_threshold, critical, enabled, next_run_at)
-                    VALUES (?, ?, ?, 'HTTP', CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, now())""",
+                    VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, now())""",
             ).use { statement ->
                 statement.setObject(1, id)
                 statement.setObject(2, resourceId)
                 statement.setString(3, definition.name)
-                statement.setString(4, objectMapper.writeValueAsString(definition.config))
-                statement.setInt(5, definition.intervalSeconds)
-                statement.setInt(6, definition.timeoutSeconds)
-                statement.setInt(7, definition.failureThreshold)
-                statement.setInt(8, definition.recoveryThreshold)
-                statement.setBoolean(9, definition.critical)
-                statement.setBoolean(10, definition.enabled)
+                statement.setString(4, definition.type)
+                statement.setString(5, objectMapper.writeValueAsString(definition.config))
+                statement.setInt(6, definition.intervalSeconds)
+                statement.setInt(7, definition.timeoutSeconds)
+                statement.setInt(8, definition.failureThreshold)
+                statement.setInt(9, definition.recoveryThreshold)
+                statement.setBoolean(10, definition.critical)
+                statement.setBoolean(11, definition.enabled)
                 statement.executeUpdate()
             }
         }
@@ -124,22 +125,23 @@ class MonitorResource {
         val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔和阈值")
         val updated = dataSource.connection.use { connection ->
             connection.prepareStatement(
-                """UPDATE monitor SET resource_id = ?, name = ?, config = CAST(? AS jsonb), interval_seconds = ?,
+                """UPDATE monitor SET resource_id = ?, name = ?, type = ?, config = CAST(? AS jsonb), interval_seconds = ?,
                     timeout_seconds = ?, failure_threshold = ?, recovery_threshold = ?, critical = ?, enabled = ?,
                     version = version + 1, next_run_at = now(), updated_at = now()
                     WHERE id = ? AND version = ? AND deleted_at IS NULL""",
             ).use { statement ->
                 statement.setObject(1, requestedResource)
                 statement.setString(2, definition.name)
-                statement.setString(3, objectMapper.writeValueAsString(definition.config))
-                statement.setInt(4, definition.intervalSeconds)
-                statement.setInt(5, definition.timeoutSeconds)
-                statement.setInt(6, definition.failureThreshold)
-                statement.setInt(7, definition.recoveryThreshold)
-                statement.setBoolean(8, definition.critical)
-                statement.setBoolean(9, definition.enabled)
-                statement.setObject(10, id)
-                statement.setInt(11, request.version)
+                statement.setString(3, definition.type)
+                statement.setString(4, objectMapper.writeValueAsString(definition.config))
+                statement.setInt(5, definition.intervalSeconds)
+                statement.setInt(6, definition.timeoutSeconds)
+                statement.setInt(7, definition.failureThreshold)
+                statement.setInt(8, definition.recoveryThreshold)
+                statement.setBoolean(9, definition.critical)
+                statement.setBoolean(10, definition.enabled)
+                statement.setObject(11, id)
+                statement.setInt(12, request.version)
                 statement.executeUpdate()
             }
         }
@@ -210,30 +212,55 @@ class MonitorResource {
         val name = request.name?.trim().orEmpty()
         val type = request.type?.trim()?.uppercase() ?: "HTTP"
         val targetUrl = request.targetUrl?.trim().orEmpty()
+        val host = request.targetHost?.trim().orEmpty()
         val method = request.method?.trim()?.uppercase() ?: "GET"
-        val interval = request.intervalSeconds ?: 60
-        val timeout = request.timeoutSeconds ?: 10
+        val interval = request.intervalSeconds ?: if (type == "TLS") 21600 else 60
+        val timeout = request.timeoutSeconds ?: if (type == "DNS") 5 else 10
         val failures = request.failureThreshold ?: 3
         val recoveries = request.recoveryThreshold ?: 2
         val expectedCodes = (request.expectedStatusCodes ?: (200..299).toList()).distinct().sorted()
         val contains = request.textContains?.takeIf(String::isNotBlank)
-        val validUri = runCatching {
-            val uri = URI(targetUrl)
-            uri.scheme.lowercase() in setOf("http", "https") && !uri.host.isNullOrBlank() &&
-                uri.userInfo == null && uri.fragment == null && (uri.port == -1 || uri.port in 1..65535)
-        }.getOrDefault(false)
-        if (name.isBlank() || name.length > 160 || type != "HTTP" || !validUri || method !in setOf("GET", "HEAD") ||
-            interval !in 10..86400 || timeout !in 1..30 || interval <= timeout || failures !in 1..20 || recoveries !in 1..20 ||
-            expectedCodes.isEmpty() || expectedCodes.size > 100 || expectedCodes.any { it !in 100..599 } || (contains?.length ?: 0) > 500) {
+        if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS") ||
+            interval !in 10..86400 || timeout !in 1..30 || interval <= timeout || failures !in 1..20 || recoveries !in 1..20) {
             return null
         }
-        val config = mapOf(
-            "url" to URI(targetUrl).normalize().toASCIIString(),
-            "method" to method,
-            "expectedStatusCodes" to expectedCodes,
-            "textContains" to contains,
-        )
-        return ValidatedDefinition(name, config, interval, timeout, failures, recoveries, request.critical != false, request.enabled != false)
+        val config: Map<String, Any?> = when (type) {
+            "HTTP" -> {
+                val uri = runCatching { URI(targetUrl) }.getOrNull()
+                if (uri == null || uri.scheme.lowercase() !in setOf("http", "https") || uri.host.isNullOrBlank() ||
+                    uri.userInfo != null || uri.fragment != null || (uri.port != -1 && uri.port !in 1..65535) ||
+                    method !in setOf("GET", "HEAD") || expectedCodes.isEmpty() || expectedCodes.size > 100 ||
+                    expectedCodes.any { it !in 100..599 } || (contains?.length ?: 0) > 500) return null
+                mapOf(
+                    "url" to uri.normalize().toASCIIString(),
+                    "method" to method,
+                    "expectedStatusCodes" to expectedCodes,
+                    "textContains" to contains,
+                )
+            }
+            "TCP" -> {
+                val port = request.port ?: 0
+                if (!validHost(host) || port !in 1..65535) return null
+                mapOf("host" to host, "port" to port)
+            }
+            "DNS" -> {
+                val recordType = request.recordType?.trim()?.uppercase() ?: "A"
+                val resolver = request.resolver?.trim()?.takeIf(String::isNotEmpty)
+                val expected = request.expectedRecordValue?.trim()?.takeIf(String::isNotEmpty)
+                if ((!validDnsName(host) && !(recordType == "PTR" && isIpLiteral(host))) || recordType !in DNS_RECORD_TYPES ||
+                    (resolver != null && !isIpLiteral(resolver)) ||
+                    (expected?.length ?: 0) > 255) return null
+                mapOf("host" to host, "recordType" to recordType, "resolver" to resolver, "expectedValue" to expected)
+            }
+            "TLS" -> {
+                val port = request.port ?: 443
+                val minimumValidityDays = request.minimumValidityDays ?: 14
+                if (!validHost(host) || port !in 1..65535 || minimumValidityDays !in 0..3650) return null
+                mapOf("host" to host, "port" to port, "minimumValidityDays" to minimumValidityDays)
+            }
+            else -> return null
+        }
+        return ValidatedDefinition(type, name, config, interval, timeout, failures, recoveries, request.critical != false, request.enabled != false)
     }
 
     private fun findMonitor(id: UUID, userId: UUID): MonitorResponse? = dataSource.connection.use { connection ->
@@ -251,26 +278,40 @@ class MonitorResource {
         }
     }
 
-    private fun runCheck(monitor: MonitorResponse) = httpCheckService.execute(
-        monitor.targetUrl,
-        monitor.method,
+    private fun runCheck(monitor: MonitorResponse) = protocolCheckService.execute(
+        monitor.type,
+        objectMapper.valueToTree(monitor.toCheckConfig()),
         monitor.timeoutSeconds,
-        monitor.expectedStatusCodes.toSet(),
-        monitor.textContains,
     )
+
+    private fun MonitorResponse.toCheckConfig(): Map<String, Any?> = when (type) {
+        "HTTP" -> mapOf("url" to targetUrl, "method" to method, "expectedStatusCodes" to expectedStatusCodes, "textContains" to textContains)
+        "TCP" -> mapOf("host" to targetHost, "port" to port)
+        "DNS" -> mapOf("host" to targetHost, "recordType" to recordType, "resolver" to resolver, "expectedValue" to expectedRecordValue)
+        "TLS" -> mapOf("host" to targetHost, "port" to port, "minimumValidityDays" to minimumValidityDays)
+        else -> emptyMap()
+    }
 
     private fun parseMonitorId(value: String) = runCatching { UUID.fromString(value) }.getOrNull()
     private fun error(status: Response.Status, code: String, message: String) = Response.status(status).entity(ErrorResponse(code, message)).build()
 
     private fun ResultSet.toMonitor(): MonitorResponse {
         val config = objectMapper.readTree(getString("config"))
+        val type = getString("type")
+        val targetHost = config.path("host").takeUnless { it.isMissingNode || it.isNull }?.asText()
         return MonitorResponse(
             id = getObject("id").toString(),
             resourceId = getObject("resource_id").toString(),
             resourceName = getString("resource_name"),
             name = getString("name"),
-            type = getString("type"),
-            targetUrl = config.path("url").asText(),
+            type = type,
+            targetUrl = config.path("url").asText(targetHost ?: ""),
+            targetHost = targetHost,
+            port = config.path("port").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
+            recordType = config.path("recordType").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            resolver = config.path("resolver").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            expectedRecordValue = config.path("expectedValue").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            minimumValidityDays = config.path("minimumValidityDays").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
             method = config.path("method").asText("GET"),
             intervalSeconds = getInt("interval_seconds"),
             timeoutSeconds = getInt("timeout_seconds"),
@@ -300,6 +341,7 @@ class MonitorResource {
     )
 
     private data class ValidatedDefinition(
+        val type: String,
         val name: String,
         val config: Map<String, Any?>,
         val intervalSeconds: Int,
@@ -313,5 +355,50 @@ class MonitorResource {
     companion object {
         private const val TEST_COOLDOWN_NANOS = 5_000_000_000L
         private val lastManualTestNanos = ConcurrentHashMap<UUID, java.util.concurrent.atomic.AtomicLong>()
+        private val DNS_RECORD_TYPES = setOf("A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "PTR")
+
+        private fun validHost(value: String): Boolean = runCatching {
+            val raw = value.trim()
+            val host = raw.removeSurrounding("[", "]").removeSuffix(".")
+            require(host.isNotBlank() && host.length <= 253 && '/' !in host && '@' !in host && !host.any(Char::isWhitespace))
+            if (raw.startsWith("[") || raw.endsWith("]")) {
+                require(raw.startsWith("[") && raw.endsWith("]") && ':' in host)
+            }
+            if (':' in host) {
+                java.net.InetAddress.getByName(host) is java.net.Inet6Address
+            } else {
+                val ascii = java.net.IDN.toASCII(host, java.net.IDN.USE_STD3_ASCII_RULES)
+                ascii.split('.').all { it.isNotBlank() && it.length <= 63 }
+            }
+        }.getOrDefault(false)
+
+        private fun isIpLiteral(value: String): Boolean {
+            val host = value.trim().removeSurrounding("[", "]")
+            return if (':' in host) {
+                host.matches(Regex("^[0-9a-fA-F:.]+$")) &&
+                    runCatching { java.net.InetAddress.getByName(host) }.isSuccess
+            } else {
+                val octets = host.split('.')
+                octets.size == 4 && octets.all {
+                    it.isNotEmpty() && it.all(Char::isDigit) && it.toIntOrNull()?.let { octet -> octet in 0..255 } == true
+                }
+            }
+        }
+
+        private fun validDnsName(value: String): Boolean = runCatching {
+            val host = value.trim().removeSuffix(".")
+            require(host.isNotBlank() && host.length <= 253 && '/' !in host && '@' !in host && !host.any(Char::isWhitespace))
+            val asciiLabels = host.split('.').map { label ->
+                val ascii = if (label.startsWith("_")) {
+                    require(label.length in 2..63 && label.drop(1).matches(Regex("[A-Za-z0-9_-]+")))
+                    label
+                } else {
+                    java.net.IDN.toASCII(label, java.net.IDN.USE_STD3_ASCII_RULES)
+                }
+                require(ascii.isNotBlank() && ascii.length <= 63)
+                ascii
+            }
+            asciiLabels.joinToString(".").length <= 253
+        }.getOrDefault(false)
     }
 }

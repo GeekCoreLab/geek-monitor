@@ -21,6 +21,7 @@ import javax.net.ssl.SSLHandshakeException
 import kotlin.math.max
 
 data class WebhookResult(val delivered: Boolean, val statusCode: Int?, val errorCode: String?, val summary: String?)
+data class TargetResolution(val addresses: List<InetAddress>, val errorCode: String?)
 
 @ApplicationScoped
 class HttpCheckService {
@@ -29,6 +30,20 @@ class HttpCheckService {
 
     @Inject @field:ConfigProperty(name = "geek-monitor.network.allowed-cidrs", defaultValue = "none")
     lateinit var allowedCidrsConfig: String
+
+    fun resolveAllowedTarget(host: String): TargetResolution {
+        val allowedNetworks = parseAllowedNetworks()
+        val normalizedHost = host.trim().removeSurrounding("[", "]")
+        if (hasBlockedIpLiteral(normalizedHost, allowedNetworks)) return TargetResolution(emptyList(), "TARGET_BLOCKED")
+        return try {
+            TargetResolution(resolveAndValidate(normalizedHost, normalizedHost, allowedNetworks), null)
+        } catch (exception: UnknownHostException) {
+            val code = if (exception.message.orEmpty().contains("network policy")) "TARGET_BLOCKED" else "DNS_FAILURE"
+            TargetResolution(emptyList(), code)
+        } catch (_: Exception) {
+            TargetResolution(emptyList(), "DNS_FAILURE")
+        }
+    }
 
     fun sendWebhook(targetUrl: String, bearerToken: String?, payload: String, idempotencyKey: String): WebhookResult {
         if (payload.toByteArray(Charsets.UTF_8).size > MAX_WEBHOOK_BYTES) {
@@ -212,6 +227,9 @@ class HttpCheckService {
     }
 
     private fun addressAllowed(address: InetAddress, allowedNetworks: List<IpNetwork>): Boolean {
+        if (address is Inet6Address && isIpv4Mapped(address.address)) {
+            return addressAllowed(InetAddress.getByAddress(address.address.copyOfRange(12, 16)), allowedNetworks)
+        }
         if (address.isAnyLocalAddress || address.isLoopbackAddress || address.isLinkLocalAddress || address.isMulticastAddress) return false
         if (isAlwaysRestricted(address)) return false
         if (!isPrivateAddress(address)) return true
@@ -253,6 +271,9 @@ class HttpCheckService {
         }
         return address is Inet6Address && bytes.isNotEmpty() && (bytes[0].toInt() and 0xfe) == 0xfc
     }
+
+    private fun isIpv4Mapped(bytes: ByteArray): Boolean = bytes.size == 16 &&
+        bytes.take(10).all { it == 0.toByte() } && bytes[10] == 0xff.toByte() && bytes[11] == 0xff.toByte()
 
     private fun parseAllowedNetworks(): List<IpNetwork> {
         if (allowedCidrsConfig.isBlank() || allowedCidrsConfig.equals("none", ignoreCase = true)) return emptyList()

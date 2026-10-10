@@ -23,7 +23,7 @@ import javax.sql.DataSource
 class MonitorScheduler {
     @Inject lateinit var dataSource: DataSource
     @Inject lateinit var objectMapper: ObjectMapper
-    @Inject lateinit var checker: HttpCheckService
+    @Inject lateinit var checker: ProtocolCheckService
     @Inject lateinit var notificationOutbox: NotificationOutbox
 
     private val threadNumber = AtomicInteger()
@@ -61,7 +61,7 @@ class MonitorScheduler {
         try {
             val tasks = mutableListOf<CheckTask>()
             connection.prepareStatement(
-                """SELECT m.id, m.resource_id, m.name, r.name AS resource_name, m.config::text AS config,
+                """SELECT m.id, m.resource_id, m.name, m.type, r.name AS resource_name, m.config::text AS config,
                     m.interval_seconds, m.timeout_seconds, m.next_run_at
                     FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id
                     WHERE m.enabled AND m.deleted_at IS NULL AND r.deleted_at IS NULL AND NOT r.paused
@@ -98,17 +98,14 @@ class MonitorScheduler {
 
     private fun ResultSet.toTask(): CheckTask {
         val intervalSeconds = getInt("interval_seconds")
-        val config = objectMapper.readTree(getString("config"))
         return CheckTask(
             executionId = UUID.randomUUID(),
             id = getObject("id", UUID::class.java),
             resourceId = getObject("resource_id", UUID::class.java),
             monitorName = getString("name"),
             resourceName = getString("resource_name"),
-            url = config.path("url").asText(),
-            method = config.path("method").asText("GET"),
-            expectedStatusCodes = config.path("expectedStatusCodes").map { it.asInt() }.toSet(),
-            textContains = config.path("textContains").takeUnless { it.isNull || it.isMissingNode }?.asText(),
+            type = getString("type"),
+            config = getString("config"),
             intervalSeconds = intervalSeconds,
             timeoutSeconds = getInt("timeout_seconds"),
             scheduledAt = getTimestamp("next_run_at").toInstant(),
@@ -117,7 +114,7 @@ class MonitorScheduler {
 
     private fun execute(task: CheckTask) {
         val result = try {
-            checker.execute(task.url, task.method, task.timeoutSeconds, task.expectedStatusCodes, task.textContains)
+            checker.execute(task.type, objectMapper.readTree(task.config), task.timeoutSeconds)
         } catch (_: Exception) {
             CheckResponse("UNKNOWN", null, "CHECKER_ERROR", "检查器发生内部错误", 0, Instant.now().toString())
         }
@@ -318,10 +315,8 @@ class MonitorScheduler {
         val resourceId: UUID,
         val monitorName: String,
         val resourceName: String,
-        val url: String,
-        val method: String,
-        val expectedStatusCodes: Set<Int>,
-        val textContains: String?,
+        val type: String,
+        val config: String,
         val intervalSeconds: Int,
         val timeoutSeconds: Int,
         val scheduledAt: Instant,

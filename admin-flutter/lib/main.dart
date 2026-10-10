@@ -953,7 +953,9 @@ class _DashboardShellState extends State<_DashboardShell> {
       showDialog<void>(
         context: context,
         builder: (context) => _CheckResultDialog(
-          title: monitor['name'] as String? ?? 'HTTP 检查',
+          title:
+              monitor['name'] as String? ??
+              '${_monitorTypeName(monitor['type'] as String? ?? 'HTTP')} 检查',
           result: result,
         ),
       );
@@ -1500,7 +1502,7 @@ class _OverviewPage extends StatelessWidget {
                     child: _MetricCard(
                       label: '主动检查',
                       value: '${monitors.length}',
-                      detail: 'HTTP 检查配置数',
+                      detail: 'HTTP/TCP/DNS/TLS 检查配置数',
                       icon: Icons.monitor_heart_outlined,
                       color: _blue,
                     ),
@@ -2765,12 +2767,12 @@ class _MonitorsPage extends StatelessWidget {
         _PageHeading(
           eyebrow: 'MONITOR CONFIGURATION',
           title: '监控配置',
-          subtitle: '配置 HTTP/HTTPS 检查、连续失败阈值和恢复条件。',
+          subtitle: '配置 HTTP、TCP、DNS、TLS 检查和故障恢复条件。',
           actions: [
             FilledButton.icon(
               onPressed: onCreate,
               icon: const Icon(Icons.add_rounded),
-              label: const Text('添加 HTTP 检查'),
+              label: const Text('添加检查'),
             ),
           ],
         ),
@@ -2788,7 +2790,7 @@ class _MonitorsPage extends StatelessWidget {
               child: _EmptyState(
                 icon: Icons.monitor_heart_outlined,
                 title: '还没有检查项',
-                subtitle: '为网站资源添加 HTTP/HTTPS 检查，即可开始周期探测。',
+                subtitle: '为网站、主机或服务添加 HTTP、TCP、DNS、TLS 检查。',
               ),
             ),
           )
@@ -2803,7 +2805,17 @@ class _MonitorsPage extends StatelessWidget {
                 runSpacing: 14,
                 children: monitors.map((monitor) {
                   final status = monitor['state'] as String? ?? 'PENDING';
-                  final target = monitor['targetUrl'] as String? ?? '';
+                  final type = monitor['type'] as String? ?? 'HTTP';
+                  final host = monitor['targetHost'] as String? ?? '';
+                  final displayHost =
+                      host.contains(':') && !host.startsWith('[')
+                      ? '[$host]'
+                      : host;
+                  final target = type == 'HTTP'
+                      ? monitor['targetUrl'] as String? ?? ''
+                      : type == 'DNS'
+                      ? '$displayHost · ${monitor['recordType']}'
+                      : '$displayHost:${monitor['port']}';
                   final resourceName = monitor['resourceName'] as String? ?? '';
                   return SizedBox(
                     width: width,
@@ -2822,8 +2834,8 @@ class _MonitorsPage extends StatelessWidget {
                                     color: const Color(0xFFEAF0FA),
                                     borderRadius: BorderRadius.circular(12),
                                   ),
-                                  child: const Icon(
-                                    Icons.language_rounded,
+                                  child: Icon(
+                                    _monitorIcon(type),
                                     color: _blue,
                                     size: 20,
                                   ),
@@ -2835,7 +2847,8 @@ class _MonitorsPage extends StatelessWidget {
                                         CrossAxisAlignment.start,
                                     children: [
                                       Text(
-                                        monitor['name'] as String? ?? 'HTTP 检查',
+                                        monitor['name'] as String? ??
+                                            '${_monitorTypeName(type)} 检查',
                                         style: const TextStyle(
                                           fontWeight: FontWeight.w700,
                                           fontSize: 14,
@@ -2843,7 +2856,7 @@ class _MonitorsPage extends StatelessWidget {
                                       ),
                                       const SizedBox(height: 4),
                                       Text(
-                                        '$resourceName  ·  ${monitor['method']}  ·  每 ${monitor['intervalSeconds']} 秒',
+                                        '$resourceName  ·  ${_monitorTypeName(type)}  ·  每 ${monitor['intervalSeconds']} 秒',
                                         style: const TextStyle(
                                           color: _muted,
                                           fontSize: 10,
@@ -2991,10 +3004,16 @@ class _InfoPill extends StatelessWidget {
 
 class _MonitorDraft {
   const _MonitorDraft({
+    required this.type,
     required this.resourceId,
     required this.name,
-    required this.targetUrl,
+    required this.target,
     required this.method,
+    required this.port,
+    required this.recordType,
+    required this.resolver,
+    required this.expectedRecordValue,
+    required this.minimumValidityDays,
     required this.intervalSeconds,
     required this.timeoutSeconds,
     required this.failureThreshold,
@@ -3005,10 +3024,16 @@ class _MonitorDraft {
     required this.enabled,
   });
 
+  final String type;
   final String resourceId;
   final String name;
-  final String targetUrl;
+  final String target;
   final String method;
+  final int? port;
+  final String? recordType;
+  final String? resolver;
+  final String? expectedRecordValue;
+  final int? minimumValidityDays;
   final int intervalSeconds;
   final int timeoutSeconds;
   final int failureThreshold;
@@ -3021,17 +3046,31 @@ class _MonitorDraft {
   Map<String, dynamic> toJson() => {
     'resourceId': resourceId,
     'name': name,
-    'type': 'HTTP',
-    'targetUrl': targetUrl,
-    'method': method,
+    'type': type,
     'intervalSeconds': intervalSeconds,
     'timeoutSeconds': timeoutSeconds,
     'failureThreshold': failureThreshold,
     'recoveryThreshold': recoveryThreshold,
-    'expectedStatusCodes': expectedStatusCodes,
-    'textContains': textContains,
     'critical': critical,
     'enabled': enabled,
+    if (type == 'HTTP') ...{
+      'targetUrl': target,
+      'method': method,
+      'expectedStatusCodes': expectedStatusCodes,
+      'textContains': textContains,
+    },
+    if (type == 'TCP') ...{'targetHost': target, 'port': port},
+    if (type == 'DNS') ...{
+      'targetHost': target,
+      'recordType': recordType,
+      'resolver': resolver,
+      'expectedRecordValue': expectedRecordValue,
+    },
+    if (type == 'TLS') ...{
+      'targetHost': target,
+      'port': port,
+      'minimumValidityDays': minimumValidityDays,
+    },
   };
 }
 
@@ -3046,21 +3085,38 @@ class _MonitorDialog extends StatefulWidget {
 
 class _MonitorDialogState extends State<_MonitorDialog> {
   final _formKey = GlobalKey<FormState>();
+  late String _type = widget.existing?['type'] as String? ?? 'HTTP';
   late String _resourceId =
       widget.existing?['resourceId'] as String? ??
       widget.resources.first['id'] as String;
   late String _method = widget.existing?['method'] as String? ?? 'GET';
+  late String _recordType = widget.existing?['recordType'] as String? ?? 'A';
   late final _name = TextEditingController(
     text: widget.existing?['name'] as String? ?? '',
   );
   late final _target = TextEditingController(
-    text: widget.existing?['targetUrl'] as String? ?? '',
+    text: _type == 'HTTP'
+        ? (widget.existing?['targetUrl'] as String? ?? '')
+        : (widget.existing?['targetHost'] as String? ?? ''),
+  );
+  late final _port = TextEditingController(
+    text: '${widget.existing?['port'] ?? (_type == 'TLS' ? 443 : 80)}',
+  );
+  late final _resolver = TextEditingController(
+    text: widget.existing?['resolver'] as String? ?? '',
+  );
+  late final _expectedRecordValue = TextEditingController(
+    text: widget.existing?['expectedRecordValue'] as String? ?? '',
+  );
+  late final _minimumValidityDays = TextEditingController(
+    text: '${widget.existing?['minimumValidityDays'] ?? 14}',
   );
   late final _interval = TextEditingController(
-    text: '${widget.existing?['intervalSeconds'] ?? 60}',
+    text:
+        '${widget.existing?['intervalSeconds'] ?? (_type == 'TLS' ? 21600 : 60)}',
   );
   late final _timeout = TextEditingController(
-    text: '${widget.existing?['timeoutSeconds'] ?? 10}',
+    text: '${widget.existing?['timeoutSeconds'] ?? (_type == 'DNS' ? 5 : 10)}',
   );
   late final _failure = TextEditingController(
     text: '${widget.existing?['failureThreshold'] ?? 3}',
@@ -3090,6 +3146,10 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   void dispose() {
     _name.dispose();
     _target.dispose();
+    _port.dispose();
+    _resolver.dispose();
+    _expectedRecordValue.dispose();
+    _minimumValidityDays.dispose();
     _interval.dispose();
     _timeout.dispose();
     _failure.dispose();
@@ -3129,9 +3189,29 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     return parsed.isEmpty ? null : (parsed.toList()..sort());
   }
 
+  void _changeType(String type) {
+    final previousType = _type;
+    final previousIntervalDefault = previousType == 'TLS' ? 21600 : 60;
+    final nextIntervalDefault = type == 'TLS' ? 21600 : 60;
+    final previousTimeoutDefault = previousType == 'DNS' ? 5 : 10;
+    final nextTimeoutDefault = type == 'DNS' ? 5 : 10;
+    final previousPortDefault = previousType == 'TLS' ? 443 : 80;
+    final nextPortDefault = type == 'TLS' ? 443 : 80;
+    if (_interval.text == '$previousIntervalDefault') {
+      _interval.text = '$nextIntervalDefault';
+    }
+    if (_timeout.text == '$previousTimeoutDefault') {
+      _timeout.text = '$nextTimeoutDefault';
+    }
+    if (_port.text == '$previousPortDefault') _port.text = '$nextPortDefault';
+    setState(() => _type = type);
+  }
+
   @override
   Widget build(BuildContext context) => AlertDialog(
-    title: Text(widget.existing == null ? '配置 HTTP 检查' : '编辑 HTTP 检查'),
+    title: Text(
+      '${widget.existing == null ? '配置' : '编辑'}${_monitorTypeName(_type)}检查',
+    ),
     content: SizedBox(
       width: 560,
       child: Form(
@@ -3156,6 +3236,21 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                 onChanged: (value) => setState(() => _resourceId = value!),
               ),
               const SizedBox(height: 11),
+              DropdownButtonFormField<String>(
+                initialValue: _type,
+                decoration: const InputDecoration(labelText: '检查类型'),
+                items: const [
+                  DropdownMenuItem(value: 'HTTP', child: Text('HTTP/HTTPS')),
+                  DropdownMenuItem(value: 'TCP', child: Text('TCP 端口')),
+                  DropdownMenuItem(value: 'DNS', child: Text('DNS 记录')),
+                  DropdownMenuItem(value: 'TLS', child: Text('TLS 证书')),
+                ],
+                onChanged: (value) {
+                  if (value == null) return;
+                  _changeType(value);
+                },
+              ),
+              const SizedBox(height: 11),
               TextFormField(
                 controller: _name,
                 autofocus: true,
@@ -3168,61 +3263,139 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     value == null || value.trim().isEmpty ? '请输入检查名称' : null,
               ),
               const SizedBox(height: 11),
-              TextFormField(
-                controller: _target,
-                keyboardType: TextInputType.url,
-                decoration: const InputDecoration(
-                  labelText: 'HTTP/HTTPS 地址',
-                  hintText: 'https://example.com/health',
-                ),
-                validator: (value) {
-                  final uri = Uri.tryParse(value?.trim() ?? '');
-                  return uri == null ||
-                          !uri.hasAuthority ||
-                          !{'http', 'https'}.contains(uri.scheme) ||
-                          uri.userInfo.isNotEmpty
-                      ? '请输入有效的 HTTP 或 HTTPS 地址'
-                      : null;
-                },
-              ),
-              const SizedBox(height: 11),
-              Row(
-                children: [
-                  Expanded(
-                    child: DropdownButtonFormField<String>(
-                      initialValue: _method,
-                      decoration: const InputDecoration(labelText: '请求方法'),
-                      items: const [
-                        DropdownMenuItem(value: 'GET', child: Text('GET')),
-                        DropdownMenuItem(value: 'HEAD', child: Text('HEAD')),
-                      ],
-                      onChanged: (value) => setState(() => _method = value!),
-                    ),
+              if (_type == 'HTTP') ...[
+                TextFormField(
+                  controller: _target,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: 'HTTP/HTTPS 地址',
+                    hintText: 'https://example.com/health',
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: TextFormField(
-                      controller: _statuses,
-                      decoration: const InputDecoration(
-                        labelText: '成功状态码',
-                        hintText: '200-299',
+                  validator: (value) {
+                    final uri = Uri.tryParse(value?.trim() ?? '');
+                    return uri == null ||
+                            !uri.hasAuthority ||
+                            !{'http', 'https'}.contains(uri.scheme) ||
+                            uri.userInfo.isNotEmpty
+                        ? '请输入有效的 HTTP 或 HTTPS 地址'
+                        : null;
+                  },
+                ),
+                const SizedBox(height: 11),
+                Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButtonFormField<String>(
+                        initialValue: _method,
+                        decoration: const InputDecoration(labelText: '请求方法'),
+                        items: const [
+                          DropdownMenuItem(value: 'GET', child: Text('GET')),
+                          DropdownMenuItem(value: 'HEAD', child: Text('HEAD')),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) setState(() => _method = value);
+                        },
                       ),
-                      validator: (_) => _parseStatuses() == null
-                          ? '使用逗号或范围填写，如 200-204, 301'
-                          : null,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextFormField(
+                        controller: _statuses,
+                        decoration: const InputDecoration(
+                          labelText: '成功状态码',
+                          hintText: '200-299',
+                        ),
+                        validator: (_) => _parseStatuses() == null
+                            ? '使用逗号或范围填写，如 200-204, 301'
+                            : null,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 11),
+                TextFormField(
+                  controller: _contains,
+                  maxLength: 500,
+                  decoration: const InputDecoration(
+                    labelText: '响应内容必须包含（可选）',
+                    hintText: '例：service is healthy',
+                  ),
+                ),
+              ] else ...[
+                TextFormField(
+                  controller: _target,
+                  keyboardType: TextInputType.url,
+                  decoration: InputDecoration(
+                    labelText: _type == 'DNS' ? '查询域名' : '目标主机名',
+                    hintText: _type == 'DNS'
+                        ? (_recordType == 'PTR'
+                              ? '域名或 IP 地址'
+                              : 'status.example.com')
+                        : 'example.com',
+                  ),
+                  validator: (value) => !_validMonitorHost(value ?? '')
+                      ? '请输入有效主机名或 IP 地址'
+                      : null,
+                ),
+                const SizedBox(height: 11),
+                if (_type == 'TCP' || _type == 'TLS')
+                  _IntField(
+                    controller: _port,
+                    label: '端口',
+                    minimum: 1,
+                    maximum: 65535,
+                  ),
+                if (_type == 'DNS') ...[
+                  DropdownButtonFormField<String>(
+                    initialValue: _recordType,
+                    decoration: const InputDecoration(labelText: '记录类型'),
+                    items: const [
+                      DropdownMenuItem(value: 'A', child: Text('A')),
+                      DropdownMenuItem(value: 'AAAA', child: Text('AAAA')),
+                      DropdownMenuItem(value: 'CNAME', child: Text('CNAME')),
+                      DropdownMenuItem(value: 'MX', child: Text('MX')),
+                      DropdownMenuItem(value: 'TXT', child: Text('TXT')),
+                      DropdownMenuItem(value: 'NS', child: Text('NS')),
+                      DropdownMenuItem(value: 'SRV', child: Text('SRV')),
+                      DropdownMenuItem(value: 'PTR', child: Text('PTR 反向解析')),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) setState(() => _recordType = value);
+                    },
+                  ),
+                  const SizedBox(height: 11),
+                  TextFormField(
+                    controller: _resolver,
+                    decoration: const InputDecoration(
+                      labelText: 'DNS 解析器 IP（可选）',
+                      hintText: '留空使用系统解析器',
+                    ),
+                    validator: (value) =>
+                        value != null &&
+                            value.trim().isNotEmpty &&
+                            !_validMonitorHost(value, ipOnly: true)
+                        ? '请填写解析器 IP 地址'
+                        : null,
+                  ),
+                  const SizedBox(height: 11),
+                  TextFormField(
+                    controller: _expectedRecordValue,
+                    decoration: const InputDecoration(
+                      labelText: '期望记录值（可选）',
+                      hintText: '例如：203.0.113.10',
                     ),
                   ),
                 ],
-              ),
-              const SizedBox(height: 11),
-              TextFormField(
-                controller: _contains,
-                maxLength: 500,
-                decoration: const InputDecoration(
-                  labelText: '响应内容必须包含（可选）',
-                  hintText: '例：service is healthy',
-                ),
-              ),
+                if (_type == 'TLS') ...[
+                  const SizedBox(height: 11),
+                  _IntField(
+                    controller: _minimumValidityDays,
+                    label: '最小证书剩余天数',
+                    minimum: 0,
+                    maximum: 3650,
+                  ),
+                ],
+              ],
               const SizedBox(height: 11),
               Row(
                 children: [
@@ -3284,10 +3457,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                 onChanged: (value) => setState(() => _enabled = value),
                 title: const Text('立即启用', style: TextStyle(fontSize: 13)),
               ),
-              const Align(
+              Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  '检查间隔必须大于超时时间；未设置自定义断言时，默认接受 200–299。',
+                  _type == 'HTTP'
+                      ? '检查间隔必须大于超时时间；未设置自定义断言时，默认接受 200–299。'
+                      : '检查间隔必须大于超时时间；目标网络访问仍遵循服务端允许网段策略。',
                   style: TextStyle(color: _muted, fontSize: 10, height: 1.4),
                 ),
               ),
@@ -3321,10 +3496,20 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     Navigator.pop(
       context,
       _MonitorDraft(
+        type: _type,
         resourceId: _resourceId,
         name: _name.text.trim(),
-        targetUrl: _target.text.trim(),
+        target: _target.text.trim(),
         method: _method,
+        port: _type == 'TCP' || _type == 'TLS' ? int.parse(_port.text) : null,
+        recordType: _type == 'DNS' ? _recordType : null,
+        resolver: _resolver.text.trim().isEmpty ? null : _resolver.text.trim(),
+        expectedRecordValue: _expectedRecordValue.text.trim().isEmpty
+            ? null
+            : _expectedRecordValue.text.trim(),
+        minimumValidityDays: _type == 'TLS'
+            ? int.parse(_minimumValidityDays.text)
+            : null,
         intervalSeconds: interval,
         timeoutSeconds: timeout,
         failureThreshold: int.parse(_failure.text),
@@ -3374,7 +3559,12 @@ class _CheckResultDialog extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final success = result['status'] == 'UP';
-    final color = success ? const Color(0xFF2C8B66) : const Color(0xFFB44438);
+    final unknown = result['status'] == 'UNKNOWN';
+    final color = success
+        ? const Color(0xFF2C8B66)
+        : unknown
+        ? const Color(0xFF7B8794)
+        : const Color(0xFFB44438);
     return AlertDialog(
       title: Text(title),
       content: SizedBox(
@@ -3386,12 +3576,20 @@ class _CheckResultDialog extends StatelessWidget {
             Row(
               children: [
                 Icon(
-                  success ? Icons.check_circle_outline : Icons.error_outline,
+                  success
+                      ? Icons.check_circle_outline
+                      : unknown
+                      ? Icons.help_outline_rounded
+                      : Icons.error_outline,
                   color: color,
                 ),
                 const SizedBox(width: 9),
                 Text(
-                  success ? '检查通过' : '检查失败',
+                  success
+                      ? '检查通过'
+                      : unknown
+                      ? '结果未知'
+                      : '检查失败',
                   style: TextStyle(color: color, fontWeight: FontWeight.w700),
                 ),
               ],
@@ -3441,10 +3639,13 @@ class _CheckHistoryDialog extends StatelessWidget {
               itemBuilder: (context, index) {
                 final result = results[index];
                 final success = result['status'] == 'UP';
+                final unknown = result['status'] == 'UNKNOWN';
                 final color = success
                     ? const Color(0xFF2C8B66)
                     : result['status'] == 'RUNNING'
                     ? const Color(0xFF7C6CAC)
+                    : unknown
+                    ? const Color(0xFF7B8794)
                     : const Color(0xFFB44438);
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 9),
@@ -3453,6 +3654,8 @@ class _CheckHistoryDialog extends StatelessWidget {
                       Icon(
                         success
                             ? Icons.check_circle_outline
+                            : unknown
+                            ? Icons.help_outline_rounded
                             : Icons.error_outline,
                         color: color,
                         size: 17,
@@ -4390,6 +4593,55 @@ IconData _resourceIcon(String type) => switch (type) {
   'HEARTBEAT' => Icons.favorite_border_rounded,
   _ => Icons.hub_outlined,
 };
+
+IconData _monitorIcon(String type) => switch (type) {
+  'TCP' => Icons.cable_rounded,
+  'DNS' => Icons.dns_outlined,
+  'TLS' => Icons.verified_user_outlined,
+  _ => Icons.language_rounded,
+};
+
+String _monitorTypeName(String type) => switch (type) {
+  'TCP' => 'TCP',
+  'DNS' => 'DNS',
+  'TLS' => 'TLS',
+  _ => 'HTTP',
+};
+
+bool _validMonitorHost(String value, {bool ipOnly = false}) {
+  final raw = value.trim();
+  if (raw.isEmpty ||
+      raw.contains('/') ||
+      raw.contains('@') ||
+      raw.contains(RegExp(r'\s'))) {
+    return false;
+  }
+  final unwrapped = raw.startsWith('[') && raw.endsWith(']')
+      ? raw.substring(1, raw.length - 1)
+      : raw;
+  final ipv4Parts = unwrapped.split('.');
+  final isIpv4 =
+      ipv4Parts.length == 4 &&
+      ipv4Parts.every((part) {
+        final value = int.tryParse(part);
+        return value != null && value >= 0 && value <= 255;
+      });
+  final isIpv6 =
+      unwrapped.contains(':') &&
+      RegExp(r'^[0-9a-fA-F:.]+$').hasMatch(unwrapped) &&
+      (Uri.tryParse('https://[$unwrapped]')?.host.isNotEmpty ?? false);
+  if (ipOnly) return isIpv4 || isIpv6;
+  final hostForUri = unwrapped.contains(':') ? '[$unwrapped]' : raw;
+  final uri = Uri.tryParse('https://$hostForUri');
+  return uri != null &&
+      uri.hasAuthority &&
+      uri.host.isNotEmpty &&
+      !uri.hasPort &&
+      uri.userInfo.isEmpty &&
+      uri.path.isEmpty &&
+      uri.query.isEmpty &&
+      uri.fragment.isEmpty;
+}
 
 String _resourceTypeName(String type) => switch (type) {
   'WEBSITE' => '网站',
