@@ -175,21 +175,28 @@ class ProtocolCheckService {
 
         return try {
             dataSource.connection.use { connection ->
-                val currentState = connection.prepareStatement(
-                    "SELECT current_state FROM monitor WHERE id = ? AND resource_id = ? AND type = 'METRIC_THRESHOLD' AND deleted_at IS NULL",
+                val ruleState = connection.prepareStatement(
+                    """SELECT m.current_state, r.type AS resource_type
+                       FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id
+                       WHERE m.id = ? AND m.resource_id = ? AND m.type = 'METRIC_THRESHOLD' AND m.deleted_at IS NULL""",
                 ).use { statement ->
                     statement.setObject(1, monitorId)
                     statement.setObject(2, resourceId)
-                    statement.executeQuery().use { rows -> if (rows.next()) rows.getString("current_state") else null }
+                    statement.executeQuery().use { rows ->
+                        if (rows.next()) rows.getString("current_state") to rows.getString("resource_type") else null
+                    }
                 } ?: return result("UNKNOWN", "CHECK_CONFIG_INVALID", "指标阈值规则已删除或资源不匹配")
+                val currentState = ruleState.first
+                val databaseMetric = ruleState.second == "DATABASE"
+                val sampleSource = if (databaseMetric) {
+                    "SELECT labels, sampled_at, value FROM database_metric_sample WHERE resource_id = ? AND metric_name = ? AND sampled_at >= ? AND sampled_at <= ?"
+                } else {
+                    "SELECT labels, sampled_at, value FROM metric_sample WHERE resource_id = ? AND metric_name = ? AND trusted AND sampled_at >= ? AND sampled_at <= ?"
+                }
                 val windowStart = checkedAt.minusSeconds(windowSeconds.toLong())
                 val series = connection.prepareStatement(
-                    """WITH points AS (
-                           SELECT labels, sampled_at, avg(value) AS value
-                           FROM metric_sample
-                           WHERE resource_id = ? AND metric_name = ? AND trusted
-                             AND sampled_at >= ? AND sampled_at <= ?
-                           GROUP BY labels, sampled_at
+                    """WITH raw_points AS ($sampleSource), points AS (
+                           SELECT labels, sampled_at, avg(value) AS value FROM raw_points GROUP BY labels, sampled_at
                        ), ordered AS (
                            SELECT labels, sampled_at, value,
                                   EXTRACT(EPOCH FROM sampled_at - lag(sampled_at) OVER (PARTITION BY labels ORDER BY sampled_at)) AS gap_seconds
@@ -228,6 +235,12 @@ class ProtocolCheckService {
                             startGap > sampleIntervalSeconds * 2L || endGap > sampleIntervalSeconds * 2L ||
                             sampleSeries.maximumGapSeconds > sampleIntervalSeconds * 2.0
                     }) {
+                    if (databaseMetric) {
+                        return result(
+                            "UNKNOWN", "DATABASE_METRIC_DATA_INSUFFICIENT",
+                            "数据库连接指标样本不足或覆盖窗口存在过大空洞；指标权限不足不会判为数据库不可用",
+                        )
+                    }
                     val agentLastSeen = connection.prepareStatement(
                         "SELECT max(COALESCE(last_seen_at, created_at)) FROM agent WHERE resource_id = ? AND revoked_at IS NULL",
                     ).use { statement ->
@@ -292,7 +305,7 @@ class ProtocolCheckService {
     )
 
     companion object {
-        private val METRIC_NAMES = MetricCatalog.hostMetricNames
+        private val METRIC_NAMES = MetricCatalog.thresholdMetricNames
         private val METRIC_OPERATORS = setOf("GT", "GTE", "LT", "LTE")
         private const val MIN_METRIC_WINDOW_SECONDS = 120
         private const val MAX_METRIC_WINDOW_SECONDS = 86400

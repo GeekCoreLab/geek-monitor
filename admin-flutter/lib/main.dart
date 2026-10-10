@@ -2298,9 +2298,15 @@ class _ResourcesPage extends StatelessWidget {
                                   Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
-                                      if (resource['type'] == 'HOST')
+                                      if (const {
+                                        'HOST',
+                                        'DATABASE',
+                                      }.contains(resource['type']))
                                         IconButton(
-                                          tooltip: '查看主机指标曲线',
+                                          tooltip:
+                                              resource['type'] == 'DATABASE'
+                                              ? '查看数据库指标曲线'
+                                              : '查看主机指标曲线',
                                           onPressed: () => onMetrics(resource),
                                           icon: const Icon(
                                             Icons.show_chart_rounded,
@@ -2601,15 +2607,19 @@ class _MetricsDialog extends StatelessWidget {
         .toList();
     final stepSeconds = result['stepSeconds'] as int? ?? 60;
     return AlertDialog(
-      title: Text('${resource['name']} · 主机指标'),
+      title: Text(
+        '${resource['name']} · ${resource['type'] == 'DATABASE' ? '数据库指标' : '主机指标'}',
+      ),
       content: SizedBox(
         width: 760,
         height: 540,
         child: series.isEmpty
-            ? const _EmptyState(
+            ? _EmptyState(
                 icon: Icons.show_chart_rounded,
-                title: '当前时间范围没有可信指标',
-                subtitle: 'Agent 开始上报后，主机趋势会显示在这里。',
+                title: '当前时间范围没有指标',
+                subtitle: resource['type'] == 'DATABASE'
+                    ? '数据库检查采集到可用连接统计后，曲线会显示在这里。账号没有统计权限时不会生成对应指标。'
+                    : 'Agent 开始上报后，主机趋势会显示在这里。',
               )
             : ListView.separated(
                 itemCount: series.length,
@@ -2805,6 +2815,9 @@ String _metricName(String value) => switch (value) {
   'disk_inode_used_percent' => 'inode 使用率（%）',
   'network_receive_bytes_per_second' => '网络接收（字节/秒）',
   'network_transmit_bytes_per_second' => '网络发送（字节/秒）',
+  'database_connections' => '数据库当前连接数（个）',
+  'database_connection_limit' => '数据库连接上限（个）',
+  'database_connections_percent' => '数据库连接使用率（%）',
   _ => value,
 };
 
@@ -4623,7 +4636,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
       final resourceType = resource['type'] as String? ?? '';
       return switch (type) {
         'HEARTBEAT' => resourceType == 'HEARTBEAT',
-        'METRIC_THRESHOLD' => resourceType == 'HOST',
+        'METRIC_THRESHOLD' => resourceType == _metricResourceType(_metricName),
         'POSTGRESQL' || 'MYSQL' || 'REDIS' => resourceType == 'DATABASE',
         _ => resourceType != 'HEARTBEAT',
       };
@@ -4985,16 +4998,22 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     color: const Color(0xFFF3F6FB),
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: const Text(
-                    '仅使用可信 Agent 样本。触发窗口至少覆盖 80% 的采样点，且任意相邻采样间隔不能超过两倍采样周期；数据不足时状态为未知。',
-                    style: TextStyle(color: _muted, fontSize: 11, height: 1.45),
+                  child: Text(
+                    _isDatabaseMetric(_metricName)
+                        ? '使用数据库检查采集的连接数、上限或使用率。窗口至少覆盖 80% 的样本且相邻采样间隔不超过两倍周期；权限不足时指标显示未知，不会把数据库判为宕机。'
+                        : '仅使用可信 Agent 样本。触发窗口至少覆盖 80% 的采样点，且任意相邻采样间隔不能超过两倍采样周期；数据不足时状态为未知。',
+                    style: const TextStyle(
+                      color: _muted,
+                      fontSize: 11,
+                      height: 1.45,
+                    ),
                   ),
                 ),
                 const SizedBox(height: 11),
                 DropdownButtonFormField<String>(
                   initialValue: _metricName,
-                  decoration: const InputDecoration(labelText: '主机指标'),
-                  items: _hostMetricNames
+                  decoration: const InputDecoration(labelText: '监控指标'),
+                  items: _thresholdMetricNames
                       .map(
                         (metric) => DropdownMenuItem(
                           value: metric,
@@ -5003,7 +5022,18 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                       )
                       .toList(),
                   onChanged: (value) {
-                    if (value != null) setState(() => _metricName = value);
+                    if (value == null) return;
+                    final compatibleResource = widget.resources.firstWhere(
+                      (resource) =>
+                          resource['type'] == _metricResourceType(value),
+                      orElse: () => const <String, dynamic>{},
+                    );
+                    setState(() {
+                      _metricName = value;
+                      if (compatibleResource.isNotEmpty) {
+                        _resourceId = compatibleResource['id'] as String;
+                      }
+                    });
                   },
                 ),
                 const SizedBox(height: 11),
@@ -5082,7 +5112,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                 _IntField(
                   controller: _metricWindow,
                   label: '持续窗口（秒）',
-                  minimum: 120,
+                  minimum: _isDatabaseMetric(_metricName) ? 240 : 120,
                   maximum: 86400,
                 ),
                 const SizedBox(height: 5),
@@ -5244,10 +5274,11 @@ class _MonitorDialogState extends State<_MonitorDialog> {
       ).showSnackBar(const SnackBar(content: Text('心跳任务必须绑定心跳类型资源')));
       return;
     }
-    if (_type == 'METRIC_THRESHOLD' && selectedResource['type'] != 'HOST') {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('主机指标阈值规则必须绑定 HOST 资源')));
+    if (_type == 'METRIC_THRESHOLD' &&
+        selectedResource['type'] != _metricResourceType(_metricName)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('指标阈值规则必须绑定与指标类型匹配的 HOST 或 DATABASE 资源')),
+      );
       return;
     }
     if (const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(_type) &&
@@ -6469,7 +6500,7 @@ int _defaultMonitorPort(String type) => switch (type) {
   _ => 80,
 };
 
-const _hostMetricNames = [
+const _thresholdMetricNames = [
   'cpu_usage_percent',
   'load_1m',
   'memory_used_percent',
@@ -6479,6 +6510,9 @@ const _hostMetricNames = [
   'disk_inode_used_percent',
   'network_receive_bytes_per_second',
   'network_transmit_bytes_per_second',
+  'database_connections',
+  'database_connection_limit',
+  'database_connections_percent',
 ];
 
 String _metricDisplayName(String name) => switch (name) {
@@ -6491,8 +6525,16 @@ String _metricDisplayName(String name) => switch (name) {
   'disk_inode_used_percent' => '磁盘 inode 使用率（按挂载点）',
   'network_receive_bytes_per_second' => '网络接收速率（按接口）',
   'network_transmit_bytes_per_second' => '网络发送速率（按接口）',
+  'database_connections' => '数据库当前连接数',
+  'database_connection_limit' => '数据库连接上限',
+  'database_connections_percent' => '数据库连接使用率',
   _ => name,
 };
+
+bool _isDatabaseMetric(String name) => name.startsWith('database_');
+
+String _metricResourceType(String name) =>
+    _isDatabaseMetric(name) ? 'DATABASE' : 'HOST';
 
 String _metricUnit(String name) => name.endsWith('_percent')
     ? '(%)'

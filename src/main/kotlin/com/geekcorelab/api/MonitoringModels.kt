@@ -71,6 +71,7 @@ data class MonitorResponse(
     val metricRecoveryValue: Double? = null,
     val metricWindowSeconds: Int? = null,
     val metricSeverity: String? = null,
+    val metricSampleIntervalSeconds: Int? = null,
     val databaseName: String? = null,
     val databaseUsername: String? = null,
     val databasePasswordConfigured: Boolean = false,
@@ -87,6 +88,7 @@ data class CheckResponse(
     val checkedAt: String,
     val certificateExpiresAt: String? = null,
     val certificateDaysRemaining: Long? = null,
+    val metrics: Map<String, Double> = emptyMap(),
 )
 
 data class CheckHistoryResponse(

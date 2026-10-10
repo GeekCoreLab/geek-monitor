@@ -150,6 +150,9 @@ class MonitorScheduler {
                     statement.setObject(7, task.executionId)
                     statement.executeUpdate()
                 }
+                if (task.type in DATABASE_MONITOR_TYPES && result.status == "UP" && result.metrics.isNotEmpty()) {
+                    persistDatabaseMetricSamples(connection, task, result)
+                }
 
                 val monitor = connection.prepareStatement(
                     "SELECT current_state, consecutive_failures, consecutive_successes, failure_threshold, recovery_threshold, critical, deleted_at, last_result_at FROM monitor WHERE id = ? FOR UPDATE",
@@ -614,6 +617,25 @@ class MonitorScheduler {
         else -> "AVAILABILITY"
     }
 
+    private fun persistDatabaseMetricSamples(connection: Connection, task: CheckTask, result: CheckResponse) {
+        val sampledAt = runCatching { Instant.parse(result.checkedAt) }.getOrElse { Instant.now() }
+        connection.prepareStatement(
+            """INSERT INTO database_metric_sample(monitor_id, resource_id, metric_name, labels, value, sampled_at)
+               VALUES (?, ?, ?, '{}'::jsonb, ?, ?) ON CONFLICT DO NOTHING""",
+        ).use { statement ->
+            result.metrics.forEach { (name, value) ->
+                if (name !in com.geekcorelab.api.MetricCatalog.databaseMetricNames || !value.isFinite() || value < 0) return@forEach
+                statement.setObject(1, task.id)
+                statement.setObject(2, task.resourceId)
+                statement.setString(3, name)
+                statement.setDouble(4, value)
+                statement.setTimestamp(5, java.sql.Timestamp.from(sampledAt))
+                statement.addBatch()
+            }
+            statement.executeBatch()
+        }
+    }
+
     private fun updateResourceHealth(connection: Connection, resourceId: UUID) {
         val aggregate = connection.prepareStatement(
             "SELECT count(*) AS total, bool_or(current_state = 'DOWN') AS has_down, bool_or(current_state = 'UNKNOWN') AS has_unknown, bool_or(current_state = 'PENDING') AS has_pending, bool_or(current_state = 'DEGRADED') AS has_degraded FROM monitor WHERE resource_id = ? AND critical AND enabled AND deleted_at IS NULL",
@@ -680,5 +702,6 @@ class MonitorScheduler {
 
     companion object {
         private const val MAX_CLAIM_PER_TICK = 20
+        private val DATABASE_MONITOR_TYPES = setOf("POSTGRESQL", "MYSQL", "REDIS")
     }
 }

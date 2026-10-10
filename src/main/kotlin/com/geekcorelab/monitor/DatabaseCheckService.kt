@@ -55,8 +55,8 @@ class DatabaseCheckService {
         }
         val tls = config.path("tls").asBoolean(false)
         return when (kind) {
-            "POSTGRESQL", "MYSQL" -> checkJdbc(kind, config, resolution.addresses, port, password, tls, timeoutSeconds, started, ::result)
-            "REDIS" -> checkRedis(config, resolution.addresses, host, port, password, tls, timeoutSeconds, started, ::result)
+            "POSTGRESQL", "MYSQL" -> checkJdbc(kind, config, resolution.addresses, port, password, tls, timeoutSeconds, started, checkedAt, ::result)
+            "REDIS" -> checkRedis(config, resolution.addresses, host, port, password, tls, timeoutSeconds, started, checkedAt, ::result)
             else -> result("UNKNOWN", "UNSUPPORTED_CHECK", "不支持此数据库检查类型")
         }
     }
@@ -70,6 +70,7 @@ class DatabaseCheckService {
         tls: Boolean,
         timeoutSeconds: Int,
         started: Long,
+        checkedAt: Instant,
         result: (String, String?, String?) -> CheckResponse,
     ): CheckResponse {
         val database = config.path("databaseName").asText("")
@@ -113,8 +114,15 @@ class DatabaseCheckService {
                             if (!rows.next() || rows.getInt(1) != 1) throw SQLException("fixed health query returned no result", "HY000")
                         }
                     }
+                    val metrics = readJdbcConnectionMetrics(kind, connection)
+                    val utilization = metrics["database_connections_percent"]
+                        ?.let { "; 数据库连接使用率 %.1f%%".format(java.util.Locale.ROOT, it) }
+                        .orEmpty()
+                    return CheckResponse(
+                        "UP", null, null, "数据库只读探测成功$utilization",
+                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), checkedAt.toString(), metrics = metrics,
+                    )
                 }
-                return result("UP", null, "数据库只读探测成功")
             } catch (exception: Exception) {
                 lastException = exception
                 if (deadline - System.nanoTime() <= 0) break
@@ -132,6 +140,7 @@ class DatabaseCheckService {
         tls: Boolean,
         timeoutSeconds: Int,
         started: Long,
+        checkedAt: Instant,
         result: (String, String?, String?) -> CheckResponse,
     ): CheckResponse {
         val username = config.path("username").asText("")
@@ -172,9 +181,16 @@ class DatabaseCheckService {
                     writeRedisCommand(output, listOf("PING"))
                     updateReadTimeout(connected, deadline)
                     if (readRedisReply(input) != "PONG") throw RedisCheckException("Redis PING returned an unexpected response")
+                    val metrics = readRedisConnectionMetrics(input, output, connected, deadline)
+                    val utilization = metrics["database_connections_percent"]
+                        ?.let { "; Redis 连接使用率 %.1f%%".format(java.util.Locale.ROOT, it) }
+                        .orEmpty()
+                    return CheckResponse(
+                        "UP", null, null, "Redis 只读 PING 探测成功$utilization",
+                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), checkedAt.toString(), metrics = metrics,
+                    )
                     }
                 }
-                return result("UP", null, "Redis 只读 PING 探测成功")
             } catch (exception: Exception) {
                 lastException = exception
                 if (deadline - System.nanoTime() <= 0) break
@@ -209,6 +225,68 @@ class DatabaseCheckService {
                 result("DOWN", "CONNECTION_FAILED", "无法建立数据库连接")
             exception != null -> result("DOWN", "DATABASE_QUERY_FAILED", "数据库只读探测失败")
             else -> result("DOWN", "CONNECTION_FAILED", "无法建立数据库连接")
+        }
+    }
+
+    private fun readJdbcConnectionMetrics(kind: String, connection: java.sql.Connection): Map<String, Double> {
+        val connected = runCatching {
+            connection.createStatement().use { statement ->
+                statement.queryTimeout = METRIC_QUERY_TIMEOUT_SECONDS
+                val query = if (kind == "POSTGRESQL") {
+                    "SELECT count(*) FROM pg_stat_activity"
+                } else {
+                    "SHOW GLOBAL STATUS LIKE 'Threads_connected'"
+                }
+                statement.executeQuery(query).use { rows ->
+                    if (!rows.next()) null else if (kind == "POSTGRESQL") rows.getDouble(1) else rows.getString(2)?.toDoubleOrNull()
+                }
+            }
+        }.getOrNull()
+        val maximum = runCatching {
+            connection.createStatement().use { statement ->
+                statement.queryTimeout = METRIC_QUERY_TIMEOUT_SECONDS
+                val query = if (kind == "POSTGRESQL") {
+                    "SELECT setting FROM pg_settings WHERE name = 'max_connections'"
+                } else {
+                    "SHOW GLOBAL VARIABLES LIKE 'max_connections'"
+                }
+                statement.executeQuery(query).use { rows ->
+                    if (!rows.next()) null else if (kind == "POSTGRESQL") rows.getString(1)?.toDoubleOrNull() else rows.getString(2)?.toDoubleOrNull()
+                }
+            }
+        }.getOrNull()
+        return connectionMetrics(connected, maximum)
+    }
+
+    private fun readRedisConnectionMetrics(
+        input: DataInputStream,
+        output: BufferedOutputStream,
+        socket: Socket,
+        deadline: Long,
+    ): Map<String, Double> {
+        val info = runCatching {
+            writeRedisCommand(output, listOf("INFO", "clients"))
+            updateReadTimeout(socket, deadline)
+            readRedisReply(input)
+        }.getOrNull()
+        val connected = info?.lineSequence()
+            ?.map(String::trim)
+            ?.firstOrNull { it.startsWith("connected_clients:") }
+            ?.substringAfter(':')
+            ?.toDoubleOrNull()
+        val maximum = runCatching {
+            writeRedisCommand(output, listOf("CONFIG", "GET", "maxclients"))
+            updateReadTimeout(socket, deadline)
+            readRedisReply(input).split(',', limit = 2).getOrNull(1)?.toDoubleOrNull()
+        }.getOrNull()
+        return connectionMetrics(connected, maximum)
+    }
+
+    private fun connectionMetrics(connected: Double?, maximum: Double?): Map<String, Double> = buildMap {
+        connected?.takeIf { it.isFinite() && it >= 0 }?.let { put("database_connections", it) }
+        maximum?.takeIf { it.isFinite() && it > 0 }?.let { put("database_connection_limit", it) }
+        if (connected != null && maximum != null && connected.isFinite() && maximum.isFinite() && connected >= 0 && maximum > 0) {
+            put("database_connections_percent", connected / maximum * 100.0)
         }
     }
 
@@ -294,6 +372,7 @@ class DatabaseCheckService {
         private const val MAX_REDIS_REPLY_BYTES = 4096
         private const val MAX_REDIS_LINE_BYTES = 4096
         private const val JDBC_CONNECT_TIMEOUT_SECONDS = 5
+        private const val METRIC_QUERY_TIMEOUT_SECONDS = 1
         private val DATABASE_TYPES = setOf("POSTGRESQL", "MYSQL", "REDIS")
         private val DATABASE_NAME = Regex("[A-Za-z0-9_.-]{1,63}")
         private val CRLF = byteArrayOf(13, 10)

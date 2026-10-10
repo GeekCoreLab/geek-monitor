@@ -86,8 +86,8 @@ class MonitorResource {
         if ((definition.type == "HEARTBEAT") != (resourceType == "HEARTBEAT")) {
             return error(Response.Status.BAD_REQUEST, "HEARTBEAT_RESOURCE_REQUIRED", "心跳任务必须使用心跳类型资源，其他检查不能绑定到该资源")
         }
-        if (definition.type == "METRIC_THRESHOLD" && resourceType != "HOST") {
-            return error(Response.Status.BAD_REQUEST, "HOST_RESOURCE_REQUIRED", "主机指标阈值规则必须绑定到 HOST 资源")
+        if (definition.type == "METRIC_THRESHOLD" && resourceType != metricResourceType(definition.config["metricName"] as? String)) {
+            return error(Response.Status.BAD_REQUEST, "METRIC_RESOURCE_REQUIRED", "指标阈值规则必须绑定与指标类型匹配的 HOST 或 DATABASE 资源")
         }
         if (definition.type in DATABASE_TYPES && resourceType != "DATABASE") {
             return error(Response.Status.BAD_REQUEST, "DATABASE_RESOURCE_REQUIRED", "数据库检查必须绑定到 DATABASE 资源")
@@ -168,8 +168,9 @@ class MonitorResource {
         if ((requestedType == "HEARTBEAT") != (requestedResourceType == "HEARTBEAT")) {
             return error(Response.Status.BAD_REQUEST, "HEARTBEAT_RESOURCE_REQUIRED", "心跳任务必须保留在心跳类型资源上")
         }
-        if (requestedType == "METRIC_THRESHOLD" && requestedResourceType != "HOST") {
-            return error(Response.Status.BAD_REQUEST, "HOST_RESOURCE_REQUIRED", "主机指标阈值规则必须绑定到 HOST 资源")
+        val requestedMetricName = request.metricName ?: current.metricName
+        if (requestedType == "METRIC_THRESHOLD" && requestedResourceType != metricResourceType(requestedMetricName)) {
+            return error(Response.Status.BAD_REQUEST, "METRIC_RESOURCE_REQUIRED", "指标阈值规则必须绑定与指标类型匹配的 HOST 或 DATABASE 资源")
         }
         if (requestedType in DATABASE_TYPES && requestedResourceType != "DATABASE") {
             return error(Response.Status.BAD_REQUEST, "DATABASE_RESOURCE_REQUIRED", "数据库检查必须绑定到 DATABASE 资源")
@@ -287,6 +288,9 @@ class MonitorResource {
         val metricRecoveryValue = request.metricRecoveryValue
         val metricWindowSeconds = request.metricWindowSeconds ?: DEFAULT_METRIC_WINDOW_SECONDS
         val metricSeverity = request.metricSeverity?.trim()?.uppercase() ?: "WARNING"
+        val metricSampleIntervalSeconds = if (metricName in MetricCatalog.databaseMetricNames) {
+            DATABASE_METRIC_SAMPLE_INTERVAL_SECONDS
+        } else METRIC_SAMPLE_INTERVAL_SECONDS
         val reminderInterval = request.reminderIntervalMinutes ?: 30
         val failures = request.failureThreshold ?: 3
         val recoveries = request.recoveryThreshold ?: 2
@@ -305,11 +309,11 @@ class MonitorResource {
                 "LT", "LTE" -> recovery > trigger
                 else -> false
             }
-            if (metricName !in MetricCatalog.hostMetricNames || metricOperator !in METRIC_OPERATORS ||
+            if (metricName !in MetricCatalog.thresholdMetricNames || metricOperator !in METRIC_OPERATORS ||
                 !trigger.isFinite() || trigger < 0 || trigger > MAX_METRIC_VALUE ||
                 !recovery.isFinite() || recovery < 0 || recovery > MAX_METRIC_VALUE || !recoveryDirectionValid ||
                 metricWindowSeconds !in MIN_METRIC_WINDOW_SECONDS..MAX_METRIC_WINDOW_SECONDS ||
-                metricWindowSeconds < METRIC_SAMPLE_INTERVAL_SECONDS * 4 || metricSeverity !in METRIC_SEVERITIES) {
+                metricWindowSeconds < metricSampleIntervalSeconds * 4 || metricSeverity !in METRIC_SEVERITIES) {
                 return null
             }
         }
@@ -384,7 +388,7 @@ class MonitorResource {
                 "threshold" to metricThreshold,
                 "recoveryValue" to metricRecoveryValue,
                 "windowSeconds" to metricWindowSeconds,
-                "sampleIntervalSeconds" to METRIC_SAMPLE_INTERVAL_SECONDS,
+                "sampleIntervalSeconds" to metricSampleIntervalSeconds,
                 "severity" to metricSeverity,
             )
             else -> return null
@@ -440,7 +444,7 @@ class MonitorResource {
             "threshold" to metricThreshold,
             "recoveryValue" to metricRecoveryValue,
             "windowSeconds" to metricWindowSeconds,
-            "sampleIntervalSeconds" to METRIC_SAMPLE_INTERVAL_SECONDS,
+            "sampleIntervalSeconds" to metricSampleIntervalSeconds,
             "severity" to metricSeverity,
         )
         else -> emptyMap()
@@ -455,6 +459,9 @@ class MonitorResource {
             statement.executeQuery().use { rows -> if (rows.next()) rows.getString("type") else null }
         }
     }
+
+    private fun metricResourceType(metricName: String?): String =
+        if (metricName in MetricCatalog.databaseMetricNames) "DATABASE" else "HOST"
 
     private fun ResultSet.toMonitor(): MonitorResponse {
         val config = objectMapper.readTree(getString("config"))
@@ -494,6 +501,7 @@ class MonitorResource {
             metricRecoveryValue = config.path("recoveryValue").takeUnless { it.isMissingNode || it.isNull }?.asDouble(),
             metricWindowSeconds = config.path("windowSeconds").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
             metricSeverity = config.path("severity").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            metricSampleIntervalSeconds = config.path("sampleIntervalSeconds").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
             databaseName = config.path("databaseName").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             databaseUsername = config.path("username").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             databasePasswordConfigured = config.path("passwordEncrypted").takeUnless { it.isMissingNode || it.isNull }?.asText()?.isNotBlank() == true,
@@ -535,6 +543,7 @@ class MonitorResource {
         private const val MIN_METRIC_WINDOW_SECONDS = 120
         private const val MAX_METRIC_WINDOW_SECONDS = 86400
         private const val METRIC_SAMPLE_INTERVAL_SECONDS = 30
+        private const val DATABASE_METRIC_SAMPLE_INTERVAL_SECONDS = 60
         private const val MAX_METRIC_VALUE = 1_000_000_000_000_000.0
         private val METRIC_OPERATORS = setOf("GT", "GTE", "LT", "LTE")
         private val METRIC_SEVERITIES = setOf("WARNING", "HIGH", "CRITICAL")

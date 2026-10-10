@@ -55,8 +55,15 @@ class MetricResource {
             connection.prepareStatement(
                 """SELECT metric_name, labels::text AS labels, date_bin(? * INTERVAL '1 second', sampled_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_at,
                           avg(value) AS average, min(value) AS minimum, max(value) AS maximum, count(*) AS sample_count
-                   FROM metric_sample
-                   WHERE resource_id = ? AND trusted AND sampled_at >= ? AND sampled_at < ?
+                   FROM (
+                       SELECT metric_name, labels, value, sampled_at
+                       FROM metric_sample
+                       WHERE resource_id = ? AND trusted AND sampled_at >= ? AND sampled_at < ?
+                       UNION ALL
+                       SELECT metric_name, labels, value, sampled_at
+                       FROM database_metric_sample
+                       WHERE resource_id = ? AND sampled_at >= ? AND sampled_at < ?
+                   ) samples
                    GROUP BY metric_name, labels, bucket_at
                    ORDER BY metric_name, labels::text, bucket_at
                    LIMIT ?""",
@@ -65,7 +72,10 @@ class MetricResource {
                 statement.setObject(2, resourceId)
                 statement.setTimestamp(3, Timestamp.from(from))
                 statement.setTimestamp(4, Timestamp.from(to))
-                statement.setInt(5, MAX_RESPONSE_BUCKETS)
+                statement.setObject(5, resourceId)
+                statement.setTimestamp(6, Timestamp.from(from))
+                statement.setTimestamp(7, Timestamp.from(to))
+                statement.setInt(8, MAX_RESPONSE_BUCKETS)
                 statement.executeQuery().use { rows ->
                     while (rows.next()) {
                         val name = rows.getString("metric_name")
