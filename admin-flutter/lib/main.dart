@@ -3574,6 +3574,7 @@ class _MonitorDraft {
     required this.timeoutSeconds,
     required this.failureThreshold,
     required this.recoveryThreshold,
+    required this.reminderIntervalMinutes,
     required this.expectedStatusCodes,
     required this.textContains,
     required this.critical,
@@ -3594,6 +3595,7 @@ class _MonitorDraft {
   final int timeoutSeconds;
   final int failureThreshold;
   final int recoveryThreshold;
+  final int reminderIntervalMinutes;
   final List<int> expectedStatusCodes;
   final String? textContains;
   final bool critical;
@@ -3607,6 +3609,7 @@ class _MonitorDraft {
     'timeoutSeconds': timeoutSeconds,
     'failureThreshold': failureThreshold,
     'recoveryThreshold': recoveryThreshold,
+    'reminderIntervalMinutes': reminderIntervalMinutes,
     'critical': critical,
     'enabled': enabled,
     if (type == 'HTTP') ...{
@@ -3680,6 +3683,9 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   late final _recovery = TextEditingController(
     text: '${widget.existing?['recoveryThreshold'] ?? 2}',
   );
+  late final _reminderInterval = TextEditingController(
+    text: '${widget.existing?['reminderIntervalMinutes'] ?? 30}',
+  );
   late final _statuses = TextEditingController(
     text: _statusText(widget.existing?['expectedStatusCodes'] as List?),
   );
@@ -3710,6 +3716,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     _timeout.dispose();
     _failure.dispose();
     _recovery.dispose();
+    _reminderInterval.dispose();
     _statuses.dispose();
     _contains.dispose();
     super.dispose();
@@ -4004,6 +4011,20 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                   ),
                 ],
               ),
+              const SizedBox(height: 11),
+              _IntField(
+                controller: _reminderInterval,
+                label: '持续故障提醒间隔（分钟）',
+                minimum: 0,
+                maximum: 1440,
+              ),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '故障持续时按此间隔重复提醒；设为 0 可关闭。级别升级会立即提醒并重新开始计时。',
+                  style: TextStyle(color: _muted, fontSize: 10, height: 1.4),
+                ),
+              ),
               const SizedBox(height: 8),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
@@ -4078,6 +4099,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         timeoutSeconds: timeout,
         failureThreshold: int.parse(_failure.text),
         recoveryThreshold: int.parse(_recovery.text),
+        reminderIntervalMinutes: int.parse(_reminderInterval.text),
         expectedStatusCodes: _parseStatuses()!,
         textContains: _contains.text.trim().isEmpty
             ? null
@@ -4699,6 +4721,7 @@ String _eventName(String type) => switch (type) {
   'ACKNOWLEDGED' => '负责人确认',
   'RESOLVED' => '监控恢复',
   'ESCALATED' => '提醒级别变化',
+  'REMINDER' => '持续故障提醒',
   'NOTE' => '状态更新',
   _ => type,
 };

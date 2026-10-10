@@ -48,7 +48,7 @@ class MonitorResource {
             connection.prepareStatement(
                 """SELECT m.id, m.resource_id, r.name AS resource_name, m.name, m.type, m.config::text AS config,
                     m.interval_seconds, m.timeout_seconds, m.failure_threshold, m.recovery_threshold,
-                    m.critical, m.enabled, m.current_state, m.version, m.last_result_at, m.next_run_at
+                    m.critical, m.enabled, m.reminder_interval_minutes, m.current_state, m.version, m.last_result_at, m.next_run_at
                     FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id
                     JOIN project_membership pm ON pm.project_id = r.project_id
                     WHERE pm.user_id = ? AND r.deleted_at IS NULL AND m.deleted_at IS NULL
@@ -72,13 +72,13 @@ class MonitorResource {
         val resourceId = request.resourceId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             ?: return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "请选择有效的监控资源")
         if (!authenticator.canAccessResource(user.id, resourceId)) return error(Response.Status.FORBIDDEN, "RESOURCE_FORBIDDEN", "你没有该资源的访问权限")
-        val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔和阈值")
+        val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔、阈值和重复提醒")
         val id = UUID.randomUUID()
         dataSource.connection.use { connection ->
             connection.prepareStatement(
                 """INSERT INTO monitor(id, resource_id, name, type, config, interval_seconds, timeout_seconds,
-                    failure_threshold, recovery_threshold, critical, enabled, next_run_at)
-                    VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, now())""",
+                    failure_threshold, recovery_threshold, critical, enabled, reminder_interval_minutes, next_run_at)
+                    VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, ?, now())""",
             ).use { statement ->
                 statement.setObject(1, id)
                 statement.setObject(2, resourceId)
@@ -91,6 +91,7 @@ class MonitorResource {
                 statement.setInt(9, definition.recoveryThreshold)
                 statement.setBoolean(10, definition.critical)
                 statement.setBoolean(11, definition.enabled)
+                statement.setInt(12, definition.reminderIntervalMinutes)
                 statement.executeUpdate()
             }
         }
@@ -122,12 +123,13 @@ class MonitorResource {
         if (request.version != current.version) return error(Response.Status.CONFLICT, "VERSION_CONFLICT", "监控配置已被其他人更新，请刷新后重试")
         val requestedResource = request.resourceId?.let { runCatching { UUID.fromString(it) }.getOrNull() } ?: UUID.fromString(current.resourceId)
         if (!authenticator.canAccessResource(user.id, requestedResource)) return error(Response.Status.FORBIDDEN, "RESOURCE_FORBIDDEN", "你没有该资源的访问权限")
-        val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔和阈值")
+        val definition = validate(request.copy(reminderIntervalMinutes = request.reminderIntervalMinutes ?: current.reminderIntervalMinutes))
+            ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔、阈值和重复提醒")
         val updated = dataSource.connection.use { connection ->
             connection.prepareStatement(
                 """UPDATE monitor SET resource_id = ?, name = ?, type = ?, config = CAST(? AS jsonb), interval_seconds = ?,
                     timeout_seconds = ?, failure_threshold = ?, recovery_threshold = ?, critical = ?, enabled = ?,
-                    version = version + 1, next_run_at = now(), updated_at = now()
+                    reminder_interval_minutes = ?, version = version + 1, next_run_at = now(), updated_at = now()
                     WHERE id = ? AND version = ? AND deleted_at IS NULL""",
             ).use { statement ->
                 statement.setObject(1, requestedResource)
@@ -140,8 +142,9 @@ class MonitorResource {
                 statement.setInt(8, definition.recoveryThreshold)
                 statement.setBoolean(9, definition.critical)
                 statement.setBoolean(10, definition.enabled)
-                statement.setObject(11, id)
-                statement.setInt(12, request.version)
+                statement.setInt(11, definition.reminderIntervalMinutes)
+                statement.setObject(12, id)
+                statement.setInt(13, request.version)
                 statement.executeUpdate()
             }
         }
@@ -216,12 +219,14 @@ class MonitorResource {
         val method = request.method?.trim()?.uppercase() ?: "GET"
         val interval = request.intervalSeconds ?: if (type == "TLS") 21600 else 60
         val timeout = request.timeoutSeconds ?: if (type == "DNS") 5 else 10
+        val reminderInterval = request.reminderIntervalMinutes ?: 30
         val failures = request.failureThreshold ?: 3
         val recoveries = request.recoveryThreshold ?: 2
         val expectedCodes = (request.expectedStatusCodes ?: (200..299).toList()).distinct().sorted()
         val contains = request.textContains?.takeIf(String::isNotBlank)
         if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS") ||
-            interval !in 10..86400 || timeout !in 1..30 || interval <= timeout || failures !in 1..20 || recoveries !in 1..20) {
+            interval !in 10..86400 || timeout !in 1..30 || interval <= timeout || failures !in 1..20 || recoveries !in 1..20 ||
+            reminderInterval !in 0..1440) {
             return null
         }
         val config: Map<String, Any?> = when (type) {
@@ -260,14 +265,14 @@ class MonitorResource {
             }
             else -> return null
         }
-        return ValidatedDefinition(type, name, config, interval, timeout, failures, recoveries, request.critical != false, request.enabled != false)
+        return ValidatedDefinition(type, name, config, interval, timeout, failures, recoveries, request.critical != false, request.enabled != false, reminderInterval)
     }
 
     private fun findMonitor(id: UUID, userId: UUID): MonitorResponse? = dataSource.connection.use { connection ->
         connection.prepareStatement(
             """SELECT m.id, m.resource_id, r.name AS resource_name, m.name, m.type, m.config::text AS config,
                 m.interval_seconds, m.timeout_seconds, m.failure_threshold, m.recovery_threshold,
-                m.critical, m.enabled, m.current_state, m.version, m.last_result_at, m.next_run_at
+                m.critical, m.enabled, m.reminder_interval_minutes, m.current_state, m.version, m.last_result_at, m.next_run_at
                 FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id
                 JOIN project_membership pm ON pm.project_id = r.project_id
                 WHERE m.id = ? AND pm.user_id = ? AND r.deleted_at IS NULL AND m.deleted_at IS NULL""",
@@ -321,6 +326,7 @@ class MonitorResource {
             textContains = config.path("textContains").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             critical = getBoolean("critical"),
             enabled = getBoolean("enabled"),
+            reminderIntervalMinutes = getInt("reminder_interval_minutes"),
             state = getString("current_state"),
             version = getInt("version"),
             lastResultAt = getTimestamp("last_result_at")?.toInstant()?.toString(),
@@ -350,6 +356,7 @@ class MonitorResource {
         val recoveryThreshold: Int,
         val critical: Boolean,
         val enabled: Boolean,
+        val reminderIntervalMinutes: Int,
     )
 
     companion object {

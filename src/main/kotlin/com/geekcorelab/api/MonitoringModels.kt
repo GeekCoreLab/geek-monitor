@@ -20,6 +20,7 @@ data class MonitorRequest(
     val textContains: String? = null,
     val critical: Boolean? = true,
     val enabled: Boolean? = true,
+    val reminderIntervalMinutes: Int? = null,
     val version: Int? = null,
 )
 
@@ -45,6 +46,7 @@ data class MonitorResponse(
     val textContains: String?,
     val critical: Boolean,
     val enabled: Boolean,
+    val reminderIntervalMinutes: Int,
     val state: String,
     val version: Int,
     val lastResultAt: String?,

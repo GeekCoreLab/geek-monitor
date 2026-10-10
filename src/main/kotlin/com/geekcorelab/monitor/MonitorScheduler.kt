@@ -319,10 +319,11 @@ class MonitorScheduler {
         if (thresholdDays != activeState.thresholdDays) {
             val severity = tlsSeverity(thresholdDays)
             val title = "${task.resourceName} · TLS 证书将在 $thresholdDays 天内到期"
-            connection.prepareStatement("UPDATE incident SET severity = ?, title = ? WHERE id = ? AND status IN ('OPEN', 'ACKNOWLEDGED')").use { statement ->
+            connection.prepareStatement("UPDATE incident SET severity = ?, title = ?, last_notified_at = CASE WHEN ? THEN now() ELSE last_notified_at END WHERE id = ? AND status IN ('OPEN', 'ACKNOWLEDGED')").use { statement ->
                 statement.setString(1, severity)
                 statement.setString(2, title)
-                statement.setObject(3, activeState.incidentId)
+                statement.setBoolean(3, thresholdDays < activeState.thresholdDays)
+                statement.setObject(4, activeState.incidentId)
                 statement.executeUpdate()
             }
             if (thresholdDays < activeState.thresholdDays) {
