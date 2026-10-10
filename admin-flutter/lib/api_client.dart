@@ -266,6 +266,30 @@ class ApiClient {
     );
   }
 
+  Future<List<Map<String, dynamic>>> notificationSilences({
+    String? projectId,
+  }) async {
+    final query = projectId == null
+        ? ''
+        : '?projectId=${Uri.encodeQueryComponent(projectId)}';
+    return _asMapList(
+      await _send('GET', '/api/v1/notification-silences$query'),
+    );
+  }
+
+  Future<Map<String, dynamic>> createNotificationSilence(
+    Map<String, dynamic> definition,
+  ) async =>
+      (await _send('POST', '/api/v1/notification-silences', body: definition))
+          as Map<String, dynamic>;
+
+  Future<void> cancelNotificationSilence(String id) async {
+    await _send(
+      'DELETE',
+      '/api/v1/notification-silences/${Uri.encodeComponent(id)}',
+    );
+  }
+
   Future<dynamic> _send(
     String method,
     String path, {

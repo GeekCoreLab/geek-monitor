@@ -162,3 +162,26 @@ data class MaintenanceWindowResponse(
     val status: String,
     val createdAt: String,
 )
+
+data class NotificationSilenceRequest(
+    val projectId: String?,
+    val resourceId: String? = null,
+    val name: String?,
+    val description: String? = "",
+    val startsAt: String?,
+    val endsAt: String?,
+)
+
+data class NotificationSilenceResponse(
+    val id: String,
+    val projectId: String,
+    val projectName: String,
+    val resourceId: String?,
+    val resourceName: String?,
+    val name: String,
+    val description: String,
+    val startsAt: String,
+    val endsAt: String,
+    val status: String,
+    val createdAt: String,
+)

@@ -2241,6 +2241,7 @@ class _NotificationsPageState extends State<_NotificationsPage> {
   List<Map<String, dynamic>> _channels = [];
   List<Map<String, dynamic>> _deliveries = [];
   List<Map<String, dynamic>> _maintenanceWindows = [];
+  List<Map<String, dynamic>> _notificationSilences = [];
   bool _loading = true;
   String? _testingId;
 
@@ -2257,12 +2258,14 @@ class _NotificationsPageState extends State<_NotificationsPage> {
         widget.api.notificationChannels(),
         widget.api.notificationDeliveries(),
         widget.api.maintenanceWindows(),
+        widget.api.notificationSilences(),
       ]);
       if (!mounted) return;
       setState(() {
         _channels = results[0];
         _deliveries = results[1];
         _maintenanceWindows = results[2];
+        _notificationSilences = results[3];
       });
     } catch (error) {
       if (mounted) widget.onNotice('加载通知记录失败：$error');
@@ -2318,6 +2321,58 @@ class _NotificationsPageState extends State<_NotificationsPage> {
       if (mounted) widget.onNotice('维护窗口已取消');
     } catch (error) {
       if (mounted) widget.onNotice('取消维护窗口失败：$error');
+    }
+  }
+
+  Future<void> _createNotificationSilence() async {
+    if (widget.projects.isEmpty) {
+      widget.onNotice('请先创建项目');
+      return;
+    }
+    final draft = await showDialog<_MaintenanceWindowDraft>(
+      context: context,
+      builder: (_) => _MaintenanceWindowDialog(
+        projects: widget.projects,
+        resources: widget.resources,
+        title: '安排通知静默',
+        isSilence: true,
+      ),
+    );
+    if (draft == null) return;
+    try {
+      await widget.api.createNotificationSilence(draft.toJson());
+      await _load();
+      if (mounted) widget.onNotice('通知静默已创建');
+    } catch (error) {
+      if (mounted) widget.onNotice('创建通知静默失败：$error');
+    }
+  }
+
+  Future<void> _cancelNotificationSilence(Map<String, dynamic> silence) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('取消通知静默？'),
+        content: Text('“${silence['name']}”取消后，排队中的通知会继续投递。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('保留'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('取消静默'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.api.cancelNotificationSilence(silence['id'] as String);
+      await _load();
+      if (mounted) widget.onNotice('通知静默已取消');
+    } catch (error) {
+      if (mounted) widget.onNotice('取消通知静默失败：$error');
     }
   }
 
@@ -2497,6 +2552,85 @@ class _NotificationsPageState extends State<_NotificationsPage> {
                         IconButton(
                           tooltip: '取消维护窗口',
                           onPressed: () => _cancelMaintenanceWindow(window),
+                          icon: const Icon(Icons.close_rounded, size: 18),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        const SizedBox(height: 20),
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                '通知静默',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+              ),
+            ),
+            Text(
+              '${_notificationSilences.where((silence) => silence['status'] == 'ACTIVE' || silence['status'] == 'SCHEDULED').length} 个有效静默',
+              style: const TextStyle(color: _muted, fontSize: 11),
+            ),
+            if (!widget.readOnly) ...[
+              const SizedBox(width: 10),
+              FilledButton.tonalIcon(
+                onPressed: _createNotificationSilence,
+                icon: const Icon(Icons.notifications_paused_outlined, size: 17),
+                label: const Text('安排静默'),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (_notificationSilences.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: _EmptyState(
+                icon: Icons.notifications_paused_outlined,
+                title: '暂无通知静默',
+                subtitle: '静默期间故障状态和事件照常记录，通知会在静默结束后继续投递。',
+              ),
+            ),
+          )
+        else
+          ..._notificationSilences.map(
+            (silence) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Card(
+                child: ListTile(
+                  dense: true,
+                  leading: const Icon(
+                    Icons.notifications_paused_outlined,
+                    color: _muted,
+                  ),
+                  title: Text(
+                    silence['name'] as String? ?? '通知静默',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  subtitle: Text(
+                    '${silence['projectName']} · ${silence['resourceName'] ?? '全部资源'} · ${_dateTime(silence['startsAt'] as String?)} 至 ${_dateTime(silence['endsAt'] as String?)}${(silence['description'] as String? ?? '').isEmpty ? '' : ' · ${silence['description']}'}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 10, color: _muted),
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _MaintenanceWindowStatus(
+                        status: silence['status'] as String? ?? 'ENDED',
+                      ),
+                      if (!widget.readOnly &&
+                          (silence['status'] == 'ACTIVE' ||
+                              silence['status'] == 'SCHEDULED'))
+                        IconButton(
+                          tooltip: '取消通知静默',
+                          onPressed: () => _cancelNotificationSilence(silence),
                           icon: const Icon(Icons.close_rounded, size: 18),
                         ),
                     ],
@@ -2757,10 +2891,14 @@ class _MaintenanceWindowDialog extends StatefulWidget {
   const _MaintenanceWindowDialog({
     required this.projects,
     required this.resources,
+    this.title = '安排维护窗口',
+    this.isSilence = false,
   });
 
   final List<Map<String, dynamic>> projects;
   final List<Map<String, dynamic>> resources;
+  final String title;
+  final bool isSilence;
 
   @override
   State<_MaintenanceWindowDialog> createState() =>
@@ -2810,7 +2948,7 @@ class _MaintenanceWindowDialogState extends State<_MaintenanceWindowDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-    title: const Text('安排维护窗口'),
+    title: Text(widget.title),
     content: SizedBox(
       width: 490,
       child: Form(
@@ -2840,7 +2978,9 @@ class _MaintenanceWindowDialogState extends State<_MaintenanceWindowDialog> {
               DropdownButtonFormField<String>(
                 key: ValueKey(_projectId),
                 initialValue: _resourceSelection,
-                decoration: const InputDecoration(labelText: '维护范围'),
+                decoration: InputDecoration(
+                  labelText: widget.isSilence ? '静默范围' : '维护范围',
+                ),
                 items: [
                   const DropdownMenuItem(value: '', child: Text('项目内全部资源')),
                   ..._projectResources.map(
@@ -2940,7 +3080,7 @@ class _MaintenanceWindowDialogState extends State<_MaintenanceWindowDialog> {
             ),
           );
         },
-        child: const Text('创建维护窗口'),
+        child: Text(widget.isSilence ? '创建通知静默' : '创建维护窗口'),
       ),
     ],
   );

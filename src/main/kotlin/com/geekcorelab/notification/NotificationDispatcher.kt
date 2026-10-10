@@ -73,7 +73,7 @@ class NotificationDispatcher {
             }
             }
             ids.forEach { id ->
-                connection.prepareStatement("UPDATE notification_outbox SET status = 'RUNNING', claimed_at = now() WHERE id = ?").use { statement ->
+                connection.prepareStatement("UPDATE notification_outbox SET status = 'RUNNING', claimed_at = now(), silence_deferred_until = NULL WHERE id = ?").use { statement ->
                     statement.setObject(1, id)
                     statement.executeUpdate()
                 }
@@ -91,9 +91,20 @@ class NotificationDispatcher {
         val envelope = loadEnvelope(task.id)
         if (envelope == null) return
         val attemptNumber = envelope.attemptCount + 1
-        val result = when {
+        val cancellation = when {
             !envelope.channelEnabled || envelope.channelDeleted -> DeliveryResult(false, null, "CHANNEL_DISABLED", "通知渠道已停用", cancelled = true)
             envelope.maintenanceActive && envelope.eventType != "TEST" -> DeliveryResult(false, null, "MAINTENANCE_ACTIVE", "维护窗口期间已抑制通知", cancelled = true)
+            else -> null
+        }
+        if (cancellation != null) {
+            recordAttempt(task.id, envelope, attemptNumber, attemptStarted, cancellation)
+            return
+        }
+        if (envelope.eventType != "TEST" && envelope.silencedUntil != null) {
+            deferUntilSilenceEnds(task.id, envelope.silencedUntil)
+            return
+        }
+        val result = when {
             envelope.eventType == "OPENED" && envelope.incidentStatus == "RESOLVED" -> DeliveryResult(false, null, "EVENT_SUPERSEDED", "故障已恢复，已取消过期故障通知", cancelled = true)
             else -> runCatching { send(envelope) }.getOrElse { DeliveryResult(false, null, "DELIVERY_ERROR", "通知发送失败") }
         }
@@ -148,7 +159,10 @@ class NotificationDispatcher {
                     SELECT 1 FROM monitored_resource r JOIN maintenance_window w ON w.project_id = r.project_id
                     WHERE r.id = i.resource_id AND w.canceled_at IS NULL AND w.starts_at <= now() AND w.ends_at > now()
                       AND (w.resource_id IS NULL OR w.resource_id = r.id)
-                )), FALSE) AS maintenance_active
+                )), FALSE) AS maintenance_active,
+                (SELECT max(s.ends_at) FROM monitored_resource r JOIN notification_silence s ON s.project_id = r.project_id
+                    WHERE r.id = i.resource_id AND s.canceled_at IS NULL AND s.starts_at <= now() AND s.ends_at > now()
+                      AND (s.resource_id IS NULL OR s.resource_id = r.id)) AS silenced_until
                 FROM notification_outbox n JOIN notification_channel c ON c.id = n.channel_id
                 LEFT JOIN incident i ON i.id = n.incident_id WHERE n.id = ? AND n.status = 'RUNNING'""",
         ).use { statement ->
@@ -167,10 +181,24 @@ class NotificationDispatcher {
         eventType = getString("event_type"),
         incidentStatus = getString("incident_status"),
         maintenanceActive = getBoolean("maintenance_active"),
+        silencedUntil = getTimestamp("silenced_until")?.toInstant(),
         idempotencyKey = getString("idempotency_key"),
         payload = getString("payload"),
         attemptCount = getInt("attempt_count"),
     )
+
+    private fun deferUntilSilenceEnds(id: UUID, until: Instant) {
+        dataSource.connection.use { connection ->
+            connection.prepareStatement(
+                "UPDATE notification_outbox SET status = 'PENDING', claimed_at = NULL, next_attempt_at = GREATEST(now(), ?), silence_deferred_until = ? WHERE id = ? AND status = 'RUNNING'",
+            ).use { statement ->
+                statement.setTimestamp(1, java.sql.Timestamp.from(until))
+                statement.setTimestamp(2, java.sql.Timestamp.from(until))
+                statement.setObject(3, id)
+                statement.executeUpdate()
+            }
+        }
+    }
 
     private fun recordAttempt(
         id: UUID,
@@ -254,6 +282,7 @@ class NotificationDispatcher {
         val eventType: String,
         val incidentStatus: String?,
         val maintenanceActive: Boolean,
+        val silencedUntil: Instant?,
         val idempotencyKey: String,
         val payload: String,
         val attemptCount: Int,
