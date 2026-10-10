@@ -12,6 +12,8 @@ import jakarta.inject.Inject
 import java.sql.Connection
 import java.sql.ResultSet
 import java.time.Instant
+import java.sql.Timestamp
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.RejectedExecutionException
@@ -48,7 +50,7 @@ class NotificationDispatcher {
             try {
                 executor.execute { deliver(task) }
             } catch (_: RejectedExecutionException) {
-                releaseClaim(task.id)
+                releaseClaim(task.ids)
             }
         }
     }
@@ -65,21 +67,75 @@ class NotificationDispatcher {
             connection.prepareStatement(
                 "UPDATE notification_outbox SET status = 'PENDING', claimed_at = NULL WHERE status = 'RUNNING' AND claimed_at < now() - INTERVAL '2 minutes'",
             ).use { it.executeUpdate() }
-            val ids = connection.prepareStatement(
-                "SELECT id FROM notification_outbox WHERE status = 'PENDING' AND next_attempt_at <= now() ORDER BY next_attempt_at, created_at LIMIT ? FOR UPDATE SKIP LOCKED",
+            val candidates = connection.prepareStatement(
+                """SELECT channel_id, event_type FROM notification_outbox WHERE status = 'PENDING' AND next_attempt_at <= now()
+                    GROUP BY channel_id, event_type ORDER BY min(next_attempt_at), min(created_at) LIMIT ?""",
             ).use { statement ->
                 statement.setInt(1, limit)
-                statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getObject("id", UUID::class.java)) }
-            }
-            }
-            ids.forEach { id ->
-                connection.prepareStatement("UPDATE notification_outbox SET status = 'RUNNING', claimed_at = now(), silence_deferred_until = NULL WHERE id = ?").use { statement ->
-                    statement.setObject(1, id)
+                statement.executeQuery().use { rows -> buildList {
+                    while (rows.next()) add(NotificationGroupKey(rows.getObject("channel_id", UUID::class.java), rows.getString("event_type")))
+                } }
+            }.sortedWith(compareBy({ it.channelId.toString() }, { it.eventType }))
+            val tasks = mutableListOf<NotificationTask>()
+            candidates.forEach { candidate ->
+                val channel = connection.prepareStatement(
+                    "SELECT enabled, deleted_at, rate_limit_per_minute, next_delivery_at, next_delivery_at > now() AS delivery_delayed FROM notification_channel WHERE id = ? FOR UPDATE SKIP LOCKED",
+                ).use { statement ->
+                    statement.setObject(1, candidate.channelId)
+                    statement.executeQuery().use { rows ->
+                        if (!rows.next()) null else ChannelDispatchState(
+                            enabled = rows.getBoolean("enabled"),
+                            deleted = rows.getTimestamp("deleted_at") != null,
+                            rateLimitPerMinute = rows.getInt("rate_limit_per_minute"),
+                            nextDeliveryAt = rows.getTimestamp("next_delivery_at")?.toInstant(),
+                            deliveryDelayed = rows.getBoolean("delivery_delayed"),
+                        )
+                    }
+                }
+                if (channel == null) return@forEach
+                if (channel.enabled && !channel.deleted && channel.deliveryDelayed && channel.nextDeliveryAt != null) {
+                    connection.prepareStatement(
+                        "UPDATE notification_outbox SET next_attempt_at = GREATEST(next_attempt_at, ?) WHERE channel_id = ? AND event_type = ? AND status = 'PENDING' AND next_attempt_at <= now()",
+                    ).use { statement ->
+                        statement.setTimestamp(1, Timestamp.from(channel.nextDeliveryAt))
+                        statement.setObject(2, candidate.channelId)
+                        statement.setString(3, candidate.eventType)
+                        statement.executeUpdate()
+                    }
+                    return@forEach
+                }
+                val batchLimit = if (candidate.eventType == "TEST") 1 else MAX_GROUP_SIZE
+                val ids = connection.prepareStatement(
+                    """SELECT id FROM notification_outbox WHERE channel_id = ? AND event_type = ? AND status = 'PENDING'
+                        AND next_attempt_at <= now() ORDER BY next_attempt_at, created_at LIMIT ? FOR UPDATE SKIP LOCKED""",
+                ).use { statement ->
+                    statement.setObject(1, candidate.channelId)
+                    statement.setString(2, candidate.eventType)
+                    statement.setInt(3, batchLimit)
+                    statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.getObject("id", UUID::class.java)) }
+                }
+                }
+                if (ids.isEmpty()) return@forEach
+                val placeholders = ids.joinToString(",") { "?" }
+                connection.prepareStatement(
+                    "UPDATE notification_outbox SET status = 'RUNNING', claimed_at = now(), silence_deferred_until = NULL WHERE id IN ($placeholders)",
+                ).use { statement ->
+                    ids.forEachIndexed { index, id -> statement.setObject(index + 1, id) }
                     statement.executeUpdate()
                 }
+                if (channel.enabled && !channel.deleted) {
+                    connection.prepareStatement(
+                        "UPDATE notification_channel SET next_delivery_at = now() + (60.0 / ?) * INTERVAL '1 second' WHERE id = ?",
+                    ).use { statement ->
+                        statement.setInt(1, channel.rateLimitPerMinute)
+                        statement.setObject(2, candidate.channelId)
+                        statement.executeUpdate()
+                    }
+                }
+                tasks += NotificationTask(ids)
             }
             connection.commit()
-            ids.map(::NotificationTask)
+            tasks
         } catch (exception: Exception) {
             connection.rollback()
             throw exception
@@ -88,34 +144,49 @@ class NotificationDispatcher {
 
     private fun deliver(task: NotificationTask) {
         val attemptStarted = Instant.now()
-        val envelope = loadEnvelope(task.id)
-        if (envelope == null) return
-        val attemptNumber = envelope.attemptCount + 1
-        val cancellation = when {
-            !envelope.channelEnabled || envelope.channelDeleted -> DeliveryResult(false, null, "CHANNEL_DISABLED", "通知渠道已停用", cancelled = true)
-            envelope.maintenanceActive && envelope.eventType != "TEST" -> DeliveryResult(false, null, "MAINTENANCE_ACTIVE", "维护窗口期间已抑制通知", cancelled = true)
-            else -> null
+        val envelopes = loadEnvelopes(task.ids)
+        if (envelopes.isEmpty()) return
+        val sendable = mutableListOf<NotificationEnvelope>()
+        envelopes.forEach { envelope ->
+            val attemptNumber = envelope.attemptCount + 1
+            val cancellation = when {
+                !envelope.channelEnabled || envelope.channelDeleted -> DeliveryResult(false, null, "CHANNEL_DISABLED", "通知渠道已停用", cancelled = true)
+                envelope.maintenanceActive && envelope.eventType != "TEST" -> DeliveryResult(false, null, "MAINTENANCE_ACTIVE", "维护窗口期间已抑制通知", cancelled = true)
+                envelope.eventType == "OPENED" && envelope.incidentStatus == "RESOLVED" -> DeliveryResult(false, null, "EVENT_SUPERSEDED", "故障已恢复，已取消过期故障通知", cancelled = true)
+                else -> null
+            }
+            if (cancellation != null) {
+                recordAttempt(envelope.id, envelope, attemptNumber, attemptStarted, cancellation, 1)
+            } else if (envelope.eventType != "TEST" && envelope.silencedUntil != null) {
+                deferUntilSilenceEnds(envelope.id, envelope.silencedUntil)
+            } else {
+                sendable += envelope
+            }
         }
-        if (cancellation != null) {
-            recordAttempt(task.id, envelope, attemptNumber, attemptStarted, cancellation)
-            return
+        if (sendable.isEmpty()) return
+        val result = runCatching { send(sendable) }.getOrElse { DeliveryResult(false, null, "DELIVERY_ERROR", "通知发送失败") }
+        sendable.forEach { envelope ->
+            recordAttempt(envelope.id, envelope, envelope.attemptCount + 1, attemptStarted, result, sendable.size)
         }
-        if (envelope.eventType != "TEST" && envelope.silencedUntil != null) {
-            deferUntilSilenceEnds(task.id, envelope.silencedUntil)
-            return
-        }
-        val result = when {
-            envelope.eventType == "OPENED" && envelope.incidentStatus == "RESOLVED" -> DeliveryResult(false, null, "EVENT_SUPERSEDED", "故障已恢复，已取消过期故障通知", cancelled = true)
-            else -> runCatching { send(envelope) }.getOrElse { DeliveryResult(false, null, "DELIVERY_ERROR", "通知发送失败") }
-        }
-        recordAttempt(task.id, envelope, attemptNumber, attemptStarted, result)
     }
 
-    private fun send(envelope: NotificationEnvelope): DeliveryResult {
+    private fun send(envelopes: List<NotificationEnvelope>): DeliveryResult {
+        val envelope = envelopes.first()
         val configuration = objectMapper.readTree(encryption.decrypt(envelope.configCiphertext))
-        val payload = objectMapper.readTree(envelope.payload)
-        val title = payload.path("title").asText("Geek Monitor 通知").take(180)
-        val message = payload.path("message").asText("Geek Monitor 检查状态发生变化。")
+        val payloads = envelopes.map { objectMapper.readTree(it.payload) }
+        val grouped = envelopes.size > 1
+        val notification = if (!grouped) payloads.first() else objectMapper.createObjectNode().apply {
+            put("eventType", "notification.grouped")
+            put("groupCount", payloads.size)
+            val events = objectMapper.createArrayNode()
+            payloads.forEach { events.add(it) }
+            set<com.fasterxml.jackson.databind.JsonNode>("events", events)
+        }
+        val title = if (grouped) "${payloads.size} 条告警通知" else payloads.first().path("title").asText("Geek Monitor 通知").take(180)
+        val idempotencyKey = if (grouped) groupedIdempotencyKey(envelopes) else envelope.idempotencyKey
+        val message = if (grouped) payloads.mapIndexed { index, payload ->
+            "${index + 1}. ${payload.path("title").asText("Geek Monitor 通知")}\n${payload.path("message").asText("Geek Monitor 检查状态发生变化。")}"
+        }.joinToString("\n\n") else payloads.first().path("message").asText("Geek Monitor 检查状态发生变化。")
         return when (envelope.channelType) {
             "EMAIL" -> {
                 val recipients = configuration.path("recipients").map { it.asText() }.distinct()
@@ -124,12 +195,18 @@ class NotificationDispatcher {
                 val body = buildString {
                     if (envelope.eventType == "TEST") appendLine("这是一次测试通知。")
                     appendLine(message)
-                    appendLine()
-                    appendLine("事件类型：${payload.path("eventType").asText(envelope.eventType)}")
-                    payload.path("incidentId").takeIf { !it.isMissingNode && !it.isNull }?.let { appendLine("事件编号：${it.asText()}") }
-                    payload.path("severity").takeIf { !it.isMissingNode && !it.isNull }?.let { appendLine("级别：${it.asText()}") }
-                    payload.path("occurredAt").takeIf { !it.isMissingNode && !it.isNull }?.let { appendLine("时间：${it.asText()}") }
-                    appendLine("通知编号：${envelope.idempotencyKey}")
+                    if (grouped) {
+                        appendLine()
+                        appendLine("本次合并 ${payloads.size} 条同类事件。")
+                    } else {
+                        val payload = payloads.first()
+                        appendLine()
+                        appendLine("事件类型：${payload.path("eventType").asText(envelope.eventType)}")
+                        payload.path("incidentId").takeIf { !it.isMissingNode && !it.isNull }?.let { appendLine("事件编号：${it.asText()}") }
+                        payload.path("severity").takeIf { !it.isMissingNode && !it.isNull }?.let { appendLine("级别：${it.asText()}") }
+                        payload.path("occurredAt").takeIf { !it.isMissingNode && !it.isNull }?.let { appendLine("时间：${it.asText()}") }
+                    }
+                    appendLine("通知编号：$idempotencyKey")
                 }
                 val mails = recipients.map { Mail.withText(it, subject, body) }.toTypedArray()
                 mailer.send(*mails)
@@ -139,18 +216,20 @@ class NotificationDispatcher {
                 val url = configuration.path("url").asText("")
                 val token = configuration.path("bearerToken").takeUnless { it.isMissingNode || it.isNull }?.asText()
                 val webhookPayload = objectMapper.createObjectNode().apply {
-                    set<com.fasterxml.jackson.databind.JsonNode>("notification", payload)
-                    put("idempotencyKey", envelope.idempotencyKey)
-                    put("deliveryId", envelope.id.toString())
+                    set<com.fasterxml.jackson.databind.JsonNode>("notification", notification)
+                    put("idempotencyKey", idempotencyKey)
+                    put("deliveryId", if (grouped) idempotencyKey else envelope.id.toString())
                 }
-                val delivery = httpChecks.sendWebhook(url, token, objectMapper.writeValueAsString(webhookPayload), envelope.idempotencyKey)
+                val delivery = httpChecks.sendWebhook(url, token, objectMapper.writeValueAsString(webhookPayload), idempotencyKey)
                 DeliveryResult(delivery.delivered, delivery.statusCode, delivery.errorCode, delivery.summary)
             }
             else -> DeliveryResult(false, null, "CHANNEL_INVALID", "通知渠道类型无效")
         }
     }
 
-    private fun loadEnvelope(id: UUID): NotificationEnvelope? = dataSource.connection.use { connection ->
+    private fun loadEnvelopes(ids: List<UUID>): List<NotificationEnvelope> = dataSource.connection.use { connection ->
+        if (ids.isEmpty()) return@use emptyList()
+        val placeholders = ids.joinToString(",") { "?" }
         connection.prepareStatement(
             """SELECT n.id, n.channel_id, n.event_type, n.idempotency_key, n.payload::text AS payload, n.attempt_count,
                 c.channel_type, c.config_ciphertext, c.enabled AS channel_enabled, c.deleted_at AS channel_deleted,
@@ -164,11 +243,18 @@ class NotificationDispatcher {
                     WHERE r.id = i.resource_id AND s.canceled_at IS NULL AND s.starts_at <= now() AND s.ends_at > now()
                       AND (s.resource_id IS NULL OR s.resource_id = r.id)) AS silenced_until
                 FROM notification_outbox n JOIN notification_channel c ON c.id = n.channel_id
-                LEFT JOIN incident i ON i.id = n.incident_id WHERE n.id = ? AND n.status = 'RUNNING'""",
+                LEFT JOIN incident i ON i.id = n.incident_id WHERE n.id IN ($placeholders) AND n.status = 'RUNNING'""",
         ).use { statement ->
-            statement.setObject(1, id)
-            statement.executeQuery().use { rows -> if (rows.next()) rows.toEnvelope() else null }
+            ids.forEachIndexed { index, id -> statement.setObject(index + 1, id) }
+            statement.executeQuery().use { rows -> buildList { while (rows.next()) add(rows.toEnvelope()) } }
         }
+    }
+
+    private fun groupedIdempotencyKey(envelopes: List<NotificationEnvelope>): String {
+        val eventIds = envelopes.map { it.id.toString() }.sorted().joinToString(":")
+        val digest = MessageDigest.getInstance("SHA-256").digest(eventIds.toByteArray())
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        return "group:${envelopes.first().channelId}:$digest"
     }
 
     private fun ResultSet.toEnvelope() = NotificationEnvelope(
@@ -206,6 +292,7 @@ class NotificationDispatcher {
         attemptNumber: Int,
         startedAt: Instant,
         result: DeliveryResult,
+        groupCount: Int,
     ) {
         dataSource.connection.use { connection ->
             connection.autoCommit = false
@@ -223,8 +310,8 @@ class NotificationDispatcher {
                     else -> "RETRYING"
                 }
                 connection.prepareStatement(
-                    """INSERT INTO notification_delivery(id, outbox_id, attempt_number, status, http_status, error_code, error_summary, started_at, finished_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, now())""",
+                    """INSERT INTO notification_delivery(id, outbox_id, attempt_number, status, http_status, error_code, error_summary, group_count, started_at, finished_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now())""",
                 ).use { statement ->
                     statement.setObject(1, UUID.randomUUID())
                     statement.setObject(2, id)
@@ -233,7 +320,8 @@ class NotificationDispatcher {
                     if (result.httpStatus == null) statement.setNull(5, java.sql.Types.INTEGER) else statement.setInt(5, result.httpStatus)
                     statement.setString(6, result.errorCode)
                     statement.setString(7, result.summary?.take(500))
-                    statement.setObject(8, java.sql.Timestamp.from(startedAt))
+                    statement.setInt(8, groupCount)
+                    statement.setObject(9, java.sql.Timestamp.from(startedAt))
                     statement.executeUpdate()
                 }
                 val retryDelay = RETRY_DELAYS_SECONDS.getOrNull(attemptNumber - 1) ?: RETRY_DELAYS_SECONDS.last()
@@ -262,16 +350,26 @@ class NotificationDispatcher {
         }
     }
 
-    private fun releaseClaim(id: UUID) {
+    private fun releaseClaim(ids: List<UUID>) {
+        if (ids.isEmpty()) return
+        val placeholders = ids.joinToString(",") { "?" }
         dataSource.connection.use { connection ->
-            connection.prepareStatement("UPDATE notification_outbox SET status = 'PENDING', claimed_at = NULL WHERE id = ? AND status = 'RUNNING'").use { statement ->
-                statement.setObject(1, id)
+            connection.prepareStatement("UPDATE notification_outbox SET status = 'PENDING', claimed_at = NULL WHERE id IN ($placeholders) AND status = 'RUNNING'").use { statement ->
+                ids.forEachIndexed { index, id -> statement.setObject(index + 1, id) }
                 statement.executeUpdate()
             }
         }
     }
 
-    private data class NotificationTask(val id: UUID)
+    private data class NotificationTask(val ids: List<UUID>)
+    private data class NotificationGroupKey(val channelId: UUID, val eventType: String)
+    private data class ChannelDispatchState(
+        val enabled: Boolean,
+        val deleted: Boolean,
+        val rateLimitPerMinute: Int,
+        val nextDeliveryAt: Instant?,
+        val deliveryDelayed: Boolean,
+    )
     private data class NotificationEnvelope(
         val id: UUID,
         val channelId: UUID,
@@ -297,6 +395,7 @@ class NotificationDispatcher {
 
     companion object {
         private const val MAX_CLAIM_PER_TICK = 20
+        private const val MAX_GROUP_SIZE = 50
         private const val MAX_ATTEMPTS = 5
         private val RETRY_DELAYS_SECONDS = listOf(15, 60, 300, 1800)
     }

@@ -43,8 +43,9 @@ class NotificationOutbox {
         }
         channels.forEach { channelId ->
             connection.prepareStatement(
-                """INSERT INTO notification_outbox(id, channel_id, incident_id, incident_event_id, event_type, idempotency_key, payload)
-                    VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb)) ON CONFLICT (idempotency_key) DO NOTHING""",
+                """INSERT INTO notification_outbox(id, channel_id, incident_id, incident_event_id, event_type, idempotency_key, payload, next_attempt_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), now() + (? * INTERVAL '1 second'))
+                    ON CONFLICT (idempotency_key) DO NOTHING""",
             ).use { statement ->
                 statement.setObject(1, UUID.randomUUID())
                 statement.setObject(2, channelId)
@@ -53,6 +54,7 @@ class NotificationOutbox {
                 statement.setString(5, eventType)
                 statement.setString(6, "${channelId}:${incidentEventId}")
                 statement.setString(7, objectMapper.writeValueAsString(payload))
+                statement.setInt(8, GROUPING_WINDOW_SECONDS)
                 statement.executeUpdate()
             }
         }
@@ -80,5 +82,9 @@ class NotificationOutbox {
             statement.executeUpdate()
         }
         return outboxId
+    }
+
+    companion object {
+        private const val GROUPING_WINDOW_SECONDS = 15
     }
 }

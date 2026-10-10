@@ -107,6 +107,7 @@ data class NotificationChannelRequest(
     val webhookBearerToken: String? = null,
     val enabled: Boolean? = true,
     val version: Int? = null,
+    val rateLimitPerMinute: Int? = null,
 )
 
 data class NotificationChannelResponse(
@@ -118,6 +119,7 @@ data class NotificationChannelResponse(
     val destinationSummary: String,
     val enabled: Boolean,
     val version: Int,
+    val rateLimitPerMinute: Int,
     val lastDeliveryStatus: String?,
     val createdAt: String,
 )
@@ -136,6 +138,7 @@ data class NotificationDeliveryResponse(
     val httpStatus: Int?,
     val errorCode: String?,
     val errorSummary: String?,
+    val groupCount: Int,
     val createdAt: String,
     val finishedAt: String,
 )

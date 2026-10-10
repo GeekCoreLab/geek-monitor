@@ -2710,7 +2710,7 @@ class _NotificationsPageState extends State<_NotificationsPage> {
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              '${channel['projectName']}  ·  ${channel['type'] == 'EMAIL' ? '邮件' : 'Webhook'}  ·  ${channel['destinationSummary']}',
+                              '${channel['projectName']}  ·  ${channel['type'] == 'EMAIL' ? '邮件' : 'Webhook'}  ·  ${channel['destinationSummary']}  ·  每分钟最多发送 ${channel['rateLimitPerMinute'] ?? 60} 批',
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
@@ -2797,7 +2797,7 @@ class _NotificationsPageState extends State<_NotificationsPage> {
                         ),
                       ),
                       subtitle: Text(
-                        '${delivery['errorSummary'] ?? '投递成功'}${delivery['httpStatus'] == null ? '' : '  ·  HTTP ${delivery['httpStatus']}'}  ·  第 ${delivery['attemptNumber']} 次',
+                        '${delivery['errorSummary'] ?? '投递成功'}${(delivery['groupCount'] as int? ?? 1) > 1 ? '  ·  合并 ${(delivery['groupCount'] as int)} 条' : ''}${delivery['httpStatus'] == null ? '' : '  ·  HTTP ${delivery['httpStatus']}'}  ·  第 ${delivery['attemptNumber']} 次',
                         style: const TextStyle(fontSize: 10, color: _muted),
                       ),
                       trailing: Text(
@@ -3094,6 +3094,7 @@ class _NotificationChannelDraft {
     required this.emailRecipients,
     required this.webhookUrl,
     required this.webhookBearerToken,
+    required this.rateLimitPerMinute,
   });
 
   final String projectId;
@@ -3102,6 +3103,7 @@ class _NotificationChannelDraft {
   final List<String> emailRecipients;
   final String webhookUrl;
   final String webhookBearerToken;
+  final int rateLimitPerMinute;
 
   Map<String, dynamic> toJson() => {
     'projectId': projectId,
@@ -3110,6 +3112,7 @@ class _NotificationChannelDraft {
     'emailRecipients': type == 'EMAIL' ? emailRecipients : null,
     'webhookUrl': type == 'WEBHOOK' ? webhookUrl : null,
     'webhookBearerToken': type == 'WEBHOOK' ? webhookBearerToken : null,
+    'rateLimitPerMinute': rateLimitPerMinute,
   };
 }
 
@@ -3131,6 +3134,7 @@ class _NotificationChannelDialogState
   final _recipients = TextEditingController();
   final _url = TextEditingController();
   final _token = TextEditingController();
+  final _rateLimit = TextEditingController(text: '60');
 
   @override
   void dispose() {
@@ -3138,6 +3142,7 @@ class _NotificationChannelDialogState
     _recipients.dispose();
     _url.dispose();
     _token.dispose();
+    _rateLimit.dispose();
     super.dispose();
   }
 
@@ -3165,6 +3170,21 @@ class _NotificationChannelDialogState
                     .toList(),
                 onChanged: (value) {
                   if (value != null) setState(() => _projectId = value);
+                },
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _rateLimit,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: '每分钟发送上限',
+                  helperText: '同类事件会先聚合 15 秒；范围 1–600 批/分钟。',
+                ),
+                validator: (value) {
+                  final limit = int.tryParse((value ?? '').trim());
+                  return limit == null || limit < 1 || limit > 600
+                      ? '请输入 1 到 600 之间的整数'
+                      : null;
                 },
               ),
               const SizedBox(height: 12),
@@ -3264,6 +3284,7 @@ class _NotificationChannelDialogState
                   .toList(),
               webhookUrl: _url.text.trim(),
               webhookBearerToken: _token.text,
+              rateLimitPerMinute: int.parse(_rateLimit.text.trim()),
             ),
           );
         },

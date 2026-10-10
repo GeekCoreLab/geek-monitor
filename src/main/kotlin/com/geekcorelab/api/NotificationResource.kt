@@ -47,7 +47,7 @@ class NotificationResource {
         dataSource.connection.use { connection ->
             connection.prepareStatement(
                 """SELECT c.id, c.project_id, p.name AS project_name, c.name, c.channel_type, c.config_ciphertext,
-                    c.enabled, c.version, c.created_at,
+                    c.enabled, c.version, c.rate_limit_per_minute, c.created_at,
                     (SELECT n.status FROM notification_outbox n WHERE n.channel_id = c.id ORDER BY n.created_at DESC LIMIT 1) AS last_delivery_status
                     FROM notification_channel c JOIN project p ON p.id = c.project_id
                     JOIN project_membership pm ON pm.project_id = p.id
@@ -72,12 +72,12 @@ class NotificationResource {
         val projectId = request.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             ?: return error(Response.Status.BAD_REQUEST, "INVALID_PROJECT", "请选择有效项目")
         if (!authenticator.canAccessProject(user.id, projectId)) return error(Response.Status.FORBIDDEN, "PROJECT_FORBIDDEN", "你没有该项目的访问权限")
-        val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_CHANNEL", "请检查通知渠道名称、收件人或 HTTPS 地址")
+        val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_CHANNEL", "请检查渠道名称、接收地址和每分钟 1–600 批的上限")
         val id = UUID.randomUUID()
         try {
             dataSource.connection.use { connection ->
                 connection.prepareStatement(
-                    "INSERT INTO notification_channel(id, project_id, name, channel_type, config_ciphertext, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO notification_channel(id, project_id, name, channel_type, config_ciphertext, enabled, rate_limit_per_minute) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 ).use { statement ->
                     statement.setObject(1, id)
                     statement.setObject(2, projectId)
@@ -85,6 +85,7 @@ class NotificationResource {
                     statement.setString(4, definition.type)
                     statement.setString(5, encryption.encrypt(objectMapper.writeValueAsString(definition.config)))
                     statement.setBoolean(6, request.enabled != false)
+                    statement.setInt(7, definition.rateLimitPerMinute)
                     statement.executeUpdate()
                 }
             }
@@ -92,7 +93,7 @@ class NotificationResource {
             if (exception.message.orEmpty().contains("duplicate key", true)) return error(Response.Status.CONFLICT, "CHANNEL_NAME_EXISTS", "该项目中已有同名通知渠道")
             throw exception
         }
-        audit(user.id, "notification_channel.created", id, mapOf("name" to definition.name, "type" to definition.type))
+        audit(user.id, "notification_channel.created", id, mapOf("name" to definition.name, "type" to definition.type, "rateLimitPerMinute" to definition.rateLimitPerMinute))
         return findChannel(id, user.id)?.let { Response.status(Response.Status.CREATED).entity(it).build() }
             ?: error(Response.Status.INTERNAL_SERVER_ERROR, "CHANNEL_LOAD_FAILED", "通知渠道已创建，但无法读取")
     }
@@ -109,11 +110,11 @@ class NotificationResource {
         if (request.version != current.version) return error(Response.Status.CONFLICT, "VERSION_CONFLICT", "通知渠道已被其他人更新，请刷新后重试")
         val projectId = request.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() } ?: UUID.fromString(current.projectId)
         if (!authenticator.canAccessProject(user.id, projectId)) return error(Response.Status.FORBIDDEN, "PROJECT_FORBIDDEN", "你没有该项目的访问权限")
-        val definition = validate(request.copy(projectId = projectId.toString()))
-            ?: return error(Response.Status.BAD_REQUEST, "INVALID_CHANNEL", "请检查通知渠道名称、收件人或 HTTPS 地址")
+        val definition = validate(request.copy(projectId = projectId.toString(), rateLimitPerMinute = request.rateLimitPerMinute ?: current.rateLimitPerMinute))
+            ?: return error(Response.Status.BAD_REQUEST, "INVALID_CHANNEL", "请检查渠道名称、接收地址和每分钟 1–600 批的上限")
         val updated = dataSource.connection.use { connection ->
             connection.prepareStatement(
-                """UPDATE notification_channel SET project_id = ?, name = ?, channel_type = ?, config_ciphertext = ?, enabled = ?,
+                """UPDATE notification_channel SET project_id = ?, name = ?, channel_type = ?, config_ciphertext = ?, enabled = ?, rate_limit_per_minute = ?,
                     version = version + 1, updated_at = now() WHERE id = ? AND version = ? AND deleted_at IS NULL""",
             ).use { statement ->
                 statement.setObject(1, projectId)
@@ -121,13 +122,14 @@ class NotificationResource {
                 statement.setString(3, definition.type)
                 statement.setString(4, encryption.encrypt(objectMapper.writeValueAsString(definition.config)))
                 statement.setBoolean(5, request.enabled != false)
-                statement.setObject(6, id)
-                statement.setInt(7, request.version)
+                statement.setInt(6, definition.rateLimitPerMinute)
+                statement.setObject(7, id)
+                statement.setInt(8, request.version)
                 statement.executeUpdate()
             }
         }
         if (updated != 1) return error(Response.Status.CONFLICT, "VERSION_CONFLICT", "通知渠道已被其他人更新，请刷新后重试")
-        audit(user.id, "notification_channel.updated", id, mapOf("name" to definition.name, "type" to definition.type))
+        audit(user.id, "notification_channel.updated", id, mapOf("name" to definition.name, "type" to definition.type, "rateLimitPerMinute" to definition.rateLimitPerMinute))
         return findChannel(id, user.id)?.let { Response.ok(it).build() }
             ?: error(Response.Status.INTERNAL_SERVER_ERROR, "CHANNEL_LOAD_FAILED", "无法读取已更新的通知渠道")
     }
@@ -202,7 +204,8 @@ class NotificationResource {
         dataSource.connection.use { connection ->
             connection.prepareStatement(
                 """SELECT d.id, d.outbox_id, n.channel_id, c.name AS channel_name, n.incident_id, n.event_type,
-                    d.status, d.attempt_number, d.http_status, d.error_code, d.error_summary, d.started_at AS created_at, d.finished_at
+                    d.group_count, d.status, d.attempt_number, d.http_status, d.error_code, d.error_summary,
+                    d.started_at AS created_at, d.finished_at
                     FROM notification_delivery d JOIN notification_outbox n ON n.id = d.outbox_id
                     JOIN notification_channel c ON c.id = n.channel_id
                     JOIN project_membership pm ON pm.project_id = c.project_id
@@ -222,12 +225,13 @@ class NotificationResource {
     private fun validate(request: NotificationChannelRequest): ChannelDefinition? {
         val name = request.name?.trim().orEmpty()
         val type = request.type?.trim()?.uppercase().orEmpty()
-        if (name.isBlank() || name.length > 120) return null
+        val rateLimitPerMinute = request.rateLimitPerMinute ?: DEFAULT_RATE_LIMIT_PER_MINUTE
+        if (name.isBlank() || name.length > 120 || rateLimitPerMinute !in 1..600) return null
         return when (type) {
             "EMAIL" -> {
                 val recipients = request.emailRecipients.orEmpty().map { it.trim().lowercase() }.filter(String::isNotEmpty).distinct()
                 if (recipients.isEmpty() || recipients.size > 20 || recipients.any { !EMAIL.matches(it) }) null
-                else ChannelDefinition(name, type, mapOf("recipients" to recipients))
+                else ChannelDefinition(name, type, mapOf("recipients" to recipients), rateLimitPerMinute)
             }
             "WEBHOOK" -> {
                 val url = request.webhookUrl?.trim().orEmpty()
@@ -236,7 +240,7 @@ class NotificationResource {
                 if (uri == null || !validScheme || uri.host.isNullOrBlank() || uri.userInfo != null || uri.fragment != null ||
                     (uri.port != -1 && uri.port !in 1..65535) || url.length > 2048 ||
                     (request.webhookBearerToken?.length ?: 0) > 4096 || request.webhookBearerToken.orEmpty().any { it.code < 32 || it.code == 127 }) null
-                else ChannelDefinition(name, type, mapOf("url" to uri.normalize().toASCIIString(), "bearerToken" to request.webhookBearerToken?.takeIf(String::isNotBlank)))
+                else ChannelDefinition(name, type, mapOf("url" to uri.normalize().toASCIIString(), "bearerToken" to request.webhookBearerToken?.takeIf(String::isNotBlank)), rateLimitPerMinute)
             }
             else -> null
         }
@@ -245,7 +249,7 @@ class NotificationResource {
     private fun findChannel(id: UUID, userId: UUID): NotificationChannelResponse? = dataSource.connection.use { connection ->
         connection.prepareStatement(
             """SELECT c.id, c.project_id, p.name AS project_name, c.name, c.channel_type, c.config_ciphertext,
-                c.enabled, c.version, c.created_at,
+                c.enabled, c.version, c.rate_limit_per_minute, c.created_at,
                 (SELECT n.status FROM notification_outbox n WHERE n.channel_id = c.id ORDER BY n.created_at DESC LIMIT 1) AS last_delivery_status
                 FROM notification_channel c JOIN project p ON p.id = c.project_id
                 JOIN project_membership pm ON pm.project_id = p.id WHERE c.id = ? AND pm.user_id = ? AND c.deleted_at IS NULL""",
@@ -276,6 +280,7 @@ class NotificationResource {
             destinationSummary = summary,
             enabled = getBoolean("enabled"),
             version = getInt("version"),
+            rateLimitPerMinute = getInt("rate_limit_per_minute"),
             lastDeliveryStatus = getString("last_delivery_status"),
             createdAt = getTimestamp("created_at").toInstant().toString(),
         )
@@ -293,6 +298,7 @@ class NotificationResource {
         httpStatus = getInt("http_status").let { if (wasNull()) null else it },
         errorCode = getString("error_code"),
         errorSummary = getString("error_summary"),
+        groupCount = getInt("group_count"),
         createdAt = getTimestamp("created_at").toInstant().toString(),
         finishedAt = getTimestamp("finished_at").toInstant().toString(),
     )
@@ -336,9 +342,10 @@ class NotificationResource {
     private fun encryptionUnavailable() = error(Response.Status.SERVICE_UNAVAILABLE, "ENCRYPTION_NOT_CONFIGURED", "请在服务端配置 GEEK_MONITOR_ENCRYPTION_KEY 后再管理通知渠道")
     private fun error(status: Response.Status, code: String, message: String) = Response.status(status).entity(ErrorResponse(code, message)).build()
 
-    private data class ChannelDefinition(val name: String, val type: String, val config: Map<String, Any?>)
+    private data class ChannelDefinition(val name: String, val type: String, val config: Map<String, Any?>, val rateLimitPerMinute: Int)
 
     companion object {
         private val EMAIL = Regex("^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$", RegexOption.IGNORE_CASE)
+        private const val DEFAULT_RATE_LIMIT_PER_MINUTE = 60
     }
 }
