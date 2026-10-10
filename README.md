@@ -1,72 +1,51 @@
-# geek-monitor
+# Geek Monitor
 
-服务器、Web、数据库及基础服务的统一监控平台（规划阶段）。
+面向自托管运维的监控平台，中心服务使用 Kotlin、Quarkus 和 PostgreSQL，管理端使用 Flutter Web。
 
-## 项目规划
+产品范围和首版验收要求见[产品与技术规划](docs/产品与技术规划.md)。
 
-- [产品与技术规划](docs/产品与技术规划.md)：监控范围、功能设计、采集架构、告警机制、数据模型、部署方案和分阶段验收计划。
+## 本地开发
 
-This project uses Quarkus, the Supersonic Subatomic Java Framework.
+需要 Java 21、Flutter stable 和 PostgreSQL。先创建开发数据库（默认连接参数为 `geek_monitor/geek_monitor`），然后启动 API：
 
-If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
-
-## Running the application in dev mode
-
-You can run your application in dev mode that enables live coding using:
-
-```shell script
+```sh
+createdb geek_monitor
 ./gradlew quarkusDev
 ```
 
-> **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at <http://localhost:8080/q/dev/>.
+Quarkus 会在启动时执行数据库迁移。首次打开 `http://localhost:8080` 会进入安装向导，创建管理员和默认项目。Flutter 调试模式的安装页和登录页预填测试账号：
 
-## Packaging and running the application
+- 用户名：`admin@biliwind.com`
+- 密码：`admin@biliwind.com`
 
-The application can be packaged using:
+生产构建不会包含这组预填值，首次安装时由管理员自行设置。管理员密码至少 12 位；数据库只保存 PBKDF2 哈希。
 
-```shell script
-./gradlew build
+要单独调试 Flutter 页面，可在 API 已运行时执行：
+
+```sh
+cd admin-flutter
+flutter run -d web-server --web-hostname 0.0.0.0 --web-port 8081
 ```
 
-It produces the `quarkus-run.jar` file in the `build/quarkus-app/` directory.
-Be aware that it’s not an _über-jar_ as the dependencies are copied into the `build/quarkus-app/lib/` directory.
+Flutter 开发服务器的地址已加入开发 CORS 白名单。执行 `./gradlew build` 会构建并将 Flutter Web 静态文件打入 Quarkus 应用。
 
-The application is now runnable using `java -jar build/quarkus-app/quarkus-run.jar`.
+## 数据库连接配置
 
-If you want to build an _über-jar_, execute the following command:
+可通过环境变量覆盖本地默认值：
 
-```shell script
-./gradlew build -Dquarkus.package.jar.type=uber-jar
-```
+| 变量 | 默认值 |
+| --- | --- |
+| `DB_URL` | `jdbc:postgresql://localhost:5432/geek_monitor` |
+| `DB_USERNAME` | `geek_monitor` |
+| `DB_PASSWORD` | `geek_monitor` |
 
-The application, packaged as an _über-jar_, is now runnable using `java -jar build/*-runner.jar`.
+首次安装状态保存在数据库中。重新部署不会重置管理员或项目；重置操作需按备份与恢复流程直接管理数据库。
 
-## Creating a native executable
+## 当前管理端能力
 
-You can create a native executable using:
+- 首次安装、管理员登录、会话恢复和退出。
+- 创建项目并维护基本项目说明。
+- 在项目内创建、查看和软删除监控资源。
+- 总览显示资源状态计数和项目列表。
 
-```shell script
-./gradlew build -Dquarkus.native.enabled=true
-```
-
-Or, if you don't have GraalVM installed, you can run the native executable build in a container using:
-
-```shell script
-./gradlew build -Dquarkus.native.enabled=true -Dquarkus.native.container-build=true
-```
-
-You can then execute your native executable with: `./build/geek-monitor-1.0-SNAPSHOT-runner`
-
-If you want to learn more about building native executables, please consult <https://quarkus.io/guides/gradle-tooling>.
-
-## Related Guides
-
-- Kotlin ([guide](https://quarkus.io/guides/kotlin)): Write your services in Kotlin
-
-## Provided Code
-
-### REST
-
-Easily start your REST Web Services
-
-[Related guide section...](https://quarkus.io/guides/getting-started-reactive#reactive-jax-rs-resources)
+主动检查调度、检查项配置、事件处理、通知、Agent 与指标页面仍按规划阶段继续实现。

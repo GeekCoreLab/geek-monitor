@@ -1,0 +1,31 @@
+package com.geekcorelab.api
+
+data class InstallStatus(val initialized: Boolean, val productName: String = "Geek Monitor")
+data class SetupRequest(val email: String?, val password: String?, val projectName: String? = "默认项目")
+data class LoginRequest(val email: String?, val password: String?)
+data class SessionResponse(val expiresAt: String, val user: UserResponse)
+data class UserResponse(val id: String, val email: String, val role: String)
+data class ProjectRequest(val name: String?, val description: String? = "")
+data class ProjectResponse(val id: String, val name: String, val description: String, val createdAt: String)
+data class ResourceRequest(
+    val projectId: String?,
+    val name: String?,
+    val type: String?,
+    val environment: String? = "production",
+    val tags: List<String>? = emptyList(),
+    val ownerEmail: String? = null,
+)
+data class ResourceResponse(
+    val id: String,
+    val projectId: String,
+    val projectName: String,
+    val name: String,
+    val type: String,
+    val environment: String,
+    val tags: List<String>,
+    val ownerEmail: String?,
+    val healthStatus: String,
+    val paused: Boolean,
+    val createdAt: String,
+)
+data class ErrorResponse(val code: String, val message: String)
