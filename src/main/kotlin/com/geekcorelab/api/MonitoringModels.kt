@@ -28,6 +28,11 @@ data class MonitorRequest(
     val metricRecoveryValue: Double? = null,
     val metricWindowSeconds: Int? = null,
     val metricSeverity: String? = null,
+    val databaseName: String? = null,
+    val databaseUsername: String? = null,
+    val databasePassword: String? = null,
+    val databaseTls: Boolean? = null,
+    val redisDatabase: Int? = null,
     val version: Int? = null,
 )
 
@@ -66,6 +71,11 @@ data class MonitorResponse(
     val metricRecoveryValue: Double? = null,
     val metricWindowSeconds: Int? = null,
     val metricSeverity: String? = null,
+    val databaseName: String? = null,
+    val databaseUsername: String? = null,
+    val databasePasswordConfigured: Boolean = false,
+    val databaseTls: Boolean? = null,
+    val redisDatabase: Int? = null,
 )
 
 data class CheckResponse(

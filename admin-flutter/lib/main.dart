@@ -4105,6 +4105,8 @@ class _MonitorsPage extends StatelessWidget {
                       ? '${monitor['metricName']} ${_metricOperatorSymbol(monitor['metricOperator'] as String?)} ${monitor['metricThreshold']} / ${monitor['metricWindowSeconds']} 秒窗口'
                       : type == 'HEARTBEAT'
                       ? '任务上报 · 宽限 ${monitor['heartbeatGraceSeconds'] ?? 60} 秒'
+                      : const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(type)
+                      ? '$displayHost:${monitor['port']} · ${type == 'REDIS' ? 'DB ${monitor['redisDatabase'] ?? 0}' : monitor['databaseName'] ?? ''}'
                       : type == 'HTTP'
                       ? monitor['targetUrl'] as String? ?? ''
                       : type == 'DNS'
@@ -4331,6 +4333,11 @@ class _MonitorDraft {
     required this.metricRecoveryValue,
     required this.metricWindowSeconds,
     required this.metricSeverity,
+    required this.databaseName,
+    required this.databaseUsername,
+    required this.databasePassword,
+    required this.databaseTls,
+    required this.redisDatabase,
     required this.failureThreshold,
     required this.recoveryThreshold,
     required this.reminderIntervalMinutes,
@@ -4359,6 +4366,11 @@ class _MonitorDraft {
   final double? metricRecoveryValue;
   final int? metricWindowSeconds;
   final String? metricSeverity;
+  final String? databaseName;
+  final String? databaseUsername;
+  final String? databasePassword;
+  final bool databaseTls;
+  final int? redisDatabase;
   final int failureThreshold;
   final int recoveryThreshold;
   final int reminderIntervalMinutes;
@@ -4381,6 +4393,16 @@ class _MonitorDraft {
       'metricRecoveryValue': metricRecoveryValue,
       'metricWindowSeconds': metricWindowSeconds,
       'metricSeverity': metricSeverity,
+    },
+    if (const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(type)) ...{
+      'targetHost': target,
+      'port': port,
+      'databaseName': databaseName,
+      'databaseUsername': databaseUsername,
+      if (databasePassword?.isNotEmpty == true)
+        'databasePassword': databasePassword,
+      'databaseTls': databaseTls,
+      if (type == 'REDIS') 'redisDatabase': redisDatabase,
     },
     'failureThreshold': failureThreshold,
     'recoveryThreshold': recoveryThreshold,
@@ -4444,7 +4466,17 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         : (widget.existing?['targetHost'] as String? ?? ''),
   );
   late final _port = TextEditingController(
-    text: '${widget.existing?['port'] ?? (_type == 'TLS' ? 443 : 80)}',
+    text: '${widget.existing?['port'] ?? _defaultMonitorPort(_type)}',
+  );
+  late final _databaseName = TextEditingController(
+    text: widget.existing?['databaseName'] as String? ?? '',
+  );
+  late final _databaseUsername = TextEditingController(
+    text: widget.existing?['databaseUsername'] as String? ?? '',
+  );
+  late final _databasePassword = TextEditingController();
+  late final _redisDatabase = TextEditingController(
+    text: '${widget.existing?['redisDatabase'] ?? 0}',
   );
   late final _resolver = TextEditingController(
     text: widget.existing?['resolver'] as String? ?? '',
@@ -4496,6 +4528,8 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   );
   late bool _critical = widget.existing?['critical'] as bool? ?? true;
   late bool _enabled = widget.existing?['enabled'] as bool? ?? true;
+  late bool _databaseTls =
+      (widget.existing?['databaseTls'] as bool?) ?? (_type == 'MYSQL');
 
   String _statusText(List? codes) {
     if (codes == null || codes.isEmpty) return '200-299';
@@ -4511,6 +4545,10 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     _name.dispose();
     _target.dispose();
     _port.dispose();
+    _databaseName.dispose();
+    _databaseUsername.dispose();
+    _databasePassword.dispose();
+    _redisDatabase.dispose();
     _resolver.dispose();
     _expectedRecordValue.dispose();
     _minimumValidityDays.dispose();
@@ -4572,8 +4610,8 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         : type == 'HEARTBEAT' || type == 'METRIC_THRESHOLD'
         ? 1
         : 10;
-    final previousPortDefault = previousType == 'TLS' ? 443 : 80;
-    final nextPortDefault = type == 'TLS' ? 443 : 80;
+    final previousPortDefault = _defaultMonitorPort(previousType);
+    final nextPortDefault = _defaultMonitorPort(type);
     if (_interval.text == '$previousIntervalDefault') {
       _interval.text = '$nextIntervalDefault';
     }
@@ -4586,11 +4624,16 @@ class _MonitorDialogState extends State<_MonitorDialog> {
       return switch (type) {
         'HEARTBEAT' => resourceType == 'HEARTBEAT',
         'METRIC_THRESHOLD' => resourceType == 'HOST',
+        'POSTGRESQL' || 'MYSQL' || 'REDIS' => resourceType == 'DATABASE',
         _ => resourceType != 'HEARTBEAT',
       };
     }, orElse: () => const <String, dynamic>{});
     setState(() {
       _type = type;
+      if (type == 'MYSQL' &&
+          !const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(previousType)) {
+        _databaseTls = true;
+      }
       if (compatibleResource.isNotEmpty) {
         _resourceId = compatibleResource['id'] as String;
       }
@@ -4636,6 +4679,21 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                           child: Text('心跳任务'),
                         ),
                       ]
+                    : const {
+                        'POSTGRESQL',
+                        'MYSQL',
+                        'REDIS',
+                      }.contains(widget.existing?['type'])
+                    ? [
+                        DropdownMenuItem(
+                          value: widget.existing!['type'] as String,
+                          child: Text(
+                            _monitorTypeName(
+                              widget.existing!['type'] as String,
+                            ),
+                          ),
+                        ),
+                      ]
                     : [
                         const DropdownMenuItem(
                           value: 'HTTP',
@@ -4656,6 +4714,18 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                         const DropdownMenuItem(
                           value: 'METRIC_THRESHOLD',
                           child: Text('主机指标阈值'),
+                        ),
+                        const DropdownMenuItem(
+                          value: 'POSTGRESQL',
+                          child: Text('PostgreSQL'),
+                        ),
+                        const DropdownMenuItem(
+                          value: 'MYSQL',
+                          child: Text('MySQL'),
+                        ),
+                        const DropdownMenuItem(
+                          value: 'REDIS',
+                          child: Text('Redis'),
                         ),
                         if (widget.existing == null)
                           const DropdownMenuItem(
@@ -4744,11 +4814,17 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                   controller: _target,
                   keyboardType: TextInputType.url,
                   decoration: InputDecoration(
-                    labelText: _type == 'DNS' ? '查询域名' : '目标主机名',
+                    labelText: _type == 'DNS'
+                        ? '查询域名'
+                        : const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(_type)
+                        ? '数据库主机名或 IP'
+                        : '目标主机名',
                     hintText: _type == 'DNS'
                         ? (_recordType == 'PTR'
                               ? '域名或 IP 地址'
                               : 'status.example.com')
+                        : const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(_type)
+                        ? 'db.example.com'
                         : 'example.com',
                   ),
                   validator: (value) => !_validMonitorHost(value ?? '')
@@ -4756,13 +4832,92 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                       : null,
                 ),
                 const SizedBox(height: 11),
-                if (_type == 'TCP' || _type == 'TLS')
+                if (_type == 'TCP' ||
+                    _type == 'TLS' ||
+                    const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(_type))
                   _IntField(
                     controller: _port,
                     label: '端口',
                     minimum: 1,
                     maximum: 65535,
                   ),
+                if (const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(_type)) ...[
+                  if (_type != 'REDIS') ...[
+                    const SizedBox(height: 11),
+                    TextFormField(
+                      controller: _databaseName,
+                      maxLength: 63,
+                      decoration: const InputDecoration(
+                        labelText: '数据库名称',
+                        hintText: 'app_db',
+                      ),
+                      validator: (value) =>
+                          _type != 'REDIS' &&
+                              !RegExp(
+                                r'^[A-Za-z0-9_.-]{1,63}$',
+                              ).hasMatch(value?.trim() ?? '')
+                          ? '请填写有效数据库名（字母、数字、点、下划线或短横线）'
+                          : null,
+                    ),
+                  ],
+                  const SizedBox(height: 11),
+                  TextFormField(
+                    controller: _databaseUsername,
+                    maxLength: 128,
+                    decoration: InputDecoration(
+                      labelText: _type == 'REDIS'
+                          ? 'Redis ACL 用户（可选）'
+                          : '只读监控用户名',
+                    ),
+                    validator: (value) =>
+                        _type != 'REDIS' &&
+                            (value == null || value.trim().isEmpty)
+                        ? '请输入数据库用户名'
+                        : null,
+                  ),
+                  const SizedBox(height: 11),
+                  TextFormField(
+                    controller: _databasePassword,
+                    obscureText: true,
+                    maxLength: 1024,
+                    decoration: InputDecoration(
+                      labelText: _type == 'REDIS' ? '密码（可选）' : '监控密码',
+                      hintText:
+                          widget.existing?['databasePasswordConfigured'] == true
+                          ? '留空则保留已保存的密码'
+                          : null,
+                    ),
+                    validator: (value) =>
+                        _type != 'REDIS' &&
+                            widget.existing?['databasePasswordConfigured'] !=
+                                true &&
+                            (value == null || value.isEmpty)
+                        ? '请输入只读监控密码'
+                        : null,
+                  ),
+                  if (_type == 'REDIS') ...[
+                    const SizedBox(height: 11),
+                    _IntField(
+                      controller: _redisDatabase,
+                      label: 'Redis 数据库编号',
+                      minimum: 0,
+                      maximum: 15,
+                    ),
+                  ],
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: _databaseTls,
+                    onChanged: (value) => setState(() => _databaseTls = value),
+                    title: const Text(
+                      '启用数据库 TLS',
+                      style: TextStyle(fontSize: 13),
+                    ),
+                    subtitle: const Text(
+                      '需要目标数据库配置受信任的证书',
+                      style: TextStyle(fontSize: 10),
+                    ),
+                  ),
+                ],
                 if (_type == 'DNS') ...[
                   DropdownButtonFormField<String>(
                     initialValue: _recordType,
@@ -5095,6 +5250,22 @@ class _MonitorDialogState extends State<_MonitorDialog> {
       ).showSnackBar(const SnackBar(content: Text('主机指标阈值规则必须绑定 HOST 资源')));
       return;
     }
+    if (const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(_type) &&
+        selectedResource['type'] != 'DATABASE') {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('数据库检查必须绑定 DATABASE 资源')));
+      return;
+    }
+    if (_type == 'REDIS' &&
+        _databaseUsername.text.trim().isNotEmpty &&
+        _databasePassword.text.isEmpty &&
+        widget.existing?['databasePasswordConfigured'] != true) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('使用 Redis ACL 用户时必须配置密码')));
+      return;
+    }
     final interval = int.parse(_interval.text);
     final timeout = int.parse(_timeout.text);
     if (interval <= timeout) {
@@ -5125,7 +5296,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         name: _name.text.trim(),
         target: _target.text.trim(),
         method: _method,
-        port: _type == 'TCP' || _type == 'TLS' ? int.parse(_port.text) : null,
+        port:
+            _type == 'TCP' ||
+                _type == 'TLS' ||
+                const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(_type)
+            ? int.parse(_port.text)
+            : null,
         recordType: _type == 'DNS' ? _recordType : null,
         resolver: _resolver.text.trim().isEmpty ? null : _resolver.text.trim(),
         expectedRecordValue: _expectedRecordValue.text.trim().isEmpty
@@ -5151,6 +5327,18 @@ class _MonitorDialogState extends State<_MonitorDialog> {
             ? int.parse(_metricWindow.text)
             : null,
         metricSeverity: _type == 'METRIC_THRESHOLD' ? _metricSeverity : null,
+        databaseName: _type == 'POSTGRESQL' || _type == 'MYSQL'
+            ? _databaseName.text.trim()
+            : null,
+        databaseUsername: const {'POSTGRESQL', 'MYSQL', 'REDIS'}.contains(_type)
+            ? _databaseUsername.text.trim()
+            : null,
+        databasePassword:
+            _type == 'POSTGRESQL' || _type == 'MYSQL' || _type == 'REDIS'
+            ? _databasePassword.text
+            : null,
+        databaseTls: _databaseTls,
+        redisDatabase: _type == 'REDIS' ? int.parse(_redisDatabase.text) : null,
         failureThreshold: int.parse(_failure.text),
         recoveryThreshold: int.parse(_recovery.text),
         reminderIntervalMinutes: int.parse(_reminderInterval.text),
@@ -6257,6 +6445,7 @@ IconData _monitorIcon(String type) => switch (type) {
   'TLS' => Icons.verified_user_outlined,
   'HEARTBEAT' => Icons.favorite_border_rounded,
   'METRIC_THRESHOLD' => Icons.speed_rounded,
+  'POSTGRESQL' || 'MYSQL' || 'REDIS' => Icons.storage_outlined,
   _ => Icons.language_rounded,
 };
 
@@ -6266,7 +6455,18 @@ String _monitorTypeName(String type) => switch (type) {
   'TLS' => 'TLS',
   'HEARTBEAT' => '心跳任务',
   'METRIC_THRESHOLD' => '指标阈值',
+  'POSTGRESQL' => 'PostgreSQL',
+  'MYSQL' => 'MySQL',
+  'REDIS' => 'Redis',
   _ => 'HTTP',
+};
+
+int _defaultMonitorPort(String type) => switch (type) {
+  'TLS' => 443,
+  'POSTGRESQL' => 5432,
+  'MYSQL' => 3306,
+  'REDIS' => 6379,
+  _ => 80,
 };
 
 const _hostMetricNames = [

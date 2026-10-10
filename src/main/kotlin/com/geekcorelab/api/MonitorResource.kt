@@ -3,6 +3,7 @@ package com.geekcorelab.api
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.geekcorelab.monitor.ProtocolCheckService
 import com.geekcorelab.security.CredentialService
+import com.geekcorelab.security.SecretEncryptionService
 import jakarta.inject.Inject
 import jakarta.ws.rs.Consumes
 import jakarta.ws.rs.DELETE
@@ -32,6 +33,7 @@ class MonitorResource {
     @Inject lateinit var authenticator: SessionAuthenticator
     @Inject lateinit var protocolCheckService: ProtocolCheckService
     @Inject lateinit var credentials: CredentialService
+    @Inject lateinit var secretEncryption: SecretEncryptionService
 
     @GET
     @Path("/monitors")
@@ -75,6 +77,10 @@ class MonitorResource {
         val resourceId = request.resourceId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
             ?: return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "请选择有效的监控资源")
         if (!authenticator.canAccessResource(user.id, resourceId)) return error(Response.Status.FORBIDDEN, "RESOURCE_FORBIDDEN", "你没有该资源的访问权限")
+        val requestedType = request.type?.trim()?.uppercase() ?: "HTTP"
+        if (requestedType in DATABASE_TYPES && !secretEncryption.isConfigured()) {
+            return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置数据库凭据加密密钥")
+        }
         val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔、阈值和重复提醒")
         val resourceType = resourceType(resourceId)
         if ((definition.type == "HEARTBEAT") != (resourceType == "HEARTBEAT")) {
@@ -82,6 +88,9 @@ class MonitorResource {
         }
         if (definition.type == "METRIC_THRESHOLD" && resourceType != "HOST") {
             return error(Response.Status.BAD_REQUEST, "HOST_RESOURCE_REQUIRED", "主机指标阈值规则必须绑定到 HOST 资源")
+        }
+        if (definition.type in DATABASE_TYPES && resourceType != "DATABASE") {
+            return error(Response.Status.BAD_REQUEST, "DATABASE_RESOURCE_REQUIRED", "数据库检查必须绑定到 DATABASE 资源")
         }
         val id = UUID.randomUUID()
         val heartbeatToken = if (definition.type == "HEARTBEAT") credentials.newToken() else null
@@ -150,6 +159,9 @@ class MonitorResource {
         if ((current.type == "HEARTBEAT" || requestedType == "HEARTBEAT") && requestedType != current.type) {
             return error(Response.Status.CONFLICT, "HEARTBEAT_TYPE_IMMUTABLE", "心跳任务类型不可转换；请新建任务以重新签发凭据")
         }
+        if ((current.type in DATABASE_TYPES || requestedType in DATABASE_TYPES) && requestedType != current.type) {
+            return error(Response.Status.CONFLICT, "DATABASE_TYPE_IMMUTABLE", "数据库检查类型不可转换；请新建监控项以更换数据库类型")
+        }
         val requestedResource = request.resourceId?.let { runCatching { UUID.fromString(it) }.getOrNull() } ?: UUID.fromString(current.resourceId)
         if (!authenticator.canAccessResource(user.id, requestedResource)) return error(Response.Status.FORBIDDEN, "RESOURCE_FORBIDDEN", "你没有该资源的访问权限")
         val requestedResourceType = resourceType(requestedResource)
@@ -159,11 +171,19 @@ class MonitorResource {
         if (requestedType == "METRIC_THRESHOLD" && requestedResourceType != "HOST") {
             return error(Response.Status.BAD_REQUEST, "HOST_RESOURCE_REQUIRED", "主机指标阈值规则必须绑定到 HOST 资源")
         }
+        if (requestedType in DATABASE_TYPES && requestedResourceType != "DATABASE") {
+            return error(Response.Status.BAD_REQUEST, "DATABASE_RESOURCE_REQUIRED", "数据库检查必须绑定到 DATABASE 资源")
+        }
+        if (requestedType in DATABASE_TYPES && !secretEncryption.isConfigured()) {
+            return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置数据库凭据加密密钥")
+        }
+        val currentConfig = loadMonitorConfig(id)
         val definition = validate(
             request.copy(
                 reminderIntervalMinutes = request.reminderIntervalMinutes ?: current.reminderIntervalMinutes,
                 heartbeatGraceSeconds = request.heartbeatGraceSeconds ?: current.heartbeatGraceSeconds,
             ),
+            currentConfig,
         )
             ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔、阈值和重复提醒")
         val updated = dataSource.connection.use { connection ->
@@ -252,7 +272,7 @@ class MonitorResource {
         return Response.ok(results).build()
     }
 
-    private fun validate(request: MonitorRequest): ValidatedDefinition? {
+    private fun validate(request: MonitorRequest, existingConfig: com.fasterxml.jackson.databind.JsonNode? = null): ValidatedDefinition? {
         val name = request.name?.trim().orEmpty()
         val type = request.type?.trim()?.uppercase() ?: "HTTP"
         val targetUrl = request.targetUrl?.trim().orEmpty()
@@ -272,7 +292,7 @@ class MonitorResource {
         val recoveries = request.recoveryThreshold ?: 2
         val expectedCodes = (request.expectedStatusCodes ?: (200..299).toList()).distinct().sorted()
         val contains = request.textContains?.takeIf(String::isNotBlank)
-        if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS", "HEARTBEAT", "METRIC_THRESHOLD") ||
+        if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS", "POSTGRESQL", "MYSQL", "REDIS", "HEARTBEAT", "METRIC_THRESHOLD") ||
             interval !in 10..86400 || timeout !in 1..30 || interval <= timeout || failures !in 1..20 || recoveries !in 1..20 ||
             reminderInterval !in 0..1440 || heartbeatGraceSeconds !in 0..86400) {
             return null
@@ -327,8 +347,38 @@ class MonitorResource {
                 if (!validHost(host) || port !in 1..65535 || minimumValidityDays !in 0..3650) return null
                 mapOf("host" to host, "port" to port, "minimumValidityDays" to minimumValidityDays)
             }
+            "POSTGRESQL", "MYSQL", "REDIS" -> {
+                val port = request.port ?: when (type) { "POSTGRESQL" -> 5432; "MYSQL" -> 3306; else -> 6379 }
+                val databaseName = request.databaseName?.trim().orEmpty()
+                val username = request.databaseUsername?.trim().orEmpty()
+                val redisDatabase = request.redisDatabase ?: 0
+                val suppliedPassword = request.databasePassword?.takeIf { it.isNotEmpty() }
+                val previousPassword = existingConfig?.path("passwordEncrypted")
+                    ?.takeUnless { it.isMissingNode || it.isNull || it.asText().isBlank() }
+                    ?.asText()
+                val encryptedPassword = suppliedPassword?.let { secretEncryption.encrypt(it) } ?: previousPassword
+                val databaseNameValid = type == "REDIS" ||
+                    (databaseName.matches(Regex("[A-Za-z0-9_.-]{1,63}")))
+                val usernameValid = type == "REDIS" ||
+                    (username.isNotBlank() && username.length <= 128 && !username.any(Char::isISOControl))
+                if (!validHost(host) || port !in 1..65535 || !databaseNameValid || !usernameValid ||
+                    (type == "REDIS" && (username.length > 128 || username.any(Char::isISOControl) ||
+                        (username.isNotBlank() && encryptedPassword == null))) ||
+                    (request.databasePassword?.length ?: 0) > 1024 || request.databasePassword?.any(Char::isISOControl) == true ||
+                    (type == "REDIS" && redisDatabase !in 0..15)) return null
+                if (type != "REDIS" && encryptedPassword == null) return null
+                mapOf(
+                    "host" to host,
+                    "port" to port,
+                    "databaseName" to databaseName.takeIf { type != "REDIS" },
+                    "username" to username.takeIf { it.isNotBlank() },
+                    "passwordEncrypted" to encryptedPassword,
+                    "tls" to (request.databaseTls ?: (type == "MYSQL")),
+                    "redisDatabase" to if (type == "REDIS") redisDatabase else null,
+                )
+            }
             "HEARTBEAT" -> mapOf("graceSeconds" to heartbeatGraceSeconds)
-            "METRIC_THRESHOLD" -> mapOf(
+        "METRIC_THRESHOLD" -> mapOf(
                 "metricName" to metricName,
                 "operator" to metricOperator,
                 "threshold" to metricThreshold,
@@ -360,11 +410,21 @@ class MonitorResource {
         }
     }
 
-    private fun runCheck(monitor: MonitorResponse) = protocolCheckService.execute(
-        monitor.type,
-        objectMapper.valueToTree(monitor.toCheckConfig()),
-        monitor.timeoutSeconds,
-    )
+    private fun runCheck(monitor: MonitorResponse): CheckResponse {
+        val config = if (monitor.type in DATABASE_TYPES) {
+            loadMonitorConfig(UUID.fromString(monitor.id)) ?: objectMapper.createObjectNode()
+        } else {
+            objectMapper.valueToTree(monitor.toCheckConfig())
+        }
+        return protocolCheckService.execute(monitor.type, config, monitor.timeoutSeconds)
+    }
+
+    private fun loadMonitorConfig(id: UUID): com.fasterxml.jackson.databind.JsonNode? = dataSource.connection.use { connection ->
+        connection.prepareStatement("SELECT config::text FROM monitor WHERE id = ? AND deleted_at IS NULL").use { statement ->
+            statement.setObject(1, id)
+            statement.executeQuery().use { rows -> if (rows.next()) objectMapper.readTree(rows.getString(1)) else null }
+        }
+    }
 
     private fun MonitorResponse.toCheckConfig(): Map<String, Any?> = when (type) {
         "HTTP" -> mapOf("url" to targetUrl, "method" to method, "expectedStatusCodes" to expectedStatusCodes, "textContains" to textContains)
@@ -434,6 +494,11 @@ class MonitorResource {
             metricRecoveryValue = config.path("recoveryValue").takeUnless { it.isMissingNode || it.isNull }?.asDouble(),
             metricWindowSeconds = config.path("windowSeconds").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
             metricSeverity = config.path("severity").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            databaseName = config.path("databaseName").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            databaseUsername = config.path("username").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            databasePasswordConfigured = config.path("passwordEncrypted").takeUnless { it.isMissingNode || it.isNull }?.asText()?.isNotBlank() == true,
+            databaseTls = config.path("tls").takeUnless { it.isMissingNode || it.isNull }?.asBoolean(),
+            redisDatabase = config.path("redisDatabase").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
         )
     }
 
@@ -473,6 +538,7 @@ class MonitorResource {
         private const val MAX_METRIC_VALUE = 1_000_000_000_000_000.0
         private val METRIC_OPERATORS = setOf("GT", "GTE", "LT", "LTE")
         private val METRIC_SEVERITIES = setOf("WARNING", "HIGH", "CRITICAL")
+        private val DATABASE_TYPES = setOf("POSTGRESQL", "MYSQL", "REDIS")
         private val lastManualTestNanos = ConcurrentHashMap<UUID, java.util.concurrent.atomic.AtomicLong>()
         private val DNS_RECORD_TYPES = setOf("A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "PTR")
 

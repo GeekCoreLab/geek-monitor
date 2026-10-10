@@ -36,6 +36,7 @@ import org.xbill.DNS.Type
 class ProtocolCheckService {
     @Inject lateinit var httpChecker: HttpCheckService
     @Inject lateinit var networkChecker: NetworkCheckService
+    @Inject lateinit var databaseChecker: DatabaseCheckService
     @Inject lateinit var dataSource: DataSource
 
     fun execute(type: String, config: JsonNode, timeoutSeconds: Int): CheckResponse = when (type.uppercase()) {
@@ -60,6 +61,7 @@ class ProtocolCheckService {
             config.path("minimumValidityDays").asInt(14),
             timeoutSeconds,
         )
+        "POSTGRESQL", "MYSQL", "REDIS" -> databaseChecker.execute(type.uppercase(), config, timeoutSeconds)
         "HEARTBEAT" -> heartbeat(
             config.path("monitorId").asText(),
             config.path("expectedIntervalSeconds").asInt(),
