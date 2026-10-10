@@ -4057,7 +4057,7 @@ class _MonitorsPage extends StatelessWidget {
         _PageHeading(
           eyebrow: 'MONITOR CONFIGURATION',
           title: '监控配置',
-          subtitle: '配置 HTTP、TCP、DNS、TLS 检查与定时任务心跳。',
+          subtitle: '配置 HTTP、TCP、DNS、TLS 检查、主机指标阈值和定时任务心跳。',
           actions: [
             FilledButton.icon(
               onPressed: onCreate,
@@ -4101,7 +4101,9 @@ class _MonitorsPage extends StatelessWidget {
                       host.contains(':') && !host.startsWith('[')
                       ? '[$host]'
                       : host;
-                  final target = type == 'HEARTBEAT'
+                  final target = type == 'METRIC_THRESHOLD'
+                      ? '${monitor['metricName']} ${_metricOperatorSymbol(monitor['metricOperator'] as String?)} ${monitor['metricThreshold']} / ${monitor['metricWindowSeconds']} 秒窗口'
+                      : type == 'HEARTBEAT'
                       ? '任务上报 · 宽限 ${monitor['heartbeatGraceSeconds'] ?? 60} 秒'
                       : type == 'HTTP'
                       ? monitor['targetUrl'] as String? ?? ''
@@ -4196,7 +4198,8 @@ class _MonitorsPage extends StatelessWidget {
                                   icon: Icons.restart_alt_rounded,
                                   text: '${monitor['recoveryThreshold']} 次成功恢复',
                                 ),
-                                if (type != 'HEARTBEAT')
+                                if (type != 'HEARTBEAT' &&
+                                    type != 'METRIC_THRESHOLD')
                                   _InfoPill(
                                     icon: Icons.schedule_outlined,
                                     text: '超时 ${monitor['timeoutSeconds']} 秒',
@@ -4322,6 +4325,12 @@ class _MonitorDraft {
     required this.intervalSeconds,
     required this.timeoutSeconds,
     required this.heartbeatGraceSeconds,
+    required this.metricName,
+    required this.metricOperator,
+    required this.metricThreshold,
+    required this.metricRecoveryValue,
+    required this.metricWindowSeconds,
+    required this.metricSeverity,
     required this.failureThreshold,
     required this.recoveryThreshold,
     required this.reminderIntervalMinutes,
@@ -4344,6 +4353,12 @@ class _MonitorDraft {
   final int intervalSeconds;
   final int timeoutSeconds;
   final int heartbeatGraceSeconds;
+  final String? metricName;
+  final String? metricOperator;
+  final double? metricThreshold;
+  final double? metricRecoveryValue;
+  final int? metricWindowSeconds;
+  final String? metricSeverity;
   final int failureThreshold;
   final int recoveryThreshold;
   final int reminderIntervalMinutes;
@@ -4359,6 +4374,14 @@ class _MonitorDraft {
     'intervalSeconds': intervalSeconds,
     'timeoutSeconds': timeoutSeconds,
     if (type == 'HEARTBEAT') 'heartbeatGraceSeconds': heartbeatGraceSeconds,
+    if (type == 'METRIC_THRESHOLD') ...{
+      'metricName': metricName,
+      'metricOperator': metricOperator,
+      'metricThreshold': metricThreshold,
+      'metricRecoveryValue': metricRecoveryValue,
+      'metricWindowSeconds': metricWindowSeconds,
+      'metricSeverity': metricSeverity,
+    },
     'failureThreshold': failureThreshold,
     'recoveryThreshold': recoveryThreshold,
     'reminderIntervalMinutes': reminderIntervalMinutes,
@@ -4406,6 +4429,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
           as String);
   late String _method = widget.existing?['method'] as String? ?? 'GET';
   late String _recordType = widget.existing?['recordType'] as String? ?? 'A';
+  late String _metricName =
+      widget.existing?['metricName'] as String? ?? 'cpu_usage_percent';
+  late String _metricOperator =
+      widget.existing?['metricOperator'] as String? ?? 'GT';
+  late String _metricSeverity =
+      widget.existing?['metricSeverity'] as String? ?? 'WARNING';
   late final _name = TextEditingController(
     text: widget.existing?['name'] as String? ?? '',
   );
@@ -4434,12 +4463,21 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     text:
         '${widget.existing?['timeoutSeconds'] ?? (_type == 'DNS'
                 ? 5
-                : _type == 'HEARTBEAT'
+                : _type == 'HEARTBEAT' || _type == 'METRIC_THRESHOLD'
                 ? 1
                 : 10)}',
   );
   late final _heartbeatGrace = TextEditingController(
     text: '${widget.existing?['heartbeatGraceSeconds'] ?? 60}',
+  );
+  late final _metricThreshold = TextEditingController(
+    text: '${widget.existing?['metricThreshold'] ?? 90}',
+  );
+  late final _metricRecoveryValue = TextEditingController(
+    text: '${widget.existing?['metricRecoveryValue'] ?? 80}',
+  );
+  late final _metricWindow = TextEditingController(
+    text: '${widget.existing?['metricWindowSeconds'] ?? 300}',
   );
   late final _failure = TextEditingController(
     text: '${widget.existing?['failureThreshold'] ?? 3}',
@@ -4479,6 +4517,9 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     _interval.dispose();
     _timeout.dispose();
     _heartbeatGrace.dispose();
+    _metricThreshold.dispose();
+    _metricRecoveryValue.dispose();
+    _metricWindow.dispose();
     _failure.dispose();
     _recovery.dispose();
     _reminderInterval.dispose();
@@ -4523,12 +4564,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     final nextIntervalDefault = type == 'TLS' ? 21600 : 60;
     final previousTimeoutDefault = previousType == 'DNS'
         ? 5
-        : previousType == 'HEARTBEAT'
+        : previousType == 'HEARTBEAT' || previousType == 'METRIC_THRESHOLD'
         ? 1
         : 10;
     final nextTimeoutDefault = type == 'DNS'
         ? 5
-        : type == 'HEARTBEAT'
+        : type == 'HEARTBEAT' || type == 'METRIC_THRESHOLD'
         ? 1
         : 10;
     final previousPortDefault = previousType == 'TLS' ? 443 : 80;
@@ -4540,12 +4581,14 @@ class _MonitorDialogState extends State<_MonitorDialog> {
       _timeout.text = '$nextTimeoutDefault';
     }
     if (_port.text == '$previousPortDefault') _port.text = '$nextPortDefault';
-    final compatibleResource = widget.resources.firstWhere(
-      (resource) =>
-          ((resource['type'] as String? ?? '') == 'HEARTBEAT') ==
-          (type == 'HEARTBEAT'),
-      orElse: () => const <String, dynamic>{},
-    );
+    final compatibleResource = widget.resources.firstWhere((resource) {
+      final resourceType = resource['type'] as String? ?? '';
+      return switch (type) {
+        'HEARTBEAT' => resourceType == 'HEARTBEAT',
+        'METRIC_THRESHOLD' => resourceType == 'HOST',
+        _ => resourceType != 'HEARTBEAT',
+      };
+    }, orElse: () => const <String, dynamic>{});
     setState(() {
       _type = type;
       if (compatibleResource.isNotEmpty) {
@@ -4586,20 +4629,40 @@ class _MonitorDialogState extends State<_MonitorDialog> {
               DropdownButtonFormField<String>(
                 initialValue: _type,
                 decoration: const InputDecoration(labelText: '检查类型'),
-                items: [
-                  const DropdownMenuItem(
-                    value: 'HTTP',
-                    child: Text('HTTP/HTTPS'),
-                  ),
-                  const DropdownMenuItem(value: 'TCP', child: Text('TCP 端口')),
-                  const DropdownMenuItem(value: 'DNS', child: Text('DNS 记录')),
-                  const DropdownMenuItem(value: 'TLS', child: Text('TLS 证书')),
-                  if (widget.existing == null || _type == 'HEARTBEAT')
-                    const DropdownMenuItem(
-                      value: 'HEARTBEAT',
-                      child: Text('心跳任务'),
-                    ),
-                ],
+                items: widget.existing?['type'] == 'HEARTBEAT'
+                    ? const [
+                        DropdownMenuItem(
+                          value: 'HEARTBEAT',
+                          child: Text('心跳任务'),
+                        ),
+                      ]
+                    : [
+                        const DropdownMenuItem(
+                          value: 'HTTP',
+                          child: Text('HTTP/HTTPS'),
+                        ),
+                        const DropdownMenuItem(
+                          value: 'TCP',
+                          child: Text('TCP 端口'),
+                        ),
+                        const DropdownMenuItem(
+                          value: 'DNS',
+                          child: Text('DNS 记录'),
+                        ),
+                        const DropdownMenuItem(
+                          value: 'TLS',
+                          child: Text('TLS 证书'),
+                        ),
+                        const DropdownMenuItem(
+                          value: 'METRIC_THRESHOLD',
+                          child: Text('主机指标阈值'),
+                        ),
+                        if (widget.existing == null)
+                          const DropdownMenuItem(
+                            value: 'HEARTBEAT',
+                            child: Text('心跳任务'),
+                          ),
+                      ],
                 onChanged: (value) {
                   if (value == null) return;
                   _changeType(value);
@@ -4759,6 +4822,123 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                   ),
                 ],
               ],
+              if (_type == 'METRIC_THRESHOLD') ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF3F6FB),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Text(
+                    '仅使用可信 Agent 样本。触发窗口至少覆盖 80% 的采样点，且任意相邻采样间隔不能超过两倍采样周期；数据不足时状态为未知。',
+                    style: TextStyle(color: _muted, fontSize: 11, height: 1.45),
+                  ),
+                ),
+                const SizedBox(height: 11),
+                DropdownButtonFormField<String>(
+                  initialValue: _metricName,
+                  decoration: const InputDecoration(labelText: '主机指标'),
+                  items: _hostMetricNames
+                      .map(
+                        (metric) => DropdownMenuItem(
+                          value: metric,
+                          child: Text(_metricDisplayName(metric)),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) {
+                    if (value != null) setState(() => _metricName = value);
+                  },
+                ),
+                const SizedBox(height: 11),
+                Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButtonFormField<String>(
+                        initialValue: _metricOperator,
+                        decoration: const InputDecoration(labelText: '触发条件'),
+                        items: const [
+                          DropdownMenuItem(value: 'GT', child: Text('大于 >')),
+                          DropdownMenuItem(value: 'GTE', child: Text('大于等于 ≥')),
+                          DropdownMenuItem(value: 'LT', child: Text('小于 <')),
+                          DropdownMenuItem(value: 'LTE', child: Text('小于等于 ≤')),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() => _metricOperator = value);
+                          }
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: DropdownButtonFormField<String>(
+                        initialValue: _metricSeverity,
+                        decoration: const InputDecoration(labelText: '事件级别'),
+                        items: const [
+                          DropdownMenuItem(value: 'WARNING', child: Text('警告')),
+                          DropdownMenuItem(value: 'HIGH', child: Text('高')),
+                          DropdownMenuItem(
+                            value: 'CRITICAL',
+                            child: Text('严重'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() => _metricSeverity = value);
+                          }
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 11),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextFormField(
+                        controller: _metricThreshold,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: InputDecoration(
+                          labelText: '触发值 ${_metricUnit(_metricName)}',
+                        ),
+                        validator: (value) => _validateMetricValue(value),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextFormField(
+                        controller: _metricRecoveryValue,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: InputDecoration(
+                          labelText: '恢复值 ${_metricUnit(_metricName)}',
+                        ),
+                        validator: (value) => _validateMetricValue(value),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 11),
+                _IntField(
+                  controller: _metricWindow,
+                  label: '持续窗口（秒）',
+                  minimum: 120,
+                  maximum: 86400,
+                ),
+                const SizedBox(height: 5),
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    '恢复值需位于触发阈值的安全侧；触发和恢复还分别受连续失败/成功次数控制。',
+                    style: TextStyle(color: _muted, fontSize: 10, height: 1.4),
+                  ),
+                ),
+              ],
               if (_type == 'HEARTBEAT') ...[
                 Container(
                   width: double.infinity,
@@ -4883,6 +5063,20 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     ],
   );
 
+  String? _validateMetricValue(String? value) {
+    final number = double.tryParse(value?.trim() ?? '');
+    if (number == null || !number.isFinite || number < 0) {
+      return '请输入 0 或更大的有限数值';
+    }
+    if (number > 1000000000000000) {
+      return '数值不能超过 1,000,000,000,000,000';
+    }
+    if (_metricName.endsWith('_percent') && number > 100) {
+      return '百分比不能超过 100';
+    }
+    return null;
+  }
+
   void _submit() {
     if (!_formKey.currentState!.validate()) return;
     final selectedResource = widget.resources.firstWhere(
@@ -4895,6 +5089,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
       ).showSnackBar(const SnackBar(content: Text('心跳任务必须绑定心跳类型资源')));
       return;
     }
+    if (_type == 'METRIC_THRESHOLD' && selectedResource['type'] != 'HOST') {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('主机指标阈值规则必须绑定 HOST 资源')));
+      return;
+    }
     final interval = int.parse(_interval.text);
     final timeout = int.parse(_timeout.text);
     if (interval <= timeout) {
@@ -4902,6 +5102,20 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         context,
       ).showSnackBar(const SnackBar(content: Text('检查间隔必须大于单次超时时间')));
       return;
+    }
+    if (_type == 'METRIC_THRESHOLD') {
+      final trigger = double.parse(_metricThreshold.text);
+      final recovery = double.parse(_metricRecoveryValue.text);
+      final validRecovery = switch (_metricOperator) {
+        'GT' || 'GTE' => recovery < trigger,
+        _ => recovery > trigger,
+      };
+      if (!validRecovery) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('恢复值必须位于触发阈值的安全侧')));
+        return;
+      }
     }
     Navigator.pop(
       context,
@@ -4925,6 +5139,18 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         heartbeatGraceSeconds: _type == 'HEARTBEAT'
             ? int.parse(_heartbeatGrace.text)
             : 60,
+        metricName: _type == 'METRIC_THRESHOLD' ? _metricName : null,
+        metricOperator: _type == 'METRIC_THRESHOLD' ? _metricOperator : null,
+        metricThreshold: _type == 'METRIC_THRESHOLD'
+            ? double.parse(_metricThreshold.text)
+            : null,
+        metricRecoveryValue: _type == 'METRIC_THRESHOLD'
+            ? double.parse(_metricRecoveryValue.text)
+            : null,
+        metricWindowSeconds: _type == 'METRIC_THRESHOLD'
+            ? int.parse(_metricWindow.text)
+            : null,
+        metricSeverity: _type == 'METRIC_THRESHOLD' ? _metricSeverity : null,
         failureThreshold: int.parse(_failure.text),
         recoveryThreshold: int.parse(_recovery.text),
         reminderIntervalMinutes: int.parse(_reminderInterval.text),
@@ -5556,6 +5782,7 @@ String _eventName(String type) => switch (type) {
 
 String _incidentCategoryName(String? category) => switch (category) {
   'TLS_CERTIFICATE' => 'TLS 证书',
+  'PERFORMANCE' => '性能阈值',
   _ => '可用性',
 };
 
@@ -6028,6 +6255,7 @@ IconData _monitorIcon(String type) => switch (type) {
   'DNS' => Icons.dns_outlined,
   'TLS' => Icons.verified_user_outlined,
   'HEARTBEAT' => Icons.favorite_border_rounded,
+  'METRIC_THRESHOLD' => Icons.speed_rounded,
   _ => Icons.language_rounded,
 };
 
@@ -6036,7 +6264,49 @@ String _monitorTypeName(String type) => switch (type) {
   'DNS' => 'DNS',
   'TLS' => 'TLS',
   'HEARTBEAT' => '心跳任务',
+  'METRIC_THRESHOLD' => '指标阈值',
   _ => 'HTTP',
+};
+
+const _hostMetricNames = [
+  'cpu_usage_percent',
+  'load_1m',
+  'memory_used_percent',
+  'memory_available_bytes',
+  'swap_used_percent',
+  'disk_used_percent',
+  'disk_inode_used_percent',
+  'network_receive_bytes_per_second',
+  'network_transmit_bytes_per_second',
+];
+
+String _metricDisplayName(String name) => switch (name) {
+  'cpu_usage_percent' => 'CPU 使用率',
+  'load_1m' => '1 分钟 Load',
+  'memory_used_percent' => '内存使用率',
+  'memory_available_bytes' => '可用内存',
+  'swap_used_percent' => 'Swap 使用率',
+  'disk_used_percent' => '磁盘使用率（按挂载点）',
+  'disk_inode_used_percent' => '磁盘 inode 使用率（按挂载点）',
+  'network_receive_bytes_per_second' => '网络接收速率（按接口）',
+  'network_transmit_bytes_per_second' => '网络发送速率（按接口）',
+  _ => name,
+};
+
+String _metricUnit(String name) => name.endsWith('_percent')
+    ? '(%)'
+    : name.endsWith('_bytes_per_second')
+    ? '(bytes/s)'
+    : name.endsWith('_bytes')
+    ? '(bytes)'
+    : '';
+
+String _metricOperatorSymbol(String? operator) => switch (operator) {
+  'GT' => '>',
+  'GTE' => '≥',
+  'LT' => '<',
+  'LTE' => '≤',
+  _ => '>',
 };
 
 bool _validMonitorHost(String value, {bool ipOnly = false}) {

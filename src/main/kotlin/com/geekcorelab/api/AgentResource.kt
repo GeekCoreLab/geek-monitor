@@ -344,13 +344,9 @@ class AgentResource {
             val name = metric.name?.trim().orEmpty()
             val value = metric.value ?: return null
             val labels = metric.labels ?: emptyMap()
-            if (name !in HOST_METRICS || !value.isFinite() || value < 0 || value > MAX_METRIC_VALUE) return null
+            if (name !in MetricCatalog.hostMetricNames || !value.isFinite() || value < 0 || value > MAX_METRIC_VALUE) return null
             if (name.endsWith("_percent") && value > 100) return null
-            val expectedLabel = when (name) {
-                "disk_used_percent", "disk_inode_used_percent" -> "mountpoint"
-                "network_receive_bytes_per_second", "network_transmit_bytes_per_second" -> "interface"
-                else -> null
-            }
+            val expectedLabel = MetricCatalog.labelKeysByMetric[name]
             if ((expectedLabel == null && labels.isNotEmpty()) ||
                 (expectedLabel != null && labels.keys != setOf(expectedLabel))) return null
             if (labels.values.any { it.isBlank() || it.length > 255 || it.any(Char::isISOControl) }) return null
@@ -434,10 +430,7 @@ class AgentResource {
         private const val MAX_METRICS_PER_BATCH = 500
         private const val MAX_METRIC_VALUE = 1_000_000_000_000_000.0
         private const val COLLECTION_INTERVAL_SECONDS = 30
-        private val HOST_METRICS = listOf(
-            "cpu_usage_percent", "load_1m", "memory_used_percent", "memory_available_bytes", "swap_used_percent",
-            "disk_used_percent", "disk_inode_used_percent", "network_receive_bytes_per_second", "network_transmit_bytes_per_second",
-        )
+        private val HOST_METRICS = MetricCatalog.hostMetricNames.toList()
     }
 }
 

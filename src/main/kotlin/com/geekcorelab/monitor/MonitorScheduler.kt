@@ -120,6 +120,10 @@ class MonitorScheduler {
                 config.put("monitorId", task.id.toString())
                 config.put("expectedIntervalSeconds", task.intervalSeconds)
             }
+            if (task.type == "METRIC_THRESHOLD" && config is ObjectNode) {
+                config.put("monitorId", task.id.toString())
+                config.put("resourceId", task.resourceId.toString())
+            }
             checker.execute(task.type, config, task.timeoutSeconds)
         } catch (_: Exception) {
             CheckResponse("UNKNOWN", null, "CHECKER_ERROR", "检查器发生内部错误", 0, Instant.now().toString())
@@ -206,17 +210,20 @@ class MonitorScheduler {
                 val previousSuccesses = if (maintenanceBoundaryCrossed) 0 else monitor.consecutiveSuccesses
                 val success = result.status == "UP"
                 val failure = result.status == "DOWN"
+                val degraded = result.status == "DEGRADED"
+                val failureEvidence = failure || degraded
                 val failures = when {
-                    success || !failure -> 0
+                    success || !failureEvidence -> 0
                     else -> previousFailures + 1
                 }
                 val successes = if (success) previousSuccesses + 1 else 0
                 val nextState = when {
-                    result.status == "UNKNOWN" && monitor.currentState == "DOWN" -> "DOWN"
+                    result.status == "UNKNOWN" && monitor.currentState in setOf("DOWN", "DEGRADED") -> monitor.currentState
                     result.status == "UNKNOWN" -> "UNKNOWN"
-                    success && monitor.currentState == "DOWN" && successes >= monitor.recoveryThreshold -> "UP"
+                    success && monitor.currentState in setOf("DOWN", "DEGRADED") && successes >= monitor.recoveryThreshold -> "UP"
                     success && monitor.currentState in setOf("PENDING", "UNKNOWN") -> "UP"
                     failure && monitor.currentState != "DOWN" && failures >= monitor.failureThreshold -> "DOWN"
+                    degraded && monitor.currentState !in setOf("DOWN", "DEGRADED") && failures >= monitor.failureThreshold -> "DEGRADED"
                     else -> monitor.currentState
                 }
                 connection.prepareStatement(
@@ -233,11 +240,13 @@ class MonitorScheduler {
                 if (!monitor.deleted && nextState == "UP" && monitor.currentState != "UP") {
                     resolveIncident(connection, task)
                 }
-                if (!monitor.deleted && nextState == "DOWN" && failure) {
+                if (!monitor.deleted && ((nextState == "DOWN" && failure) || (nextState == "DEGRADED" && degraded))) {
+                    val incidentCategory = if (task.type == "METRIC_THRESHOLD") "PERFORMANCE" else "AVAILABILITY"
                     val activeIncident = connection.prepareStatement(
-                        "SELECT id FROM incident WHERE monitor_id = ? AND category = 'AVAILABILITY' AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
+                        "SELECT id FROM incident WHERE monitor_id = ? AND category = ? AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
                     ).use { statement ->
                         statement.setObject(1, task.id)
+                        statement.setString(2, incidentCategory)
                         statement.executeQuery().use { rows -> if (rows.next()) rows.getObject("id", UUID::class.java) else null }
                     }
                     if (activeIncident != null && !(task.type == "TLS" && result.errorCode == "TLS_EXPIRING")) {
@@ -246,7 +255,10 @@ class MonitorScheduler {
                             statement.executeUpdate()
                         }
                     } else if (activeIncident == null && !(task.type == "TLS" && result.errorCode == "TLS_EXPIRING") && !maintenanceActive && failures >= monitor.failureThreshold) {
-                        openIncident(connection, task, result)
+                        val severity = if (task.type == "METRIC_THRESHOLD") {
+                            objectMapper.readTree(task.config).path("severity").asText("WARNING")
+                        } else "WARNING"
+                        openIncident(connection, task, result, incidentCategory, severity)
                     }
                 }
 
@@ -492,25 +504,45 @@ class MonitorScheduler {
         else -> "WARNING"
     }
 
-    private fun openIncident(connection: Connection, task: CheckTask, result: CheckResponse) {
+    private fun openIncident(
+        connection: Connection,
+        task: CheckTask,
+        result: CheckResponse,
+        category: String,
+        severity: String,
+    ) {
         val incidentId = UUID.randomUUID()
+        val performanceIncident = category == "PERFORMANCE"
+        val title = if (performanceIncident) {
+            "${task.resourceName} · ${task.monitorName} 指标超过阈值"
+        } else {
+            "${task.resourceName} · ${task.monitorName} 检查失败"
+        }
+        val message = if (performanceIncident) {
+            result.summary ?: "${task.resourceName} 的 ${task.monitorName} 指标达到阈值。"
+        } else {
+            "${task.resourceName} 的 ${task.monitorName} 检查达到失败阈值。"
+        }
         connection.prepareStatement(
-            "INSERT INTO incident(id, deduplication_key, monitor_id, resource_id, category, severity, status, title) VALUES (?, ?, ?, ?, 'AVAILABILITY', 'WARNING', 'OPEN', ?)",
+            "INSERT INTO incident(id, deduplication_key, monitor_id, resource_id, category, severity, status, title) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)",
         ).use { statement ->
             statement.setObject(1, incidentId)
             statement.setString(2, "${task.id}:$incidentId")
             statement.setObject(3, task.id)
             statement.setObject(4, task.resourceId)
-            statement.setString(5, "${task.resourceName} · ${task.monitorName} 检查失败")
+            statement.setString(5, category)
+            statement.setString(6, severity)
+            statement.setString(7, title)
             statement.executeUpdate()
         }
         val eventId = UUID.randomUUID()
         connection.prepareStatement(
-            "INSERT INTO incident_event(id, incident_id, event_type, details) VALUES (?, ?, 'OPENED', CAST(? AS jsonb))",
+            "INSERT INTO incident_event(id, incident_id, event_type, note, details) VALUES (?, ?, 'OPENED', ?, CAST(? AS jsonb))",
         ).use { statement ->
             statement.setObject(1, eventId)
             statement.setObject(2, incidentId)
-            statement.setString(3, objectMapper.writeValueAsString(mapOf("errorCode" to result.errorCode, "statusCode" to result.statusCode)))
+            statement.setString(3, result.summary.takeIf { performanceIncident })
+            statement.setString(4, objectMapper.writeValueAsString(mapOf("category" to category, "errorCode" to result.errorCode, "statusCode" to result.statusCode)))
             statement.executeUpdate()
         }
         notificationOutbox.enqueueIncident(
@@ -522,12 +554,13 @@ class MonitorScheduler {
                 "eventId" to eventId.toString(),
                 "eventType" to "incident.opened",
                 "incidentId" to incidentId.toString(),
-                "title" to "${task.resourceName} · ${task.monitorName} 检查失败",
-                "message" to "${task.resourceName} 的 ${task.monitorName} 检查达到失败阈值。",
+                "category" to category,
+                "title" to title,
+                "message" to message,
                 "resourceName" to task.resourceName,
                 "monitorName" to task.monitorName,
-                "severity" to "WARNING",
-                "status" to "DOWN",
+                "severity" to severity,
+                "status" to if (performanceIncident) "DEGRADED" else "DOWN",
                 "occurredAt" to result.checkedAt,
                 "errorCode" to result.errorCode,
                 "statusCode" to result.statusCode,
@@ -536,10 +569,12 @@ class MonitorScheduler {
     }
 
     private fun resolveIncident(connection: Connection, task: CheckTask) {
+        val category = if (task.type == "METRIC_THRESHOLD") "PERFORMANCE" else "AVAILABILITY"
         val active = connection.prepareStatement(
-            "SELECT id FROM incident WHERE monitor_id = ? AND category = 'AVAILABILITY' AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
+            "SELECT id FROM incident WHERE monitor_id = ? AND category = ? AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
         ).use { statement ->
             statement.setObject(1, task.id)
+            statement.setString(2, category)
             statement.executeQuery().use { rows -> if (rows.next()) rows.getObject("id", UUID::class.java) else null }
         } ?: return
         connection.prepareStatement("UPDATE incident SET status = 'RESOLVED', resolved_at = now() WHERE id = ?").use { statement ->
@@ -574,12 +609,12 @@ class MonitorScheduler {
 
     private fun updateResourceHealth(connection: Connection, resourceId: UUID) {
         val aggregate = connection.prepareStatement(
-            "SELECT count(*) AS total, bool_or(current_state = 'DOWN') AS has_down, bool_or(current_state = 'UNKNOWN') AS has_unknown, bool_or(current_state = 'PENDING') AS has_pending FROM monitor WHERE resource_id = ? AND critical AND enabled AND deleted_at IS NULL",
+            "SELECT count(*) AS total, bool_or(current_state = 'DOWN') AS has_down, bool_or(current_state = 'UNKNOWN') AS has_unknown, bool_or(current_state = 'PENDING') AS has_pending, bool_or(current_state = 'DEGRADED') AS has_degraded FROM monitor WHERE resource_id = ? AND critical AND enabled AND deleted_at IS NULL",
         ).use { statement ->
             statement.setObject(1, resourceId)
             statement.executeQuery().use { rows ->
                 rows.next()
-                ResourceAggregate(rows.getInt("total"), rows.getBoolean("has_down"), rows.getBoolean("has_unknown"), rows.getBoolean("has_pending"))
+                ResourceAggregate(rows.getInt("total"), rows.getBoolean("has_down"), rows.getBoolean("has_unknown"), rows.getBoolean("has_pending"), rows.getBoolean("has_degraded"))
             }
         }
         val status = when {
@@ -587,6 +622,7 @@ class MonitorScheduler {
             aggregate.hasDown -> "DOWN"
             aggregate.hasUnknown -> "UNKNOWN"
             aggregate.hasPending -> "PENDING"
+            aggregate.hasDegraded -> "DEGRADED"
             else -> "UP"
         }
         connection.prepareStatement("UPDATE monitored_resource SET health_status = ?, updated_at = now() WHERE id = ?").use { statement ->
@@ -627,7 +663,13 @@ class MonitorScheduler {
         val incidentStatus: String,
     )
 
-    private data class ResourceAggregate(val total: Int, val hasDown: Boolean, val hasUnknown: Boolean, val hasPending: Boolean)
+    private data class ResourceAggregate(
+        val total: Int,
+        val hasDown: Boolean,
+        val hasUnknown: Boolean,
+        val hasPending: Boolean,
+        val hasDegraded: Boolean,
+    )
 
     companion object {
         private const val MAX_CLAIM_PER_TICK = 20

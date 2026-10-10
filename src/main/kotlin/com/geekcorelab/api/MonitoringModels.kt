@@ -22,6 +22,12 @@ data class MonitorRequest(
     val enabled: Boolean? = true,
     val reminderIntervalMinutes: Int? = null,
     val heartbeatGraceSeconds: Int? = null,
+    val metricName: String? = null,
+    val metricOperator: String? = null,
+    val metricThreshold: Double? = null,
+    val metricRecoveryValue: Double? = null,
+    val metricWindowSeconds: Int? = null,
+    val metricSeverity: String? = null,
     val version: Int? = null,
 )
 
@@ -54,6 +60,12 @@ data class MonitorResponse(
     val nextRunAt: String,
     val heartbeatGraceSeconds: Int? = null,
     val heartbeatToken: String? = null,
+    val metricName: String? = null,
+    val metricOperator: String? = null,
+    val metricThreshold: Double? = null,
+    val metricRecoveryValue: Double? = null,
+    val metricWindowSeconds: Int? = null,
+    val metricSeverity: String? = null,
 )
 
 data class CheckResponse(

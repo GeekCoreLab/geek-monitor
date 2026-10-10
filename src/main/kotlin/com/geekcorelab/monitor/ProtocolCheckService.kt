@@ -2,6 +2,7 @@ package com.geekcorelab.monitor
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.geekcorelab.api.CheckResponse
+import com.geekcorelab.api.MetricCatalog
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import java.net.ConnectException
@@ -9,6 +10,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.sql.Timestamp
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
@@ -63,6 +65,7 @@ class ProtocolCheckService {
             config.path("expectedIntervalSeconds").asInt(),
             config.path("graceSeconds").asInt(60),
         )
+        "METRIC_THRESHOLD" -> metricThreshold(config)
         else -> CheckResponse("UNKNOWN", null, "UNSUPPORTED_CHECK", "不支持此监控类型", 0, Instant.now().toString())
     }
 
@@ -114,6 +117,115 @@ class ProtocolCheckService {
         }
     }
 
+    private fun metricThreshold(config: JsonNode): CheckResponse {
+        val started = System.nanoTime()
+        val checkedAt = Instant.now()
+        fun result(status: String, code: String?, summary: String?) =
+            CheckResponse(status, null, code, summary, elapsed(started), checkedAt.toString())
+
+        val monitorId = runCatching { UUID.fromString(config.path("monitorId").asText()) }.getOrNull()
+            ?: return result("UNKNOWN", "CHECK_CONFIG_INVALID", "指标阈值规则编号无效")
+        val resourceId = runCatching { UUID.fromString(config.path("resourceId").asText()) }.getOrNull()
+            ?: return result("UNKNOWN", "CHECK_CONFIG_INVALID", "指标阈值资源编号无效")
+        val metricName = config.path("metricName").asText()
+        val operator = config.path("operator").asText()
+        val threshold = config.path("threshold").takeIf(JsonNode::isNumber)?.asDouble()
+        val recoveryValue = config.path("recoveryValue").takeIf(JsonNode::isNumber)?.asDouble()
+        val windowSeconds = config.path("windowSeconds").asInt()
+        val sampleIntervalSeconds = config.path("sampleIntervalSeconds").asInt()
+        if (metricName !in METRIC_NAMES || operator !in METRIC_OPERATORS || threshold == null || recoveryValue == null ||
+            !threshold.isFinite() || !recoveryValue.isFinite() || windowSeconds !in MIN_METRIC_WINDOW_SECONDS..MAX_METRIC_WINDOW_SECONDS ||
+            sampleIntervalSeconds !in 10..3600 || windowSeconds < sampleIntervalSeconds * 4) {
+            return result("UNKNOWN", "CHECK_CONFIG_INVALID", "指标阈值规则配置无效")
+        }
+
+        return try {
+            dataSource.connection.use { connection ->
+                val currentState = connection.prepareStatement(
+                    "SELECT current_state FROM monitor WHERE id = ? AND resource_id = ? AND type = 'METRIC_THRESHOLD' AND deleted_at IS NULL",
+                ).use { statement ->
+                    statement.setObject(1, monitorId)
+                    statement.setObject(2, resourceId)
+                    statement.executeQuery().use { rows -> if (rows.next()) rows.getString("current_state") else null }
+                } ?: return result("UNKNOWN", "CHECK_CONFIG_INVALID", "指标阈值规则已删除或资源不匹配")
+                val windowStart = checkedAt.minusSeconds(windowSeconds.toLong())
+                val series = connection.prepareStatement(
+                    """WITH points AS (
+                           SELECT labels, sampled_at, avg(value) AS value
+                           FROM metric_sample
+                           WHERE resource_id = ? AND metric_name = ? AND trusted
+                             AND sampled_at >= ? AND sampled_at <= ?
+                           GROUP BY labels, sampled_at
+                       ), ordered AS (
+                           SELECT labels, sampled_at, value,
+                                  EXTRACT(EPOCH FROM sampled_at - lag(sampled_at) OVER (PARTITION BY labels ORDER BY sampled_at)) AS gap_seconds
+                           FROM points
+                       )
+                       SELECT labels::text AS labels, count(*) AS sample_count, min(value) AS minimum, max(value) AS maximum,
+                              min(sampled_at) AS first_sample_at, max(sampled_at) AS last_sample_at,
+                              COALESCE(max(gap_seconds), 0) AS maximum_gap_seconds
+                       FROM ordered GROUP BY labels ORDER BY labels::text""",
+                ).use { statement ->
+                    statement.setObject(1, resourceId)
+                    statement.setString(2, metricName)
+                    statement.setTimestamp(3, Timestamp.from(windowStart))
+                    statement.setTimestamp(4, Timestamp.from(checkedAt))
+                    statement.executeQuery().use { rows ->
+                        buildList {
+                            while (rows.next()) add(
+                                MetricSeries(
+                                    sampleCount = rows.getLong("sample_count"),
+                                    minimum = rows.getDouble("minimum"),
+                                    maximum = rows.getDouble("maximum"),
+                                    firstAt = rows.getTimestamp("first_sample_at").toInstant(),
+                                    lastAt = rows.getTimestamp("last_sample_at").toInstant(),
+                                    maximumGapSeconds = rows.getDouble("maximum_gap_seconds"),
+                                ),
+                            )
+                        }
+                    }
+                }
+                val expectedCount = kotlin.math.ceil(windowSeconds.toDouble() / sampleIntervalSeconds).toLong()
+                val minimumCount = kotlin.math.ceil(expectedCount * MIN_SAMPLE_COVERAGE).toLong()
+                if (series.isEmpty() || series.any { sampleSeries ->
+                        val startGap = Duration.between(windowStart, sampleSeries.firstAt).seconds.coerceAtLeast(0)
+                        val endGap = Duration.between(sampleSeries.lastAt, checkedAt).seconds.coerceAtLeast(0)
+                        sampleSeries.sampleCount < minimumCount ||
+                            startGap > sampleIntervalSeconds * 2L || endGap > sampleIntervalSeconds * 2L ||
+                            sampleSeries.maximumGapSeconds > sampleIntervalSeconds * 2.0
+                    }) {
+                    return result("UNKNOWN", "METRIC_DATA_INSUFFICIENT", "指标样本覆盖不足或窗口内存在过大空洞，无法评估阈值")
+                }
+
+                val breached = series.any { sampleSeries -> when (operator) {
+                    "GT" -> sampleSeries.minimum > threshold
+                    "GTE" -> sampleSeries.minimum >= threshold
+                    "LT" -> sampleSeries.maximum < threshold
+                    else -> sampleSeries.maximum <= threshold
+                } }
+                val recovered = series.all { sampleSeries -> when (operator) {
+                    "GT", "GTE" -> sampleSeries.maximum <= recoveryValue
+                    "LT", "LTE" -> sampleSeries.minimum >= recoveryValue
+                    else -> false
+                } }
+                val degrading = breached || (currentState == "DEGRADED" && !recovered)
+                val observed = if (operator in setOf("GT", "GTE")) series.maxOf { it.maximum } else series.minOf { it.minimum }
+                val seriesCount = series.size
+                if (degrading) {
+                    result(
+                        "DEGRADED",
+                        if (breached) "METRIC_THRESHOLD_EXCEEDED" else "METRIC_RECOVERY_PENDING",
+                        "指标 $metricName 的 $windowSeconds 秒窗口值为 $observed，触发阈值为 $operator $threshold，恢复阈值为 $recoveryValue（$seriesCount 个序列）",
+                    )
+                } else {
+                    result("UP", null, "指标 $metricName 的 $windowSeconds 秒窗口值为 $observed，未达到触发条件（$seriesCount 个序列）")
+                }
+            }
+        } catch (_: Exception) {
+            result("UNKNOWN", "METRIC_STATE_UNAVAILABLE", "无法读取足够的可信指标样本")
+        }
+    }
+
     private fun elapsed(started: Long) = Duration.ofNanos(System.nanoTime() - started).toMillis()
 
     private data class HeartbeatState(
@@ -122,6 +234,23 @@ class ProtocolCheckService {
         val lastStatus: String?,
         val lastSummary: String?,
     )
+
+    private data class MetricSeries(
+        val sampleCount: Long,
+        val minimum: Double,
+        val maximum: Double,
+        val firstAt: Instant,
+        val lastAt: Instant,
+        val maximumGapSeconds: Double,
+    )
+
+    companion object {
+        private val METRIC_NAMES = MetricCatalog.hostMetricNames
+        private val METRIC_OPERATORS = setOf("GT", "GTE", "LT", "LTE")
+        private const val MIN_METRIC_WINDOW_SECONDS = 120
+        private const val MAX_METRIC_WINDOW_SECONDS = 86400
+        private const val MIN_SAMPLE_COVERAGE = 0.8
+    }
 }
 
 @ApplicationScoped

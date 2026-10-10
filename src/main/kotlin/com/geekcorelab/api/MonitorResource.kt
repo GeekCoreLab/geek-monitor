@@ -79,6 +79,9 @@ class MonitorResource {
         if ((definition.type == "HEARTBEAT") != (resourceType == "HEARTBEAT")) {
             return error(Response.Status.BAD_REQUEST, "HEARTBEAT_RESOURCE_REQUIRED", "心跳任务必须使用心跳类型资源，其他检查不能绑定到该资源")
         }
+        if (definition.type == "METRIC_THRESHOLD" && resourceType != "HOST") {
+            return error(Response.Status.BAD_REQUEST, "HOST_RESOURCE_REQUIRED", "主机指标阈值规则必须绑定到 HOST 资源")
+        }
         val id = UUID.randomUUID()
         val heartbeatToken = if (definition.type == "HEARTBEAT") credentials.newToken() else null
         dataSource.connection.use { connection ->
@@ -149,8 +152,11 @@ class MonitorResource {
         val requestedResource = request.resourceId?.let { runCatching { UUID.fromString(it) }.getOrNull() } ?: UUID.fromString(current.resourceId)
         if (!authenticator.canAccessResource(user.id, requestedResource)) return error(Response.Status.FORBIDDEN, "RESOURCE_FORBIDDEN", "你没有该资源的访问权限")
         val requestedResourceType = resourceType(requestedResource)
-        if ((current.type == "HEARTBEAT") != (requestedResourceType == "HEARTBEAT")) {
+        if ((requestedType == "HEARTBEAT") != (requestedResourceType == "HEARTBEAT")) {
             return error(Response.Status.BAD_REQUEST, "HEARTBEAT_RESOURCE_REQUIRED", "心跳任务必须保留在心跳类型资源上")
+        }
+        if (requestedType == "METRIC_THRESHOLD" && requestedResourceType != "HOST") {
+            return error(Response.Status.BAD_REQUEST, "HOST_RESOURCE_REQUIRED", "主机指标阈值规则必须绑定到 HOST 资源")
         }
         val definition = validate(
             request.copy(
@@ -252,17 +258,39 @@ class MonitorResource {
         val host = request.targetHost?.trim().orEmpty()
         val method = request.method?.trim()?.uppercase() ?: "GET"
         val interval = request.intervalSeconds ?: if (type == "TLS") 21600 else 60
-        val timeout = request.timeoutSeconds ?: when (type) { "DNS" -> 5; "HEARTBEAT" -> 1; else -> 10 }
+        val timeout = request.timeoutSeconds ?: when (type) { "DNS" -> 5; "HEARTBEAT", "METRIC_THRESHOLD" -> 1; else -> 10 }
         val heartbeatGraceSeconds = request.heartbeatGraceSeconds ?: DEFAULT_HEARTBEAT_GRACE_SECONDS
+        val metricName = request.metricName?.trim().orEmpty()
+        val metricOperator = request.metricOperator?.trim()?.uppercase() ?: "GT"
+        val metricThreshold = request.metricThreshold
+        val metricRecoveryValue = request.metricRecoveryValue
+        val metricWindowSeconds = request.metricWindowSeconds ?: DEFAULT_METRIC_WINDOW_SECONDS
+        val metricSeverity = request.metricSeverity?.trim()?.uppercase() ?: "WARNING"
         val reminderInterval = request.reminderIntervalMinutes ?: 30
         val failures = request.failureThreshold ?: 3
         val recoveries = request.recoveryThreshold ?: 2
         val expectedCodes = (request.expectedStatusCodes ?: (200..299).toList()).distinct().sorted()
         val contains = request.textContains?.takeIf(String::isNotBlank)
-        if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS", "HEARTBEAT") ||
+        if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS", "HEARTBEAT", "METRIC_THRESHOLD") ||
             interval !in 10..86400 || timeout !in 1..30 || interval <= timeout || failures !in 1..20 || recoveries !in 1..20 ||
             reminderInterval !in 0..1440 || heartbeatGraceSeconds !in 0..86400) {
             return null
+        }
+        if (type == "METRIC_THRESHOLD") {
+            val trigger = metricThreshold ?: return null
+            val recovery = metricRecoveryValue ?: return null
+            val recoveryDirectionValid = when (metricOperator) {
+                "GT", "GTE" -> recovery < trigger
+                "LT", "LTE" -> recovery > trigger
+                else -> false
+            }
+            if (metricName !in MetricCatalog.hostMetricNames || metricOperator !in METRIC_OPERATORS ||
+                !trigger.isFinite() || trigger < 0 || trigger > MAX_METRIC_VALUE ||
+                !recovery.isFinite() || recovery < 0 || recovery > MAX_METRIC_VALUE || !recoveryDirectionValid ||
+                metricWindowSeconds !in MIN_METRIC_WINDOW_SECONDS..MAX_METRIC_WINDOW_SECONDS ||
+                metricWindowSeconds < METRIC_SAMPLE_INTERVAL_SECONDS * 4 || metricSeverity !in METRIC_SEVERITIES) {
+                return null
+            }
         }
         val config: Map<String, Any?> = when (type) {
             "HTTP" -> {
@@ -299,6 +327,15 @@ class MonitorResource {
                 mapOf("host" to host, "port" to port, "minimumValidityDays" to minimumValidityDays)
             }
             "HEARTBEAT" -> mapOf("graceSeconds" to heartbeatGraceSeconds)
+            "METRIC_THRESHOLD" -> mapOf(
+                "metricName" to metricName,
+                "operator" to metricOperator,
+                "threshold" to metricThreshold,
+                "recoveryValue" to metricRecoveryValue,
+                "windowSeconds" to metricWindowSeconds,
+                "sampleIntervalSeconds" to METRIC_SAMPLE_INTERVAL_SECONDS,
+                "severity" to metricSeverity,
+            )
             else -> return null
         }
         return ValidatedDefinition(
@@ -334,6 +371,17 @@ class MonitorResource {
         "DNS" -> mapOf("host" to targetHost, "recordType" to recordType, "resolver" to resolver, "expectedValue" to expectedRecordValue)
         "TLS" -> mapOf("host" to targetHost, "port" to port, "minimumValidityDays" to minimumValidityDays)
         "HEARTBEAT" -> mapOf("monitorId" to id, "expectedIntervalSeconds" to intervalSeconds, "graceSeconds" to heartbeatGraceSeconds)
+        "METRIC_THRESHOLD" -> mapOf(
+            "monitorId" to id,
+            "resourceId" to resourceId,
+            "metricName" to metricName,
+            "operator" to metricOperator,
+            "threshold" to metricThreshold,
+            "recoveryValue" to metricRecoveryValue,
+            "windowSeconds" to metricWindowSeconds,
+            "sampleIntervalSeconds" to METRIC_SAMPLE_INTERVAL_SECONDS,
+            "severity" to metricSeverity,
+        )
         else -> emptyMap()
     }
 
@@ -379,6 +427,12 @@ class MonitorResource {
             lastResultAt = getTimestamp("last_result_at")?.toInstant()?.toString(),
             nextRunAt = getTimestamp("next_run_at").toInstant().toString(),
             heartbeatGraceSeconds = config.path("graceSeconds").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
+            metricName = config.path("metricName").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            metricOperator = config.path("operator").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            metricThreshold = config.path("threshold").takeUnless { it.isMissingNode || it.isNull }?.asDouble(),
+            metricRecoveryValue = config.path("recoveryValue").takeUnless { it.isMissingNode || it.isNull }?.asDouble(),
+            metricWindowSeconds = config.path("windowSeconds").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
+            metricSeverity = config.path("severity").takeUnless { it.isMissingNode || it.isNull }?.asText(),
         )
     }
 
@@ -411,6 +465,13 @@ class MonitorResource {
     companion object {
         private const val TEST_COOLDOWN_NANOS = 5_000_000_000L
         private const val DEFAULT_HEARTBEAT_GRACE_SECONDS = 60
+        private const val DEFAULT_METRIC_WINDOW_SECONDS = 300
+        private const val MIN_METRIC_WINDOW_SECONDS = 120
+        private const val MAX_METRIC_WINDOW_SECONDS = 86400
+        private const val METRIC_SAMPLE_INTERVAL_SECONDS = 30
+        private const val MAX_METRIC_VALUE = 1_000_000_000_000_000.0
+        private val METRIC_OPERATORS = setOf("GT", "GTE", "LT", "LTE")
+        private val METRIC_SEVERITIES = setOf("WARNING", "HIGH", "CRITICAL")
         private val lastManualTestNanos = ConcurrentHashMap<UUID, java.util.concurrent.atomic.AtomicLong>()
         private val DNS_RECORD_TYPES = setOf("A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "PTR")
 
