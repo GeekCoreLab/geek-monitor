@@ -780,7 +780,7 @@ class _UnavailablePage extends StatelessWidget {
   );
 }
 
-enum _Section { overview, resources, projects }
+enum _Section { overview, resources, monitors, incidents, projects }
 
 class _DashboardShell extends StatefulWidget {
   const _DashboardShell({
@@ -801,6 +801,8 @@ class _DashboardShellState extends State<_DashboardShell> {
   _Section _section = _Section.overview;
   List<Map<String, dynamic>> _projects = [];
   List<Map<String, dynamic>> _resources = [];
+  List<Map<String, dynamic>> _monitors = [];
+  List<Map<String, dynamic>> _incidents = [];
   bool _loading = true;
   String? _loadError;
 
@@ -819,10 +821,14 @@ class _DashboardShellState extends State<_DashboardShell> {
       final values = await Future.wait([
         widget.api.projects(),
         widget.api.resources(),
+        widget.api.monitors(),
+        widget.api.incidents(),
       ]);
       setState(() {
         _projects = values[0];
         _resources = values[1];
+        _monitors = values[2];
+        _incidents = values[3];
       });
     } catch (error) {
       setState(
@@ -874,6 +880,105 @@ class _DashboardShellState extends State<_DashboardShell> {
       );
       await _reload();
       if (mounted) _notice('资源已添加');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _editMonitor([Map<String, dynamic>? current]) async {
+    if (_resources.isEmpty) {
+      _notice('请先添加一个监控资源', isError: true);
+      return;
+    }
+    final draft = await showDialog<_MonitorDraft>(
+      context: context,
+      builder: (_) => _MonitorDialog(resources: _resources, existing: current),
+    );
+    if (draft == null) return;
+    try {
+      if (current == null) {
+        await widget.api.createMonitor(draft.toJson());
+      } else {
+        await widget.api.updateMonitor(current['id'] as String, {
+          ...draft.toJson(),
+          'version': current['version'],
+        });
+      }
+      await _reload();
+      if (mounted) _notice(current == null ? '监控项已创建' : '监控项已更新');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _deleteMonitor(Map<String, dynamic> monitor) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('删除监控项？'),
+        content: Text('“${monitor['name']}”将停止调度，历史记录会保留。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.api.deleteMonitor(monitor['id'] as String);
+      await _reload();
+      if (mounted) _notice('监控项已删除');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _testMonitor(Map<String, dynamic> monitor) async {
+    try {
+      final result = await widget.api.testMonitor(monitor['id'] as String);
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        builder: (context) => _CheckResultDialog(
+          title: monitor['name'] as String? ?? 'HTTP 检查',
+          result: result,
+        ),
+      );
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _acknowledgeIncident(Map<String, dynamic> incident) async {
+    final note = await showDialog<String>(
+      context: context,
+      builder: (_) => const _IncidentNoteDialog(),
+    );
+    if (note == null) return;
+    try {
+      await widget.api.acknowledgeIncident(incident['id'] as String, note);
+      await _reload();
+      if (mounted) _notice('故障已确认');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _showIncidentEvents(Map<String, dynamic> incident) async {
+    try {
+      final events = await widget.api.incidentEvents(incident['id'] as String);
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        builder: (_) =>
+            _IncidentEventsDialog(incident: incident, events: events),
+      );
     } catch (error) {
       if (mounted) _notice(error.toString(), isError: true);
     }
@@ -940,35 +1045,7 @@ class _DashboardShellState extends State<_DashboardShell> {
                     onRefresh: _reload,
                     onLogout: widget.onLogout,
                   ),
-                  Expanded(
-                    child: _loading && _projects.isEmpty
-                        ? const Center(child: CircularProgressIndicator())
-                        : _loadError != null && _projects.isEmpty
-                        ? _WorkspaceError(
-                            message: _loadError!,
-                            onRetry: _reload,
-                          )
-                        : _section == _Section.overview
-                        ? _OverviewPage(
-                            projects: _projects,
-                            resources: _resources,
-                            onNavigate: (value) =>
-                                setState(() => _section = value),
-                            onCreateResource: _createResource,
-                          )
-                        : _section == _Section.resources
-                        ? _ResourcesPage(
-                            resources: _resources,
-                            projects: _projects,
-                            loading: _loading,
-                            onCreate: _createResource,
-                            onDelete: _deleteResource,
-                          )
-                        : _ProjectsPage(
-                            projects: _projects,
-                            onCreate: _createProject,
-                          ),
-                  ),
+                  Expanded(child: _content()),
                   if (!wide)
                     _BottomNavigation(
                       section: _section,
@@ -982,6 +1059,66 @@ class _DashboardShellState extends State<_DashboardShell> {
       );
     },
   );
+
+  Widget _content() {
+    if (_loading && _projects.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_loadError != null && _projects.isEmpty) {
+      return _WorkspaceError(message: _loadError!, onRetry: _reload);
+    }
+    return switch (_section) {
+      _Section.overview => _OverviewPage(
+        projects: _projects,
+        resources: _resources,
+        monitors: _monitors,
+        incidents: _incidents,
+        onNavigate: (value) => setState(() => _section = value),
+        onCreateResource: _createResource,
+        onCreateMonitor: () => _editMonitor(),
+      ),
+      _Section.resources => _ResourcesPage(
+        resources: _resources,
+        projects: _projects,
+        loading: _loading,
+        onCreate: _createResource,
+        onDelete: _deleteResource,
+      ),
+      _Section.monitors => _MonitorsPage(
+        monitors: _monitors,
+        resources: _resources,
+        loading: _loading,
+        onCreate: () => _editMonitor(),
+        onEdit: _editMonitor,
+        onDelete: _deleteMonitor,
+        onTest: _testMonitor,
+        onHistory: _showMonitorHistory,
+      ),
+      _Section.incidents => _IncidentsPage(
+        incidents: _incidents,
+        loading: _loading,
+        onAcknowledge: _acknowledgeIncident,
+        onEvents: _showIncidentEvents,
+      ),
+      _Section.projects => _ProjectsPage(
+        projects: _projects,
+        onCreate: _createProject,
+      ),
+    };
+  }
+
+  Future<void> _showMonitorHistory(Map<String, dynamic> monitor) async {
+    try {
+      final results = await widget.api.checkResults(monitor['id'] as String);
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        builder: (_) => _CheckHistoryDialog(monitor: monitor, results: results),
+      );
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
 }
 
 class _SideNavigation extends StatelessWidget {
@@ -1032,6 +1169,18 @@ class _SideNavigation extends StatelessWidget {
           label: '监控资源',
           selected: section == _Section.resources,
           onTap: () => onSelect(_Section.resources),
+        ),
+        _NavItem(
+          icon: Icons.monitor_heart_outlined,
+          label: '监控配置',
+          selected: section == _Section.monitors,
+          onTap: () => onSelect(_Section.monitors),
+        ),
+        _NavItem(
+          icon: Icons.warning_amber_rounded,
+          label: '故障中心',
+          selected: section == _Section.incidents,
+          onTap: () => onSelect(_Section.incidents),
         ),
         _NavItem(
           icon: Icons.folder_outlined,
@@ -1230,6 +1379,14 @@ class _BottomNavigation extends StatelessWidget {
         label: '总览',
       ),
       NavigationDestination(icon: Icon(Icons.dns_outlined), label: '资源'),
+      NavigationDestination(
+        icon: Icon(Icons.monitor_heart_outlined),
+        label: '检查',
+      ),
+      NavigationDestination(
+        icon: Icon(Icons.warning_amber_rounded),
+        label: '故障',
+      ),
       NavigationDestination(icon: Icon(Icons.folder_outlined), label: '项目'),
     ],
   );
@@ -1239,14 +1396,20 @@ class _OverviewPage extends StatelessWidget {
   const _OverviewPage({
     required this.projects,
     required this.resources,
+    required this.monitors,
+    required this.incidents,
     required this.onNavigate,
     required this.onCreateResource,
+    required this.onCreateMonitor,
   });
 
   final List<Map<String, dynamic>> projects;
   final List<Map<String, dynamic>> resources;
+  final List<Map<String, dynamic>> monitors;
+  final List<Map<String, dynamic>> incidents;
   final ValueChanged<_Section> onNavigate;
   final VoidCallback onCreateResource;
+  final VoidCallback onCreateMonitor;
 
   @override
   Widget build(BuildContext context) {
@@ -1256,6 +1419,9 @@ class _OverviewPage extends StatelessWidget {
       statuses[status] = (statuses[status] ?? 0) + 1;
     }
     final problems = (statuses['DOWN'] ?? 0) + (statuses['DEGRADED'] ?? 0);
+    final activeIncidents = incidents
+        .where((incident) => incident['status'] != 'RESOLVED')
+        .length;
     return _PageScroll(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1269,6 +1435,12 @@ class _OverviewPage extends StatelessWidget {
                 onPressed: () => onNavigate(_Section.projects),
                 icon: const Icon(Icons.folder_open_outlined, size: 18),
                 label: const Text('管理项目'),
+              ),
+              const SizedBox(width: 9),
+              OutlinedButton.icon(
+                onPressed: onCreateMonitor,
+                icon: const Icon(Icons.monitor_heart_outlined, size: 18),
+                label: const Text('配置检查'),
               ),
               const SizedBox(width: 9),
               FilledButton.icon(
@@ -1303,6 +1475,28 @@ class _OverviewPage extends StatelessWidget {
                   SizedBox(
                     width: width,
                     child: _MetricCard(
+                      label: '主动检查',
+                      value: '${monitors.length}',
+                      detail: 'HTTP 检查配置数',
+                      icon: Icons.monitor_heart_outlined,
+                      color: _blue,
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _MetricCard(
+                      label: '活跃故障',
+                      value: '$activeIncidents',
+                      detail: '等待处理或已确认',
+                      icon: Icons.warning_amber_rounded,
+                      color: activeIncidents > 0
+                          ? const Color(0xFFC8743E)
+                          : const Color(0xFF2C8B66),
+                    ),
+                  ),
+                  SizedBox(
+                    width: width,
+                    child: _MetricCard(
                       label: '运行正常',
                       value: '${statuses['UP'] ?? 0}',
                       detail: '最近一次状态为健康',
@@ -1316,19 +1510,8 @@ class _OverviewPage extends StatelessWidget {
                       label: '异常资源',
                       value: '$problems',
                       detail: '需要关注的服务',
-                      icon: Icons.warning_amber_rounded,
-                      color: problems > 0 ? const Color(0xFFC8743E) : _muted,
-                    ),
-                  ),
-                  SizedBox(
-                    width: width,
-                    child: _MetricCard(
-                      label: '等待数据',
-                      value:
-                          '${statuses['PENDING'] ?? resources.length - (statuses['UP'] ?? 0) - (statuses['DOWN'] ?? 0) - (statuses['DEGRADED'] ?? 0)}',
-                      detail: '添加检查后开始采集',
-                      icon: Icons.schedule_outlined,
-                      color: const Color(0xFF7C6CAC),
+                      icon: Icons.error_outline_rounded,
+                      color: problems > 0 ? const Color(0xFFB44438) : _muted,
                     ),
                   ),
                 ],
@@ -1374,6 +1557,11 @@ class _OverviewPage extends StatelessWidget {
                 ],
               );
             },
+          ),
+          const SizedBox(height: 18),
+          _IncidentPreview(
+            incidents: incidents,
+            onOpen: () => onNavigate(_Section.incidents),
           ),
           const SizedBox(height: 20),
           const _GettingStartedCard(),
@@ -2004,6 +2192,1204 @@ class _ProjectsPage extends StatelessWidget {
   );
 }
 
+class _MonitorsPage extends StatelessWidget {
+  const _MonitorsPage({
+    required this.monitors,
+    required this.resources,
+    required this.loading,
+    required this.onCreate,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onTest,
+    required this.onHistory,
+  });
+
+  final List<Map<String, dynamic>> monitors;
+  final List<Map<String, dynamic>> resources;
+  final bool loading;
+  final VoidCallback onCreate;
+  final ValueChanged<Map<String, dynamic>> onEdit;
+  final ValueChanged<Map<String, dynamic>> onDelete;
+  final ValueChanged<Map<String, dynamic>> onTest;
+  final ValueChanged<Map<String, dynamic>> onHistory;
+
+  @override
+  Widget build(BuildContext context) => _PageScroll(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _PageHeading(
+          eyebrow: 'MONITOR CONFIGURATION',
+          title: '监控配置',
+          subtitle: '配置 HTTP/HTTPS 检查、连续失败阈值和恢复条件。',
+          actions: [
+            FilledButton.icon(
+              onPressed: onCreate,
+              icon: const Icon(Icons.add_rounded),
+              label: const Text('添加 HTTP 检查'),
+            ),
+          ],
+        ),
+        if (loading && monitors.isEmpty)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.all(40),
+              child: CircularProgressIndicator(),
+            ),
+          )
+        else if (monitors.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(34),
+              child: _EmptyState(
+                icon: Icons.monitor_heart_outlined,
+                title: '还没有检查项',
+                subtitle: '为网站资源添加 HTTP/HTTPS 检查，即可开始周期探测。',
+              ),
+            ),
+          )
+        else
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final columns = constraints.maxWidth > 1100 ? 2 : 1;
+              final width =
+                  (constraints.maxWidth - (columns - 1) * 14) / columns;
+              return Wrap(
+                spacing: 14,
+                runSpacing: 14,
+                children: monitors.map((monitor) {
+                  final status = monitor['state'] as String? ?? 'PENDING';
+                  final target = monitor['targetUrl'] as String? ?? '';
+                  final resourceName = monitor['resourceName'] as String? ?? '';
+                  return SizedBox(
+                    width: width,
+                    child: Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(18),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  width: 38,
+                                  height: 38,
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFEAF0FA),
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: const Icon(
+                                    Icons.language_rounded,
+                                    color: _blue,
+                                    size: 20,
+                                  ),
+                                ),
+                                const SizedBox(width: 11),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        monitor['name'] as String? ?? 'HTTP 检查',
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w700,
+                                          fontSize: 14,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        '$resourceName  ·  ${monitor['method']}  ·  每 ${monitor['intervalSeconds']} 秒',
+                                        style: const TextStyle(
+                                          color: _muted,
+                                          fontSize: 10,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                _StatusTag(status: status),
+                              ],
+                            ),
+                            const SizedBox(height: 16),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 11,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFF6F8FA),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text(
+                                target,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Color(0xFF3E5268),
+                                  fontSize: 11,
+                                  fontFamily: 'monospace',
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 7,
+                              children: [
+                                _InfoPill(
+                                  icon: Icons.error_outline_rounded,
+                                  text:
+                                      '连续 ${monitor['failureThreshold']} 次失败触发',
+                                ),
+                                _InfoPill(
+                                  icon: Icons.restart_alt_rounded,
+                                  text: '${monitor['recoveryThreshold']} 次成功恢复',
+                                ),
+                                _InfoPill(
+                                  icon: Icons.schedule_outlined,
+                                  text: '超时 ${monitor['timeoutSeconds']} 秒',
+                                ),
+                                if (monitor['critical'] == true)
+                                  const _InfoPill(
+                                    icon: Icons.priority_high_rounded,
+                                    text: '关键检查',
+                                  ),
+                              ],
+                            ),
+                            const SizedBox(height: 13),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    '最近结果：${_dateTime(monitor['lastResultAt'] as String?)}',
+                                    style: const TextStyle(
+                                      color: _muted,
+                                      fontSize: 10,
+                                    ),
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: '立即试运行',
+                                  onPressed: () => onTest(monitor),
+                                  icon: const Icon(
+                                    Icons.play_circle_outline_rounded,
+                                    color: _blue,
+                                    size: 19,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: '查看历史',
+                                  onPressed: () => onHistory(monitor),
+                                  icon: const Icon(
+                                    Icons.history_rounded,
+                                    color: _muted,
+                                    size: 19,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: '编辑',
+                                  onPressed: () => onEdit(monitor),
+                                  icon: const Icon(
+                                    Icons.edit_outlined,
+                                    color: _muted,
+                                    size: 18,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: '删除',
+                                  onPressed: () => onDelete(monitor),
+                                  icon: const Icon(
+                                    Icons.delete_outline_rounded,
+                                    color: _muted,
+                                    size: 18,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              );
+            },
+          ),
+      ],
+    ),
+  );
+}
+
+class _InfoPill extends StatelessWidget {
+  const _InfoPill({required this.icon, required this.text});
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+    decoration: BoxDecoration(
+      color: const Color(0xFFF3F5F8),
+      borderRadius: BorderRadius.circular(20),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 13, color: _muted),
+        const SizedBox(width: 5),
+        Text(text, style: const TextStyle(color: _muted, fontSize: 10)),
+      ],
+    ),
+  );
+}
+
+class _MonitorDraft {
+  const _MonitorDraft({
+    required this.resourceId,
+    required this.name,
+    required this.targetUrl,
+    required this.method,
+    required this.intervalSeconds,
+    required this.timeoutSeconds,
+    required this.failureThreshold,
+    required this.recoveryThreshold,
+    required this.expectedStatusCodes,
+    required this.textContains,
+    required this.critical,
+    required this.enabled,
+  });
+
+  final String resourceId;
+  final String name;
+  final String targetUrl;
+  final String method;
+  final int intervalSeconds;
+  final int timeoutSeconds;
+  final int failureThreshold;
+  final int recoveryThreshold;
+  final List<int> expectedStatusCodes;
+  final String? textContains;
+  final bool critical;
+  final bool enabled;
+
+  Map<String, dynamic> toJson() => {
+    'resourceId': resourceId,
+    'name': name,
+    'type': 'HTTP',
+    'targetUrl': targetUrl,
+    'method': method,
+    'intervalSeconds': intervalSeconds,
+    'timeoutSeconds': timeoutSeconds,
+    'failureThreshold': failureThreshold,
+    'recoveryThreshold': recoveryThreshold,
+    'expectedStatusCodes': expectedStatusCodes,
+    'textContains': textContains,
+    'critical': critical,
+    'enabled': enabled,
+  };
+}
+
+class _MonitorDialog extends StatefulWidget {
+  const _MonitorDialog({required this.resources, this.existing});
+  final List<Map<String, dynamic>> resources;
+  final Map<String, dynamic>? existing;
+
+  @override
+  State<_MonitorDialog> createState() => _MonitorDialogState();
+}
+
+class _MonitorDialogState extends State<_MonitorDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late String _resourceId =
+      widget.existing?['resourceId'] as String? ??
+      widget.resources.first['id'] as String;
+  late String _method = widget.existing?['method'] as String? ?? 'GET';
+  late final _name = TextEditingController(
+    text: widget.existing?['name'] as String? ?? '',
+  );
+  late final _target = TextEditingController(
+    text: widget.existing?['targetUrl'] as String? ?? '',
+  );
+  late final _interval = TextEditingController(
+    text: '${widget.existing?['intervalSeconds'] ?? 60}',
+  );
+  late final _timeout = TextEditingController(
+    text: '${widget.existing?['timeoutSeconds'] ?? 10}',
+  );
+  late final _failure = TextEditingController(
+    text: '${widget.existing?['failureThreshold'] ?? 3}',
+  );
+  late final _recovery = TextEditingController(
+    text: '${widget.existing?['recoveryThreshold'] ?? 2}',
+  );
+  late final _statuses = TextEditingController(
+    text: _statusText(widget.existing?['expectedStatusCodes'] as List?),
+  );
+  late final _contains = TextEditingController(
+    text: widget.existing?['textContains'] as String? ?? '',
+  );
+  late bool _critical = widget.existing?['critical'] as bool? ?? true;
+  late bool _enabled = widget.existing?['enabled'] as bool? ?? true;
+
+  String _statusText(List? codes) {
+    if (codes == null || codes.isEmpty) return '200-299';
+    final values = codes.cast<int>().toList()..sort();
+    if (values.length == 100 && values.first == 200 && values.last == 299) {
+      return '200-299';
+    }
+    return values.join(', ');
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _target.dispose();
+    _interval.dispose();
+    _timeout.dispose();
+    _failure.dispose();
+    _recovery.dispose();
+    _statuses.dispose();
+    _contains.dispose();
+    super.dispose();
+  }
+
+  List<int>? _parseStatuses() {
+    final parsed = <int>{};
+    for (final part in _statuses.text.split(',')) {
+      final segment = part.trim();
+      if (segment.isEmpty) continue;
+      if (segment.contains('-')) {
+        final range = segment.split('-');
+        if (range.length != 2) return null;
+        final start = int.tryParse(range[0].trim());
+        final end = int.tryParse(range[1].trim());
+        if (start == null ||
+            end == null ||
+            start > end ||
+            start < 100 ||
+            end > 599 ||
+            end - start > 99) {
+          return null;
+        }
+        parsed.addAll(
+          Iterable<int>.generate(end - start + 1, (index) => start + index),
+        );
+      } else {
+        final code = int.tryParse(segment);
+        if (code == null || code < 100 || code > 599) return null;
+        parsed.add(code);
+      }
+    }
+    return parsed.isEmpty ? null : (parsed.toList()..sort());
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.existing == null ? '配置 HTTP 检查' : '编辑 HTTP 检查'),
+    content: SizedBox(
+      width: 560,
+      child: Form(
+        key: _formKey,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              DropdownButtonFormField<String>(
+                initialValue: _resourceId,
+                decoration: const InputDecoration(labelText: '监控资源'),
+                items: widget.resources
+                    .map(
+                      (resource) => DropdownMenuItem(
+                        value: resource['id'] as String,
+                        child: Text(
+                          '${resource['name']} · ${_resourceTypeName(resource['type'] as String? ?? '')}',
+                        ),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (value) => setState(() => _resourceId = value!),
+              ),
+              const SizedBox(height: 11),
+              TextFormField(
+                controller: _name,
+                autofocus: true,
+                maxLength: 160,
+                decoration: const InputDecoration(
+                  labelText: '检查名称',
+                  hintText: '例如：官网首页',
+                ),
+                validator: (value) =>
+                    value == null || value.trim().isEmpty ? '请输入检查名称' : null,
+              ),
+              const SizedBox(height: 11),
+              TextFormField(
+                controller: _target,
+                keyboardType: TextInputType.url,
+                decoration: const InputDecoration(
+                  labelText: 'HTTP/HTTPS 地址',
+                  hintText: 'https://example.com/health',
+                ),
+                validator: (value) {
+                  final uri = Uri.tryParse(value?.trim() ?? '');
+                  return uri == null ||
+                          !uri.hasAuthority ||
+                          !{'http', 'https'}.contains(uri.scheme) ||
+                          uri.userInfo.isNotEmpty
+                      ? '请输入有效的 HTTP 或 HTTPS 地址'
+                      : null;
+                },
+              ),
+              const SizedBox(height: 11),
+              Row(
+                children: [
+                  Expanded(
+                    child: DropdownButtonFormField<String>(
+                      initialValue: _method,
+                      decoration: const InputDecoration(labelText: '请求方法'),
+                      items: const [
+                        DropdownMenuItem(value: 'GET', child: Text('GET')),
+                        DropdownMenuItem(value: 'HEAD', child: Text('HEAD')),
+                      ],
+                      onChanged: (value) => setState(() => _method = value!),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextFormField(
+                      controller: _statuses,
+                      decoration: const InputDecoration(
+                        labelText: '成功状态码',
+                        hintText: '200-299',
+                      ),
+                      validator: (_) => _parseStatuses() == null
+                          ? '使用逗号或范围填写，如 200-204, 301'
+                          : null,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 11),
+              TextFormField(
+                controller: _contains,
+                maxLength: 500,
+                decoration: const InputDecoration(
+                  labelText: '响应内容必须包含（可选）',
+                  hintText: '例：service is healthy',
+                ),
+              ),
+              const SizedBox(height: 11),
+              Row(
+                children: [
+                  Expanded(
+                    child: _IntField(
+                      controller: _interval,
+                      label: '检查间隔（秒）',
+                      minimum: 10,
+                      maximum: 86400,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _IntField(
+                      controller: _timeout,
+                      label: '超时（秒）',
+                      minimum: 1,
+                      maximum: 30,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 11),
+              Row(
+                children: [
+                  Expanded(
+                    child: _IntField(
+                      controller: _failure,
+                      label: '连续失败次数',
+                      minimum: 1,
+                      maximum: 20,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _IntField(
+                      controller: _recovery,
+                      label: '连续成功恢复',
+                      minimum: 1,
+                      maximum: 20,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: _critical,
+                onChanged: (value) => setState(() => _critical = value),
+                title: const Text('关键检查', style: TextStyle(fontSize: 13)),
+                subtitle: const Text(
+                  '参与资源整体健康状态计算',
+                  style: TextStyle(fontSize: 11),
+                ),
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: _enabled,
+                onChanged: (value) => setState(() => _enabled = value),
+                title: const Text('立即启用', style: TextStyle(fontSize: 13)),
+              ),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '检查间隔必须大于超时时间；未设置自定义断言时，默认接受 200–299。',
+                  style: TextStyle(color: _muted, fontSize: 10, height: 1.4),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(
+        onPressed: _submit,
+        child: Text(widget.existing == null ? '创建检查' : '保存'),
+      ),
+    ],
+  );
+
+  void _submit() {
+    if (!_formKey.currentState!.validate()) return;
+    final interval = int.parse(_interval.text);
+    final timeout = int.parse(_timeout.text);
+    if (interval <= timeout) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('检查间隔必须大于单次超时时间')));
+      return;
+    }
+    Navigator.pop(
+      context,
+      _MonitorDraft(
+        resourceId: _resourceId,
+        name: _name.text.trim(),
+        targetUrl: _target.text.trim(),
+        method: _method,
+        intervalSeconds: interval,
+        timeoutSeconds: timeout,
+        failureThreshold: int.parse(_failure.text),
+        recoveryThreshold: int.parse(_recovery.text),
+        expectedStatusCodes: _parseStatuses()!,
+        textContains: _contains.text.trim().isEmpty
+            ? null
+            : _contains.text.trim(),
+        critical: _critical,
+        enabled: _enabled,
+      ),
+    );
+  }
+}
+
+class _IntField extends StatelessWidget {
+  const _IntField({
+    required this.controller,
+    required this.label,
+    required this.minimum,
+    required this.maximum,
+  });
+  final TextEditingController controller;
+  final String label;
+  final int minimum;
+  final int maximum;
+
+  @override
+  Widget build(BuildContext context) => TextFormField(
+    controller: controller,
+    keyboardType: TextInputType.number,
+    decoration: InputDecoration(labelText: label),
+    validator: (value) {
+      final number = int.tryParse(value ?? '');
+      return number == null || number < minimum || number > maximum
+          ? '$minimum–$maximum 之间的整数'
+          : null;
+    },
+  );
+}
+
+class _CheckResultDialog extends StatelessWidget {
+  const _CheckResultDialog({required this.title, required this.result});
+  final String title;
+  final Map<String, dynamic> result;
+
+  @override
+  Widget build(BuildContext context) {
+    final success = result['status'] == 'UP';
+    final color = success ? const Color(0xFF2C8B66) : const Color(0xFFB44438);
+    return AlertDialog(
+      title: Text(title),
+      content: SizedBox(
+        width: 430,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  success ? Icons.check_circle_outline : Icons.error_outline,
+                  color: color,
+                ),
+                const SizedBox(width: 9),
+                Text(
+                  success ? '检查通过' : '检查失败',
+                  style: TextStyle(color: color, fontWeight: FontWeight.w700),
+                ),
+              ],
+            ),
+            const SizedBox(height: 18),
+            _DialogInfoRow('响应时间', '${result['durationMs']} ms'),
+            if (result['statusCode'] != null)
+              _DialogInfoRow('HTTP 状态码', '${result['statusCode']}'),
+            if (result['errorCode'] != null)
+              _DialogInfoRow('错误类别', '${result['errorCode']}'),
+            if (result['summary'] != null)
+              _DialogInfoRow('说明', '${result['summary']}'),
+            _DialogInfoRow('检查时间', _dateTime(result['checkedAt'] as String?)),
+          ],
+        ),
+      ),
+      actions: [
+        FilledButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('完成'),
+        ),
+      ],
+    );
+  }
+}
+
+class _CheckHistoryDialog extends StatelessWidget {
+  const _CheckHistoryDialog({required this.monitor, required this.results});
+  final Map<String, dynamic> monitor;
+  final List<Map<String, dynamic>> results;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text('${monitor['name']} · 检查历史'),
+    content: SizedBox(
+      width: 620,
+      height: 440,
+      child: results.isEmpty
+          ? const _EmptyState(
+              icon: Icons.history_rounded,
+              title: '还没有检查结果',
+              subtitle: '首次运行后，最近执行记录会显示在这里。',
+            )
+          : ListView.separated(
+              itemCount: results.length,
+              separatorBuilder: (_, _) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final result = results[index];
+                final success = result['status'] == 'UP';
+                final color = success
+                    ? const Color(0xFF2C8B66)
+                    : result['status'] == 'RUNNING'
+                    ? const Color(0xFF7C6CAC)
+                    : const Color(0xFFB44438);
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 9),
+                  child: Row(
+                    children: [
+                      Icon(
+                        success
+                            ? Icons.check_circle_outline
+                            : Icons.error_outline,
+                        color: color,
+                        size: 17,
+                      ),
+                      const SizedBox(width: 9),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '${result['status']}  ·  ${_dateTime(result['scheduledAt'] as String?)}',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              (result['summary'] as String?) ?? '检查完成',
+                              style: const TextStyle(
+                                color: _muted,
+                                fontSize: 10,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Text(
+                        '${result['durationMs'] ?? '—'} ms',
+                        style: const TextStyle(color: _muted, fontSize: 10),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('关闭'),
+      ),
+    ],
+  );
+}
+
+class _DialogInfoRow extends StatelessWidget {
+  const _DialogInfoRow(this.label, this.value);
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 6),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 95,
+          child: Text(
+            label,
+            style: const TextStyle(color: _muted, fontSize: 12),
+          ),
+        ),
+        Expanded(
+          child: Text(value, style: const TextStyle(fontSize: 12, height: 1.4)),
+        ),
+      ],
+    ),
+  );
+}
+
+class _IncidentsPage extends StatefulWidget {
+  const _IncidentsPage({
+    required this.incidents,
+    required this.loading,
+    required this.onAcknowledge,
+    required this.onEvents,
+  });
+  final List<Map<String, dynamic>> incidents;
+  final bool loading;
+  final ValueChanged<Map<String, dynamic>> onAcknowledge;
+  final ValueChanged<Map<String, dynamic>> onEvents;
+
+  @override
+  State<_IncidentsPage> createState() => _IncidentsPageState();
+}
+
+class _IncidentsPageState extends State<_IncidentsPage> {
+  String _filter = 'ACTIVE';
+
+  @override
+  Widget build(BuildContext context) {
+    final visible = widget.incidents.where((incident) {
+      if (_filter == 'ACTIVE') return incident['status'] != 'RESOLVED';
+      if (_filter == 'RESOLVED') return incident['status'] == 'RESOLVED';
+      return true;
+    }).toList();
+    final children = <Widget>[
+      _PageHeading(
+        eyebrow: 'INCIDENT CENTER',
+        title: '故障中心',
+        subtitle: '查看故障原因、确认处理并追踪恢复过程。',
+      ),
+      Wrap(
+        spacing: 8,
+        children: [
+          _IncidentFilter(
+            label: '活跃',
+            selected: _filter == 'ACTIVE',
+            onTap: () => setState(() => _filter = 'ACTIVE'),
+          ),
+          _IncidentFilter(
+            label: '全部',
+            selected: _filter == 'ALL',
+            onTap: () => setState(() => _filter = 'ALL'),
+          ),
+          _IncidentFilter(
+            label: '已恢复',
+            selected: _filter == 'RESOLVED',
+            onTap: () => setState(() => _filter = 'RESOLVED'),
+          ),
+        ],
+      ),
+      const SizedBox(height: 16),
+    ];
+    if (widget.loading && widget.incidents.isEmpty) {
+      children.add(
+        const Center(
+          child: Padding(
+            padding: EdgeInsets.all(40),
+            child: CircularProgressIndicator(),
+          ),
+        ),
+      );
+    } else if (visible.isEmpty) {
+      children.add(
+        const Card(
+          child: Padding(
+            padding: EdgeInsets.all(36),
+            child: _EmptyState(
+              icon: Icons.check_circle_outline,
+              title: '没有符合条件的故障',
+              subtitle: '检查项达到失败阈值后，故障会显示在这里。',
+            ),
+          ),
+        ),
+      );
+    } else {
+      for (final incident in visible) {
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          incident['status'] == 'RESOLVED'
+                              ? Icons.check_circle_outline
+                              : Icons.warning_amber_rounded,
+                          color: incident['status'] == 'RESOLVED'
+                              ? const Color(0xFF2C8B66)
+                              : const Color(0xFFB44438),
+                          size: 20,
+                        ),
+                        const SizedBox(width: 9),
+                        Expanded(
+                          child: Text(
+                            incident['title'] as String? ?? '监控检查异常',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        _IncidentStatus(
+                          status: incident['status'] as String? ?? 'OPEN',
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 11),
+                    Text(
+                      '${incident['resourceName'] ?? '资源'}  ·  开始于 ${_dateTime(incident['openedAt'] as String?)}  ·  ${incident['occurrenceCount']} 次失败',
+                      style: const TextStyle(color: _muted, fontSize: 11),
+                    ),
+                    if (incident['acknowledgedBy'] != null) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        '由 ${incident['acknowledgedBy']} 于 ${_dateTime(incident['acknowledgedAt'] as String?)} 确认',
+                        style: const TextStyle(color: _muted, fontSize: 10),
+                      ),
+                    ],
+                    if (incident['acknowledgementNote'] != null &&
+                        (incident['acknowledgementNote'] as String)
+                            .isNotEmpty) ...[
+                      const SizedBox(height: 7),
+                      Text(
+                        '处理备注：${incident['acknowledgementNote']}',
+                        style: const TextStyle(color: _ink, fontSize: 11),
+                      ),
+                    ],
+                    const Divider(height: 22),
+                    Row(
+                      children: [
+                        TextButton.icon(
+                          onPressed: () => widget.onEvents(incident),
+                          icon: const Icon(Icons.subject_rounded, size: 17),
+                          label: const Text('事件记录'),
+                        ),
+                        const Spacer(),
+                        if (incident['status'] == 'OPEN')
+                          FilledButton.icon(
+                            onPressed: () => widget.onAcknowledge(incident),
+                            icon: const Icon(Icons.done_rounded, size: 17),
+                            label: const Text('确认处理'),
+                          ),
+                        if (incident['status'] == 'RESOLVED')
+                          Text(
+                            '恢复于 ${_dateTime(incident['resolvedAt'] as String?)}',
+                            style: const TextStyle(
+                              color: Color(0xFF2C8B66),
+                              fontSize: 10,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+    return _PageScroll(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: children,
+      ),
+    );
+  }
+}
+
+class _IncidentFilter extends StatelessWidget {
+  const _IncidentFilter({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => FilterChip(
+    label: Text(label),
+    selected: selected,
+    onSelected: (_) => onTap(),
+    showCheckmark: false,
+  );
+}
+
+class _IncidentStatus extends StatelessWidget {
+  const _IncidentStatus({required this.status});
+  final String status;
+
+  @override
+  Widget build(BuildContext context) {
+    final (label, color) = switch (status) {
+      'ACKNOWLEDGED' => ('处理中', const Color(0xFF315CA8)),
+      'RESOLVED' => ('已恢复', const Color(0xFF2C8B66)),
+      _ => ('待确认', const Color(0xFFB44438)),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color,
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
+class _IncidentPreview extends StatelessWidget {
+  const _IncidentPreview({required this.incidents, required this.onOpen});
+  final List<Map<String, dynamic>> incidents;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final active = incidents
+        .where((incident) => incident['status'] != 'RESOLVED')
+        .take(3)
+        .toList();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 15, 18, 11),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    '活跃故障',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+                  ),
+                ),
+                TextButton(onPressed: onOpen, child: const Text('打开故障中心')),
+              ],
+            ),
+            const Divider(height: 15),
+            if (active.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 16),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.check_circle_outline,
+                      color: Color(0xFF2C8B66),
+                      size: 18,
+                    ),
+                    SizedBox(width: 9),
+                    Text(
+                      '当前没有活跃故障',
+                      style: TextStyle(color: _muted, fontSize: 11),
+                    ),
+                  ],
+                ),
+              )
+            else
+              ...active.map(
+                (incident) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.warning_amber_rounded,
+                        color: Color(0xFFB44438),
+                        size: 17,
+                      ),
+                      const SizedBox(width: 9),
+                      Expanded(
+                        child: Text(
+                          incident['title'] as String? ?? '监控检查异常',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      Text(
+                        '${incident['status'] == 'ACKNOWLEDGED' ? '处理中' : '待确认'}  ·  ${_dateTime(incident['openedAt'] as String?)}',
+                        style: const TextStyle(color: _muted, fontSize: 10),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _IncidentNoteDialog extends StatefulWidget {
+  const _IncidentNoteDialog();
+  @override
+  State<_IncidentNoteDialog> createState() => _IncidentNoteDialogState();
+}
+
+class _IncidentNoteDialogState extends State<_IncidentNoteDialog> {
+  final _note = TextEditingController();
+  @override
+  void dispose() {
+    _note.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('确认处理故障'),
+    content: SizedBox(
+      width: 420,
+      child: TextField(
+        controller: _note,
+        maxLength: 2000,
+        maxLines: 4,
+        decoration: const InputDecoration(
+          labelText: '处理备注（可选）',
+          hintText: '记录排查进展或负责人',
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(
+        onPressed: () => Navigator.pop(context, _note.text.trim()),
+        child: const Text('确认'),
+      ),
+    ],
+  );
+}
+
+class _IncidentEventsDialog extends StatelessWidget {
+  const _IncidentEventsDialog({required this.incident, required this.events});
+  final Map<String, dynamic> incident;
+  final List<Map<String, dynamic>> events;
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text('${incident['resourceName']} · 事件记录'),
+    content: SizedBox(
+      width: 480,
+      height: 380,
+      child: events.isEmpty
+          ? const _EmptyState(
+              icon: Icons.subject_rounded,
+              title: '暂无记录',
+              subtitle: '',
+            )
+          : ListView.separated(
+              itemCount: events.length,
+              separatorBuilder: (_, _) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final event = events[index];
+                return ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.circle, size: 8, color: _blue),
+                  title: Text(
+                    _eventName(event['eventType'] as String? ?? ''),
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  subtitle: Text(
+                    [
+                      if (event['actorEmail'] != null) event['actorEmail'],
+                      if (event['note'] != null &&
+                          (event['note'] as String).isNotEmpty)
+                        event['note'],
+                      _dateTime(event['createdAt'] as String?),
+                    ].join(' · '),
+                    style: const TextStyle(fontSize: 10, color: _muted),
+                  ),
+                );
+              },
+            ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('关闭'),
+      ),
+    ],
+  );
+}
+
+String _eventName(String type) => switch (type) {
+  'OPENED' => '故障触发',
+  'ACKNOWLEDGED' => '负责人确认',
+  'RESOLVED' => '监控恢复',
+  _ => type,
+};
+
 class _ProjectDraft {
   const _ProjectDraft(this.name, this.description);
   final String name;
@@ -2474,4 +3860,15 @@ String _shortDate(String? value) {
   final parsed = DateTime.tryParse(value)?.toLocal();
   if (parsed == null) return '';
   return '${parsed.year}-${parsed.month.toString().padLeft(2, '0')}-${parsed.day.toString().padLeft(2, '0')}';
+}
+
+String _dateTime(String? value) {
+  if (value == null) return '尚无记录';
+  final parsed = DateTime.tryParse(value)?.toLocal();
+  if (parsed == null) return '时间未知';
+  final date = _shortDate(parsed.toIso8601String());
+  final hour = parsed.hour.toString().padLeft(2, '0');
+  final minute = parsed.minute.toString().padLeft(2, '0');
+  final second = parsed.second.toString().padLeft(2, '0');
+  return '$date $hour:$minute:$second';
 }

@@ -125,6 +125,72 @@ class ApiClient {
     await _send('DELETE', '/api/v1/resources/${Uri.encodeComponent(id)}');
   }
 
+  Future<List<Map<String, dynamic>>> monitors({String? resourceId}) async {
+    final query = resourceId == null
+        ? ''
+        : '?resourceId=${Uri.encodeQueryComponent(resourceId)}';
+    return _asMapList(await _send('GET', '/api/v1/monitors$query'));
+  }
+
+  Future<Map<String, dynamic>> createMonitor(
+    Map<String, dynamic> definition,
+  ) async =>
+      (await _send('POST', '/api/v1/monitors', body: definition))
+          as Map<String, dynamic>;
+
+  Future<Map<String, dynamic>> updateMonitor(
+    String id,
+    Map<String, dynamic> definition,
+  ) async =>
+      (await _send(
+            'PATCH',
+            '/api/v1/monitors/${Uri.encodeComponent(id)}',
+            body: definition,
+          ))
+          as Map<String, dynamic>;
+
+  Future<void> deleteMonitor(String id) async {
+    await _send('DELETE', '/api/v1/monitors/${Uri.encodeComponent(id)}');
+  }
+
+  Future<Map<String, dynamic>> testMonitor(String id) async =>
+      (await _send('POST', '/api/v1/monitors/${Uri.encodeComponent(id)}/test'))
+          as Map<String, dynamic>;
+
+  Future<List<Map<String, dynamic>>> checkResults(String id) async =>
+      _asMapList(
+        await _send(
+          'GET',
+          '/api/v1/monitors/${Uri.encodeComponent(id)}/results?limit=100',
+        ),
+      );
+
+  Future<List<Map<String, dynamic>>> incidents({String? status}) async {
+    final query = status == null
+        ? ''
+        : '?status=${Uri.encodeQueryComponent(status)}';
+    return _asMapList(await _send('GET', '/api/v1/incidents$query'));
+  }
+
+  Future<Map<String, dynamic>> acknowledgeIncident(
+    String id,
+    String note,
+  ) async =>
+      (await _send(
+            'POST',
+            '/api/v1/incidents/${Uri.encodeComponent(id)}/ack',
+            body: {'note': note},
+          ))
+          as Map<String, dynamic>;
+
+  Future<List<Map<String, dynamic>>> incidentEvents(String id) async =>
+      _asMapList(
+        await _send(
+          'GET',
+          '/api/v1/incidents/${Uri.encodeComponent(id)}/events',
+        ),
+      );
+
   Future<dynamic> _send(
     String method,
     String path, {

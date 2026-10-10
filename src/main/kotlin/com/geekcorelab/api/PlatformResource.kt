@@ -29,6 +29,7 @@ import javax.sql.DataSource
 class PlatformResource {
     @Inject lateinit var dataSource: DataSource
     @Inject lateinit var credentials: CredentialService
+    @Inject lateinit var authenticator: SessionAuthenticator
     @Inject lateinit var objectMapper: ObjectMapper
     @Inject @field:ConfigProperty(name = "geek-monitor.session.days", defaultValue = "30")
     var sessionDays: Int = 30
@@ -144,7 +145,7 @@ class PlatformResource {
     @GET
     @Path("/auth/me")
     fun me(@Context headers: HttpHeaders): Response {
-        val user = authenticatedUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
         return Response.ok(UserResponse(user.id.toString(), user.email, user.role)).build()
     }
 
@@ -211,7 +212,7 @@ class PlatformResource {
     @GET
     @Path("/resources")
     fun listResources(@QueryParam("projectId") projectId: String?, @Context headers: HttpHeaders): Response {
-        val user = authenticatedUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
         val parsedProjectId = projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
         if (projectId != null && parsedProjectId == null) return error(Response.Status.BAD_REQUEST, "INVALID_PROJECT", "项目编号无效")
         val resources = mutableListOf<ResourceResponse>()
@@ -235,7 +236,7 @@ class PlatformResource {
     @POST
     @Path("/resources")
     fun createResource(request: ResourceRequest, @Context headers: HttpHeaders): Response {
-        val user = authenticatedUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
         val projectId = request.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
         val name = request.name?.trim().orEmpty()
         val type = request.type?.trim()?.uppercase().orEmpty()
@@ -246,13 +247,7 @@ class PlatformResource {
         if (name.isBlank() || name.length > 160) return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "资源名称不能为空且不能超过 160 个字符")
         if (type !in RESOURCE_TYPES) return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE_TYPE", "资源类型无效")
         if (environment.length > 80 || (ownerEmail != null && !EMAIL.matches(ownerEmail))) return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "环境或负责人邮箱无效")
-        val authorized = dataSource.connection.use { connection ->
-            connection.prepareStatement("SELECT 1 FROM project_membership WHERE project_id = ? AND user_id = ?").use { statement ->
-                statement.setObject(1, projectId)
-                statement.setObject(2, user.id)
-                statement.executeQuery().use(ResultSet::next)
-            }
-        }
+        val authorized = authenticator.canAccessProject(user.id, projectId)
         if (!authorized) return error(Response.Status.FORBIDDEN, "PROJECT_FORBIDDEN", "你没有该项目的访问权限")
         val id = UUID.randomUUID()
         dataSource.connection.use { connection ->
@@ -276,7 +271,7 @@ class PlatformResource {
     @DELETE
     @Path("/resources/{id}")
     fun deleteResource(@PathParam("id") idText: String, @Context headers: HttpHeaders): Response {
-        val user = authenticatedUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
         val id = runCatching { UUID.fromString(idText) }.getOrNull() ?: return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "资源编号无效")
         val updated = dataSource.connection.use { connection ->
             connection.prepareStatement(
@@ -300,19 +295,7 @@ class PlatformResource {
         }
     }
 
-    private fun authenticatedUser(headers: HttpHeaders): SessionUser? {
-        val token = requestToken(headers) ?: return null
-        return dataSource.connection.use { connection ->
-            connection.prepareStatement(
-                "SELECT u.id, u.email, u.role FROM auth_session s JOIN app_user u ON u.id = s.user_id WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > now() AND u.disabled_at IS NULL",
-            ).use { statement ->
-                statement.setString(1, credentials.tokenHash(token))
-                statement.executeQuery().use { result -> if (result.next()) SessionUser(result.getObject("id", UUID::class.java), result.getString("email"), result.getString("role")) else null }
-            }
-        }
-    }
-
-    private fun requireAdmin(headers: HttpHeaders): SessionUser? = authenticatedUser(headers)?.takeIf { it.role == "ADMIN" }
+    private fun requireAdmin(headers: HttpHeaders): AuthenticatedUser? = authenticator.currentUser(headers)?.takeIf { it.role == "ADMIN" }
 
     private fun bearer(headers: HttpHeaders): String? = headers.getHeaderString(HttpHeaders.AUTHORIZATION)
         ?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }
@@ -352,8 +335,6 @@ class PlatformResource {
     )
 
     private data class LoginUser(val id: UUID, val email: String, val passwordHash: String, val role: String)
-    private data class SessionUser(val id: UUID, val email: String, val role: String)
-
     companion object {
         private val EMAIL = Regex("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")
         private val RESOURCE_TYPES = setOf("HOST", "WEBSITE", "DATABASE", "SERVICE", "HEARTBEAT")
