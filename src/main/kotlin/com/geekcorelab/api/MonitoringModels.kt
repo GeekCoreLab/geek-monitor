@@ -21,6 +21,7 @@ data class MonitorRequest(
     val critical: Boolean? = true,
     val enabled: Boolean? = true,
     val reminderIntervalMinutes: Int? = null,
+    val heartbeatGraceSeconds: Int? = null,
     val version: Int? = null,
 )
 
@@ -51,6 +52,8 @@ data class MonitorResponse(
     val version: Int,
     val lastResultAt: String?,
     val nextRunAt: String,
+    val heartbeatGraceSeconds: Int? = null,
+    val heartbeatToken: String? = null,
 )
 
 data class CheckResponse(

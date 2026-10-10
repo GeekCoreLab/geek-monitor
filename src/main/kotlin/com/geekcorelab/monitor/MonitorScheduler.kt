@@ -1,6 +1,7 @@
 package com.geekcorelab.monitor
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.geekcorelab.api.CheckResponse
 import com.geekcorelab.notification.NotificationOutbox
 import io.quarkus.scheduler.Scheduled
@@ -114,7 +115,12 @@ class MonitorScheduler {
 
     private fun execute(task: CheckTask) {
         val result = try {
-            checker.execute(task.type, objectMapper.readTree(task.config), task.timeoutSeconds)
+            val config = objectMapper.readTree(task.config)
+            if (task.type == "HEARTBEAT" && config is ObjectNode) {
+                config.put("monitorId", task.id.toString())
+                config.put("expectedIntervalSeconds", task.intervalSeconds)
+            }
+            checker.execute(task.type, config, task.timeoutSeconds)
         } catch (_: Exception) {
             CheckResponse("UNKNOWN", null, "CHECKER_ERROR", "检查器发生内部错误", 0, Instant.now().toString())
         }

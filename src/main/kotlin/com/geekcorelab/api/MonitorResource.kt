@@ -2,6 +2,7 @@ package com.geekcorelab.api
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.geekcorelab.monitor.ProtocolCheckService
+import com.geekcorelab.security.CredentialService
 import jakarta.inject.Inject
 import jakarta.ws.rs.Consumes
 import jakarta.ws.rs.DELETE
@@ -30,6 +31,7 @@ class MonitorResource {
     @Inject lateinit var objectMapper: ObjectMapper
     @Inject lateinit var authenticator: SessionAuthenticator
     @Inject lateinit var protocolCheckService: ProtocolCheckService
+    @Inject lateinit var credentials: CredentialService
 
     @GET
     @Path("/monitors")
@@ -73,30 +75,49 @@ class MonitorResource {
             ?: return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "请选择有效的监控资源")
         if (!authenticator.canAccessResource(user.id, resourceId)) return error(Response.Status.FORBIDDEN, "RESOURCE_FORBIDDEN", "你没有该资源的访问权限")
         val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔、阈值和重复提醒")
+        val resourceType = resourceType(resourceId)
+        if ((definition.type == "HEARTBEAT") != (resourceType == "HEARTBEAT")) {
+            return error(Response.Status.BAD_REQUEST, "HEARTBEAT_RESOURCE_REQUIRED", "心跳任务必须使用心跳类型资源，其他检查不能绑定到该资源")
+        }
         val id = UUID.randomUUID()
+        val heartbeatToken = if (definition.type == "HEARTBEAT") credentials.newToken() else null
         dataSource.connection.use { connection ->
-            connection.prepareStatement(
-                """INSERT INTO monitor(id, resource_id, name, type, config, interval_seconds, timeout_seconds,
-                    failure_threshold, recovery_threshold, critical, enabled, reminder_interval_minutes, next_run_at)
-                    VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, ?, now())""",
-            ).use { statement ->
-                statement.setObject(1, id)
-                statement.setObject(2, resourceId)
-                statement.setString(3, definition.name)
-                statement.setString(4, definition.type)
-                statement.setString(5, objectMapper.writeValueAsString(definition.config))
-                statement.setInt(6, definition.intervalSeconds)
-                statement.setInt(7, definition.timeoutSeconds)
-                statement.setInt(8, definition.failureThreshold)
-                statement.setInt(9, definition.recoveryThreshold)
-                statement.setBoolean(10, definition.critical)
-                statement.setBoolean(11, definition.enabled)
-                statement.setInt(12, definition.reminderIntervalMinutes)
-                statement.executeUpdate()
+            connection.autoCommit = false
+            try {
+                connection.prepareStatement(
+                    """INSERT INTO monitor(id, resource_id, name, type, config, interval_seconds, timeout_seconds,
+                        failure_threshold, recovery_threshold, critical, enabled, reminder_interval_minutes, next_run_at)
+                        VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, ?, now())""",
+                ).use { statement ->
+                    statement.setObject(1, id)
+                    statement.setObject(2, resourceId)
+                    statement.setString(3, definition.name)
+                    statement.setString(4, definition.type)
+                    statement.setString(5, objectMapper.writeValueAsString(definition.config))
+                    statement.setInt(6, definition.intervalSeconds)
+                    statement.setInt(7, definition.timeoutSeconds)
+                    statement.setInt(8, definition.failureThreshold)
+                    statement.setInt(9, definition.recoveryThreshold)
+                    statement.setBoolean(10, definition.critical)
+                    statement.setBoolean(11, definition.enabled)
+                    statement.setInt(12, definition.reminderIntervalMinutes)
+                    statement.executeUpdate()
+                }
+                if (heartbeatToken != null) {
+                    connection.prepareStatement("INSERT INTO heartbeat_task(monitor_id, token_hash) VALUES (?, ?)").use { statement ->
+                        statement.setObject(1, id)
+                        statement.setString(2, credentials.tokenHash(heartbeatToken))
+                        statement.executeUpdate()
+                    }
+                }
+                connection.commit()
+            } catch (exception: Exception) {
+                connection.rollback()
+                throw exception
             }
         }
         val created = findMonitor(id, user.id) ?: return error(Response.Status.INTERNAL_SERVER_ERROR, "MONITOR_LOAD_FAILED", "监控项已创建，但无法读取")
-        return Response.status(Response.Status.CREATED).entity(created).build()
+        return Response.status(Response.Status.CREATED).entity(created.copy(heartbeatToken = heartbeatToken)).build()
     }
 
     @GET
@@ -121,9 +142,22 @@ class MonitorResource {
         val current = findMonitor(id, user.id) ?: return error(Response.Status.NOT_FOUND, "MONITOR_NOT_FOUND", "监控项不存在或无权访问")
         if (request.version == null) return error(Response.Status.BAD_REQUEST, "VERSION_REQUIRED", "更新配置时必须提供版本号")
         if (request.version != current.version) return error(Response.Status.CONFLICT, "VERSION_CONFLICT", "监控配置已被其他人更新，请刷新后重试")
+        val requestedType = request.type?.trim()?.uppercase() ?: current.type
+        if ((current.type == "HEARTBEAT" || requestedType == "HEARTBEAT") && requestedType != current.type) {
+            return error(Response.Status.CONFLICT, "HEARTBEAT_TYPE_IMMUTABLE", "心跳任务类型不可转换；请新建任务以重新签发凭据")
+        }
         val requestedResource = request.resourceId?.let { runCatching { UUID.fromString(it) }.getOrNull() } ?: UUID.fromString(current.resourceId)
         if (!authenticator.canAccessResource(user.id, requestedResource)) return error(Response.Status.FORBIDDEN, "RESOURCE_FORBIDDEN", "你没有该资源的访问权限")
-        val definition = validate(request.copy(reminderIntervalMinutes = request.reminderIntervalMinutes ?: current.reminderIntervalMinutes))
+        val requestedResourceType = resourceType(requestedResource)
+        if ((current.type == "HEARTBEAT") != (requestedResourceType == "HEARTBEAT")) {
+            return error(Response.Status.BAD_REQUEST, "HEARTBEAT_RESOURCE_REQUIRED", "心跳任务必须保留在心跳类型资源上")
+        }
+        val definition = validate(
+            request.copy(
+                reminderIntervalMinutes = request.reminderIntervalMinutes ?: current.reminderIntervalMinutes,
+                heartbeatGraceSeconds = request.heartbeatGraceSeconds ?: current.heartbeatGraceSeconds,
+            ),
+        )
             ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔、阈值和重复提醒")
         val updated = dataSource.connection.use { connection ->
             connection.prepareStatement(
@@ -218,15 +252,16 @@ class MonitorResource {
         val host = request.targetHost?.trim().orEmpty()
         val method = request.method?.trim()?.uppercase() ?: "GET"
         val interval = request.intervalSeconds ?: if (type == "TLS") 21600 else 60
-        val timeout = request.timeoutSeconds ?: if (type == "DNS") 5 else 10
+        val timeout = request.timeoutSeconds ?: when (type) { "DNS" -> 5; "HEARTBEAT" -> 1; else -> 10 }
+        val heartbeatGraceSeconds = request.heartbeatGraceSeconds ?: DEFAULT_HEARTBEAT_GRACE_SECONDS
         val reminderInterval = request.reminderIntervalMinutes ?: 30
         val failures = request.failureThreshold ?: 3
         val recoveries = request.recoveryThreshold ?: 2
         val expectedCodes = (request.expectedStatusCodes ?: (200..299).toList()).distinct().sorted()
         val contains = request.textContains?.takeIf(String::isNotBlank)
-        if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS") ||
+        if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS", "HEARTBEAT") ||
             interval !in 10..86400 || timeout !in 1..30 || interval <= timeout || failures !in 1..20 || recoveries !in 1..20 ||
-            reminderInterval !in 0..1440) {
+            reminderInterval !in 0..1440 || heartbeatGraceSeconds !in 0..86400) {
             return null
         }
         val config: Map<String, Any?> = when (type) {
@@ -263,9 +298,13 @@ class MonitorResource {
                 if (!validHost(host) || port !in 1..65535 || minimumValidityDays !in 0..3650) return null
                 mapOf("host" to host, "port" to port, "minimumValidityDays" to minimumValidityDays)
             }
+            "HEARTBEAT" -> mapOf("graceSeconds" to heartbeatGraceSeconds)
             else -> return null
         }
-        return ValidatedDefinition(type, name, config, interval, timeout, failures, recoveries, request.critical != false, request.enabled != false, reminderInterval)
+        return ValidatedDefinition(
+            type, name, config, interval, timeout, failures, recoveries,
+            request.critical != false, request.enabled != false, reminderInterval, heartbeatGraceSeconds,
+        )
     }
 
     private fun findMonitor(id: UUID, userId: UUID): MonitorResponse? = dataSource.connection.use { connection ->
@@ -294,11 +333,19 @@ class MonitorResource {
         "TCP" -> mapOf("host" to targetHost, "port" to port)
         "DNS" -> mapOf("host" to targetHost, "recordType" to recordType, "resolver" to resolver, "expectedValue" to expectedRecordValue)
         "TLS" -> mapOf("host" to targetHost, "port" to port, "minimumValidityDays" to minimumValidityDays)
+        "HEARTBEAT" -> mapOf("monitorId" to id, "expectedIntervalSeconds" to intervalSeconds, "graceSeconds" to heartbeatGraceSeconds)
         else -> emptyMap()
     }
 
     private fun parseMonitorId(value: String) = runCatching { UUID.fromString(value) }.getOrNull()
     private fun error(status: Response.Status, code: String, message: String) = Response.status(status).entity(ErrorResponse(code, message)).build()
+
+    private fun resourceType(resourceId: UUID): String? = dataSource.connection.use { connection ->
+        connection.prepareStatement("SELECT type FROM monitored_resource WHERE id = ? AND deleted_at IS NULL").use { statement ->
+            statement.setObject(1, resourceId)
+            statement.executeQuery().use { rows -> if (rows.next()) rows.getString("type") else null }
+        }
+    }
 
     private fun ResultSet.toMonitor(): MonitorResponse {
         val config = objectMapper.readTree(getString("config"))
@@ -331,6 +378,7 @@ class MonitorResource {
             version = getInt("version"),
             lastResultAt = getTimestamp("last_result_at")?.toInstant()?.toString(),
             nextRunAt = getTimestamp("next_run_at").toInstant().toString(),
+            heartbeatGraceSeconds = config.path("graceSeconds").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
         )
     }
 
@@ -357,10 +405,12 @@ class MonitorResource {
         val critical: Boolean,
         val enabled: Boolean,
         val reminderIntervalMinutes: Int,
+        val heartbeatGraceSeconds: Int,
     )
 
     companion object {
         private const val TEST_COOLDOWN_NANOS = 5_000_000_000L
+        private const val DEFAULT_HEARTBEAT_GRACE_SECONDS = 60
         private val lastManualTestNanos = ConcurrentHashMap<UUID, java.util.concurrent.atomic.AtomicLong>()
         private val DNS_RECORD_TYPES = setOf("A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "PTR")
 

@@ -160,6 +160,13 @@ class ApiClient {
       (await _send('POST', '/api/v1/monitors', body: definition))
           as Map<String, dynamic>;
 
+  Future<Map<String, dynamic>> rotateHeartbeatToken(String id) async =>
+      (await _send(
+            'POST',
+            '/api/v1/heartbeats/${Uri.encodeComponent(id)}/rotate-token',
+          ))
+          as Map<String, dynamic>;
+
   Future<Map<String, dynamic>> updateMonitor(
     String id,
     Map<String, dynamic> definition,

@@ -909,15 +909,116 @@ class _DashboardShellState extends State<_DashboardShell> {
     if (draft == null) return;
     try {
       if (current == null) {
-        await widget.api.createMonitor(draft.toJson());
+        final created = await widget.api.createMonitor(draft.toJson());
+        await _reload();
+        final token = created['heartbeatToken'] as String?;
+        if (draft.type == 'HEARTBEAT' && token != null && mounted) {
+          await _showHeartbeatToken(
+            monitorId: created['id'] as String,
+            token: token,
+          );
+        } else if (mounted) {
+          _notice('监控项已创建');
+        }
       } else {
         await widget.api.updateMonitor(current['id'] as String, {
           ...draft.toJson(),
           'version': current['version'],
         });
+        await _reload();
+        if (mounted) _notice('监控项已更新');
       }
-      await _reload();
-      if (mounted) _notice(current == null ? '监控项已创建' : '监控项已更新');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _showHeartbeatToken({
+    required String monitorId,
+    required String token,
+  }) => showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('保存心跳任务凭据'),
+      content: SizedBox(
+        width: 560,
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('此凭据只显示这一次。请将它保存到任务运行环境的密钥配置中。'),
+              const SizedBox(height: 12),
+              SelectableText(
+                token,
+                style: const TextStyle(fontFamily: 'monospace'),
+              ),
+              const SizedBox(height: 16),
+              const Text('上报示例（将令牌放入 HEARTBEAT_TOKEN 环境变量）：'),
+              const SizedBox(height: 6),
+              SelectableText(
+                'curl -X POST "\$API_URL/api/v1/heartbeats/$monitorId" \\\n'
+                '  -H "Authorization: Bearer \$HEARTBEAT_TOKEN" \\\n'
+                '  -H "Content-Type: application/json" \\\n'
+                '  -d \'{"runId":"<UUID>","runAt":"<UTC ISO-8601>","status":"SUCCESS","summary":"completed"}\'',
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+              ),
+              const SizedBox(height: 10),
+              const Text(
+                '每次真实运行使用新的 UUID；网络重试应沿用同一个 runId。不要在摘要中放入密码或令牌。',
+                style: TextStyle(color: _muted, fontSize: 11, height: 1.4),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext),
+          child: const Text('关闭'),
+        ),
+        FilledButton.icon(
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: token));
+            if (dialogContext.mounted) Navigator.pop(dialogContext);
+            if (mounted) _notice('心跳任务凭据已复制，请安全保存');
+          },
+          icon: const Icon(Icons.copy_rounded),
+          label: const Text('复制凭据并关闭'),
+        ),
+      ],
+    ),
+  );
+
+  Future<void> _rotateHeartbeatToken(Map<String, dynamic> monitor) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('轮换心跳任务凭据？'),
+        content: const Text('当前凭据会立即失效。请同时更新任务运行环境中的密钥。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('轮换'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      final rotated = await widget.api.rotateHeartbeatToken(
+        monitor['id'] as String,
+      );
+      if (mounted) {
+        await _showHeartbeatToken(
+          monitorId: rotated['monitorId'] as String,
+          token: rotated['token'] as String,
+        );
+      }
     } catch (error) {
       if (mounted) _notice(error.toString(), isError: true);
     }
@@ -1225,6 +1326,9 @@ class _DashboardShellState extends State<_DashboardShell> {
         onDelete: _deleteMonitor,
         onTest: _testMonitor,
         onHistory: _showMonitorHistory,
+        onRotateHeartbeatToken: widget.user['role'] == 'ADMIN'
+            ? _rotateHeartbeatToken
+            : null,
       ),
       _Section.incidents => _IncidentsPage(
         incidents: _incidents,
@@ -3932,6 +4036,7 @@ class _MonitorsPage extends StatelessWidget {
     required this.onDelete,
     required this.onTest,
     required this.onHistory,
+    this.onRotateHeartbeatToken,
   });
 
   final List<Map<String, dynamic>> monitors;
@@ -3942,6 +4047,7 @@ class _MonitorsPage extends StatelessWidget {
   final ValueChanged<Map<String, dynamic>> onDelete;
   final ValueChanged<Map<String, dynamic>> onTest;
   final ValueChanged<Map<String, dynamic>> onHistory;
+  final ValueChanged<Map<String, dynamic>>? onRotateHeartbeatToken;
 
   @override
   Widget build(BuildContext context) => _PageScroll(
@@ -3951,7 +4057,7 @@ class _MonitorsPage extends StatelessWidget {
         _PageHeading(
           eyebrow: 'MONITOR CONFIGURATION',
           title: '监控配置',
-          subtitle: '配置 HTTP、TCP、DNS、TLS 检查和故障恢复条件。',
+          subtitle: '配置 HTTP、TCP、DNS、TLS 检查与定时任务心跳。',
           actions: [
             FilledButton.icon(
               onPressed: onCreate,
@@ -3974,7 +4080,7 @@ class _MonitorsPage extends StatelessWidget {
               child: _EmptyState(
                 icon: Icons.monitor_heart_outlined,
                 title: '还没有检查项',
-                subtitle: '为网站、主机或服务添加 HTTP、TCP、DNS、TLS 检查。',
+                subtitle: '为网站、主机、服务或定时任务添加对应检查。',
               ),
             ),
           )
@@ -3995,7 +4101,9 @@ class _MonitorsPage extends StatelessWidget {
                       host.contains(':') && !host.startsWith('[')
                       ? '[$host]'
                       : host;
-                  final target = type == 'HTTP'
+                  final target = type == 'HEARTBEAT'
+                      ? '任务上报 · 宽限 ${monitor['heartbeatGraceSeconds'] ?? 60} 秒'
+                      : type == 'HTTP'
                       ? monitor['targetUrl'] as String? ?? ''
                       : type == 'DNS'
                       ? '$displayHost · ${monitor['recordType']}'
@@ -4088,10 +4196,11 @@ class _MonitorsPage extends StatelessWidget {
                                   icon: Icons.restart_alt_rounded,
                                   text: '${monitor['recoveryThreshold']} 次成功恢复',
                                 ),
-                                _InfoPill(
-                                  icon: Icons.schedule_outlined,
-                                  text: '超时 ${monitor['timeoutSeconds']} 秒',
-                                ),
+                                if (type != 'HEARTBEAT')
+                                  _InfoPill(
+                                    icon: Icons.schedule_outlined,
+                                    text: '超时 ${monitor['timeoutSeconds']} 秒',
+                                  ),
                                 if (monitor['critical'] == true)
                                   const _InfoPill(
                                     icon: Icons.priority_high_rounded,
@@ -4129,6 +4238,18 @@ class _MonitorsPage extends StatelessWidget {
                                     size: 19,
                                   ),
                                 ),
+                                if (type == 'HEARTBEAT' &&
+                                    onRotateHeartbeatToken != null)
+                                  IconButton(
+                                    tooltip: '轮换任务凭据',
+                                    onPressed: () =>
+                                        onRotateHeartbeatToken!(monitor),
+                                    icon: const Icon(
+                                      Icons.key_outlined,
+                                      color: _muted,
+                                      size: 18,
+                                    ),
+                                  ),
                                 IconButton(
                                   tooltip: '编辑',
                                   onPressed: () => onEdit(monitor),
@@ -4200,6 +4321,7 @@ class _MonitorDraft {
     required this.minimumValidityDays,
     required this.intervalSeconds,
     required this.timeoutSeconds,
+    required this.heartbeatGraceSeconds,
     required this.failureThreshold,
     required this.recoveryThreshold,
     required this.reminderIntervalMinutes,
@@ -4221,6 +4343,7 @@ class _MonitorDraft {
   final int? minimumValidityDays;
   final int intervalSeconds;
   final int timeoutSeconds;
+  final int heartbeatGraceSeconds;
   final int failureThreshold;
   final int recoveryThreshold;
   final int reminderIntervalMinutes;
@@ -4235,6 +4358,7 @@ class _MonitorDraft {
     'type': type,
     'intervalSeconds': intervalSeconds,
     'timeoutSeconds': timeoutSeconds,
+    if (type == 'HEARTBEAT') 'heartbeatGraceSeconds': heartbeatGraceSeconds,
     'failureThreshold': failureThreshold,
     'recoveryThreshold': recoveryThreshold,
     'reminderIntervalMinutes': reminderIntervalMinutes,
@@ -4275,7 +4399,11 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   late String _type = widget.existing?['type'] as String? ?? 'HTTP';
   late String _resourceId =
       widget.existing?['resourceId'] as String? ??
-      widget.resources.first['id'] as String;
+      (widget.resources.firstWhere(
+            (resource) => resource['type'] != 'HEARTBEAT',
+            orElse: () => widget.resources.first,
+          )['id']
+          as String);
   late String _method = widget.existing?['method'] as String? ?? 'GET';
   late String _recordType = widget.existing?['recordType'] as String? ?? 'A';
   late final _name = TextEditingController(
@@ -4303,7 +4431,15 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         '${widget.existing?['intervalSeconds'] ?? (_type == 'TLS' ? 21600 : 60)}',
   );
   late final _timeout = TextEditingController(
-    text: '${widget.existing?['timeoutSeconds'] ?? (_type == 'DNS' ? 5 : 10)}',
+    text:
+        '${widget.existing?['timeoutSeconds'] ?? (_type == 'DNS'
+                ? 5
+                : _type == 'HEARTBEAT'
+                ? 1
+                : 10)}',
+  );
+  late final _heartbeatGrace = TextEditingController(
+    text: '${widget.existing?['heartbeatGraceSeconds'] ?? 60}',
   );
   late final _failure = TextEditingController(
     text: '${widget.existing?['failureThreshold'] ?? 3}',
@@ -4342,6 +4478,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     _minimumValidityDays.dispose();
     _interval.dispose();
     _timeout.dispose();
+    _heartbeatGrace.dispose();
     _failure.dispose();
     _recovery.dispose();
     _reminderInterval.dispose();
@@ -4384,8 +4521,16 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     final previousType = _type;
     final previousIntervalDefault = previousType == 'TLS' ? 21600 : 60;
     final nextIntervalDefault = type == 'TLS' ? 21600 : 60;
-    final previousTimeoutDefault = previousType == 'DNS' ? 5 : 10;
-    final nextTimeoutDefault = type == 'DNS' ? 5 : 10;
+    final previousTimeoutDefault = previousType == 'DNS'
+        ? 5
+        : previousType == 'HEARTBEAT'
+        ? 1
+        : 10;
+    final nextTimeoutDefault = type == 'DNS'
+        ? 5
+        : type == 'HEARTBEAT'
+        ? 1
+        : 10;
     final previousPortDefault = previousType == 'TLS' ? 443 : 80;
     final nextPortDefault = type == 'TLS' ? 443 : 80;
     if (_interval.text == '$previousIntervalDefault') {
@@ -4395,7 +4540,18 @@ class _MonitorDialogState extends State<_MonitorDialog> {
       _timeout.text = '$nextTimeoutDefault';
     }
     if (_port.text == '$previousPortDefault') _port.text = '$nextPortDefault';
-    setState(() => _type = type);
+    final compatibleResource = widget.resources.firstWhere(
+      (resource) =>
+          ((resource['type'] as String? ?? '') == 'HEARTBEAT') ==
+          (type == 'HEARTBEAT'),
+      orElse: () => const <String, dynamic>{},
+    );
+    setState(() {
+      _type = type;
+      if (compatibleResource.isNotEmpty) {
+        _resourceId = compatibleResource['id'] as String;
+      }
+    });
   }
 
   @override
@@ -4430,11 +4586,19 @@ class _MonitorDialogState extends State<_MonitorDialog> {
               DropdownButtonFormField<String>(
                 initialValue: _type,
                 decoration: const InputDecoration(labelText: '检查类型'),
-                items: const [
-                  DropdownMenuItem(value: 'HTTP', child: Text('HTTP/HTTPS')),
-                  DropdownMenuItem(value: 'TCP', child: Text('TCP 端口')),
-                  DropdownMenuItem(value: 'DNS', child: Text('DNS 记录')),
-                  DropdownMenuItem(value: 'TLS', child: Text('TLS 证书')),
+                items: [
+                  const DropdownMenuItem(
+                    value: 'HTTP',
+                    child: Text('HTTP/HTTPS'),
+                  ),
+                  const DropdownMenuItem(value: 'TCP', child: Text('TCP 端口')),
+                  const DropdownMenuItem(value: 'DNS', child: Text('DNS 记录')),
+                  const DropdownMenuItem(value: 'TLS', child: Text('TLS 证书')),
+                  if (widget.existing == null || _type == 'HEARTBEAT')
+                    const DropdownMenuItem(
+                      value: 'HEARTBEAT',
+                      child: Text('心跳任务'),
+                    ),
                 ],
                 onChanged: (value) {
                   if (value == null) return;
@@ -4512,7 +4676,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     hintText: '例：service is healthy',
                   ),
                 ),
-              ] else ...[
+              ] else if (_type != 'HEARTBEAT') ...[
                 TextFormField(
                   controller: _target,
                   keyboardType: TextInputType.url,
@@ -4595,6 +4759,27 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                   ),
                 ],
               ],
+              if (_type == 'HEARTBEAT') ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF3F6FB),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Text(
+                    '创建后会签发一次性任务凭据。任务脚本通过心跳 API 上报 SUCCESS 或 FAILURE；超过检查间隔与宽限期仍未上报时会触发故障。',
+                    style: TextStyle(color: _muted, fontSize: 11, height: 1.45),
+                  ),
+                ),
+                const SizedBox(height: 11),
+                _IntField(
+                  controller: _heartbeatGrace,
+                  label: '缺报宽限期（秒）',
+                  minimum: 0,
+                  maximum: 86400,
+                ),
+              ],
               const SizedBox(height: 11),
               Row(
                 children: [
@@ -4673,7 +4858,9 @@ class _MonitorDialogState extends State<_MonitorDialog> {
               Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  _type == 'HTTP'
+                  _type == 'HEARTBEAT'
+                      ? '任务计划间隔与宽限期决定何时判定缺报；具体执行频率由你的任务调度器控制。'
+                      : _type == 'HTTP'
                       ? '检查间隔必须大于超时时间；未设置自定义断言时，默认接受 200–299。'
                       : '检查间隔必须大于超时时间；目标网络访问仍遵循服务端允许网段策略。',
                   style: TextStyle(color: _muted, fontSize: 10, height: 1.4),
@@ -4698,6 +4885,16 @@ class _MonitorDialogState extends State<_MonitorDialog> {
 
   void _submit() {
     if (!_formKey.currentState!.validate()) return;
+    final selectedResource = widget.resources.firstWhere(
+      (resource) => resource['id'] == _resourceId,
+      orElse: () => const <String, dynamic>{},
+    );
+    if ((_type == 'HEARTBEAT') != (selectedResource['type'] == 'HEARTBEAT')) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('心跳任务必须绑定心跳类型资源')));
+      return;
+    }
     final interval = int.parse(_interval.text);
     final timeout = int.parse(_timeout.text);
     if (interval <= timeout) {
@@ -4725,6 +4922,9 @@ class _MonitorDialogState extends State<_MonitorDialog> {
             : null,
         intervalSeconds: interval,
         timeoutSeconds: timeout,
+        heartbeatGraceSeconds: _type == 'HEARTBEAT'
+            ? int.parse(_heartbeatGrace.text)
+            : 60,
         failureThreshold: int.parse(_failure.text),
         recoveryThreshold: int.parse(_recovery.text),
         reminderIntervalMinutes: int.parse(_reminderInterval.text),
@@ -5827,6 +6027,7 @@ IconData _monitorIcon(String type) => switch (type) {
   'TCP' => Icons.cable_rounded,
   'DNS' => Icons.dns_outlined,
   'TLS' => Icons.verified_user_outlined,
+  'HEARTBEAT' => Icons.favorite_border_rounded,
   _ => Icons.language_rounded,
 };
 
@@ -5834,6 +6035,7 @@ String _monitorTypeName(String type) => switch (type) {
   'TCP' => 'TCP',
   'DNS' => 'DNS',
   'TLS' => 'TLS',
+  'HEARTBEAT' => '心跳任务',
   _ => 'HTTP',
 };
 

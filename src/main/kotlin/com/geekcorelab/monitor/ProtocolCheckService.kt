@@ -11,6 +11,8 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.time.Instant
+import java.util.UUID
+import javax.sql.DataSource
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import javax.net.ssl.SNIHostName
@@ -32,6 +34,7 @@ import org.xbill.DNS.Type
 class ProtocolCheckService {
     @Inject lateinit var httpChecker: HttpCheckService
     @Inject lateinit var networkChecker: NetworkCheckService
+    @Inject lateinit var dataSource: DataSource
 
     fun execute(type: String, config: JsonNode, timeoutSeconds: Int): CheckResponse = when (type.uppercase()) {
         "HTTP" -> httpChecker.execute(
@@ -55,8 +58,70 @@ class ProtocolCheckService {
             config.path("minimumValidityDays").asInt(14),
             timeoutSeconds,
         )
+        "HEARTBEAT" -> heartbeat(
+            config.path("monitorId").asText(),
+            config.path("expectedIntervalSeconds").asInt(),
+            config.path("graceSeconds").asInt(60),
+        )
         else -> CheckResponse("UNKNOWN", null, "UNSUPPORTED_CHECK", "不支持此监控类型", 0, Instant.now().toString())
     }
+
+    private fun heartbeat(monitorIdText: String, intervalSeconds: Int, graceSeconds: Int): CheckResponse {
+        val started = System.nanoTime()
+        val checkedAt = Instant.now()
+        val monitorId = runCatching { UUID.fromString(monitorIdText) }.getOrNull()
+            ?: return CheckResponse("UNKNOWN", null, "CHECK_CONFIG_INVALID", "心跳任务配置无效", 0, checkedAt.toString())
+        if (intervalSeconds !in 10..86400 || graceSeconds !in 0..86400) {
+            return CheckResponse("UNKNOWN", null, "CHECK_CONFIG_INVALID", "心跳任务间隔配置无效", 0, checkedAt.toString())
+        }
+        return try {
+            val state = dataSource.connection.use { connection ->
+                connection.prepareStatement(
+                    "SELECT created_at, last_run_at, last_status, last_summary FROM heartbeat_task WHERE monitor_id = ?",
+                ).use { statement ->
+                    statement.setObject(1, monitorId)
+                    statement.executeQuery().use { rows ->
+                        if (!rows.next()) null else HeartbeatState(
+                            createdAt = rows.getTimestamp("created_at").toInstant(),
+                            lastRunAt = rows.getTimestamp("last_run_at")?.toInstant(),
+                            lastStatus = rows.getString("last_status"),
+                            lastSummary = rows.getString("last_summary"),
+                        )
+                    }
+                }
+            } ?: return CheckResponse("UNKNOWN", null, "HEARTBEAT_TASK_MISSING", "心跳任务配置不存在", elapsed(started), checkedAt.toString())
+
+            val latestRunAt = state.lastRunAt
+            if (latestRunAt == null) {
+                val elapsedSinceCreated = Duration.between(state.createdAt, checkedAt).seconds.coerceAtLeast(0)
+                if (elapsedSinceCreated <= intervalSeconds + graceSeconds) {
+                    return CheckResponse("UNKNOWN", null, "HEARTBEAT_WAITING", "等待任务首次上报", elapsed(started), checkedAt.toString())
+                }
+                return CheckResponse("DOWN", null, "HEARTBEAT_MISSED", "任务超过预期间隔与宽限期仍未上报", elapsed(started), checkedAt.toString())
+            }
+            if (state.lastStatus == "FAILURE") {
+                val summary = state.lastSummary?.takeIf(String::isNotBlank)?.let { "任务上报执行失败：$it" } ?: "任务上报执行失败"
+                return CheckResponse("DOWN", null, "HEARTBEAT_REPORTED_FAILURE", summary, elapsed(started), checkedAt.toString())
+            }
+            val ageSeconds = Duration.between(latestRunAt, checkedAt).seconds.coerceAtLeast(0)
+            if (ageSeconds > intervalSeconds + graceSeconds) {
+                CheckResponse("DOWN", null, "HEARTBEAT_MISSED", "任务最后运行于 ${ageSeconds} 秒前，已超过预期间隔与宽限期", elapsed(started), checkedAt.toString())
+            } else {
+                CheckResponse("UP", null, null, "任务最近一次成功运行于 ${ageSeconds} 秒前", elapsed(started), checkedAt.toString())
+            }
+        } catch (_: Exception) {
+            CheckResponse("UNKNOWN", null, "HEARTBEAT_STATE_UNAVAILABLE", "无法读取心跳任务状态", elapsed(started), checkedAt.toString())
+        }
+    }
+
+    private fun elapsed(started: Long) = Duration.ofNanos(System.nanoTime() - started).toMillis()
+
+    private data class HeartbeatState(
+        val createdAt: Instant,
+        val lastRunAt: Instant?,
+        val lastStatus: String?,
+        val lastSummary: String?,
+    )
 }
 
 @ApplicationScoped
