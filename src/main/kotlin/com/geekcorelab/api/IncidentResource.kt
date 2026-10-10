@@ -38,7 +38,7 @@ class IncidentResource {
         val incidents = mutableListOf<IncidentResponse>()
         dataSource.connection.use { connection ->
             connection.prepareStatement(
-                """SELECT i.id, i.resource_id, r.name AS resource_name, i.monitor_id, i.title, i.severity,
+                """SELECT i.id, i.resource_id, r.name AS resource_name, i.monitor_id, i.title, i.category, i.severity,
                     i.status, i.opened_at, i.acknowledged_at, u.email AS acknowledged_by,
                     i.acknowledgement_note, i.resolved_at, i.occurrence_count
                     FROM incident i JOIN monitored_resource r ON r.id = i.resource_id
@@ -156,7 +156,7 @@ class IncidentResource {
 
     private fun findIncident(id: UUID, userId: UUID): IncidentResponse? = dataSource.connection.use { connection ->
         connection.prepareStatement(
-            """SELECT i.id, i.resource_id, r.name AS resource_name, i.monitor_id, i.title, i.severity,
+            """SELECT i.id, i.resource_id, r.name AS resource_name, i.monitor_id, i.title, i.category, i.severity,
                 i.status, i.opened_at, i.acknowledged_at, u.email AS acknowledged_by,
                 i.acknowledgement_note, i.resolved_at, i.occurrence_count
                 FROM incident i JOIN monitored_resource r ON r.id = i.resource_id
@@ -176,6 +176,7 @@ class IncidentResource {
         resourceName = getString("resource_name"),
         monitorId = getObject("monitor_id").toString(),
         title = getString("title"),
+        category = getString("category"),
         severity = getString("severity"),
         status = getString("status"),
         openedAt = getTimestamp("opened_at").toInstant().toString(),

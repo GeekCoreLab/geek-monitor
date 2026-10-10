@@ -152,7 +152,7 @@ class NotificationDispatcher {
             val cancellation = when {
                 !envelope.channelEnabled || envelope.channelDeleted -> DeliveryResult(false, null, "CHANNEL_DISABLED", "通知渠道已停用", cancelled = true)
                 envelope.maintenanceActive && envelope.eventType != "TEST" -> DeliveryResult(false, null, "MAINTENANCE_ACTIVE", "维护窗口期间已抑制通知", cancelled = true)
-                envelope.eventType == "OPENED" && envelope.incidentStatus == "RESOLVED" -> DeliveryResult(false, null, "EVENT_SUPERSEDED", "故障已恢复，已取消过期故障通知", cancelled = true)
+                envelope.eventType in setOf("OPENED", "ESCALATED") && envelope.incidentStatus == "RESOLVED" -> DeliveryResult(false, null, "EVENT_SUPERSEDED", "事件已恢复，已取消过期通知", cancelled = true)
                 else -> null
             }
             if (cancellation != null) {

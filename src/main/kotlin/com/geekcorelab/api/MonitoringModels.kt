@@ -58,6 +58,8 @@ data class CheckResponse(
     val summary: String?,
     val durationMs: Long,
     val checkedAt: String,
+    val certificateExpiresAt: String? = null,
+    val certificateDaysRemaining: Long? = null,
 )
 
 data class CheckHistoryResponse(
@@ -78,6 +80,7 @@ data class IncidentResponse(
     val resourceName: String,
     val monitorId: String,
     val title: String,
+    val category: String,
     val severity: String,
     val status: String,
     val openedAt: String,

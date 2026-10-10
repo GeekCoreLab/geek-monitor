@@ -195,6 +195,7 @@ class MonitorScheduler {
                     }
                 } ?: false
                 val maintenanceActive = isMaintenanceActive(connection, task.resourceId, processedAt)
+                processTlsCertificateAlert(connection, task, result)
                 val previousFailures = if (maintenanceBoundaryCrossed) 0 else monitor.consecutiveFailures
                 val previousSuccesses = if (maintenanceBoundaryCrossed) 0 else monitor.consecutiveSuccesses
                 val success = result.status == "UP"
@@ -228,17 +229,17 @@ class MonitorScheduler {
                 }
                 if (!monitor.deleted && nextState == "DOWN" && failure) {
                     val activeIncident = connection.prepareStatement(
-                        "SELECT id FROM incident WHERE monitor_id = ? AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
+                        "SELECT id FROM incident WHERE monitor_id = ? AND category = 'AVAILABILITY' AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
                     ).use { statement ->
                         statement.setObject(1, task.id)
                         statement.executeQuery().use { rows -> if (rows.next()) rows.getObject("id", UUID::class.java) else null }
                     }
-                    if (activeIncident != null) {
+                    if (activeIncident != null && !(task.type == "TLS" && result.errorCode == "TLS_EXPIRING")) {
                         connection.prepareStatement("UPDATE incident SET occurrence_count = occurrence_count + 1 WHERE id = ?").use { statement ->
                             statement.setObject(1, activeIncident)
                             statement.executeUpdate()
                         }
-                    } else if (!maintenanceActive && failures >= monitor.failureThreshold) {
+                    } else if (activeIncident == null && !(task.type == "TLS" && result.errorCode == "TLS_EXPIRING") && !maintenanceActive && failures >= monitor.failureThreshold) {
                         openIncident(connection, task, result)
                     }
                 }
@@ -266,10 +267,228 @@ class MonitorScheduler {
             statement.executeQuery().use { rows -> rows.next() && rows.getBoolean(1) }
         }
 
+    private fun processTlsCertificateAlert(connection: Connection, task: CheckTask, result: CheckResponse) {
+        if (task.type != "TLS") return
+        val certificateExpiresAt = result.certificateExpiresAt?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: return
+        val daysRemaining = result.certificateDaysRemaining ?: return
+        val thresholdDays = when {
+            daysRemaining <= 7 -> 7
+            daysRemaining <= 14 -> 14
+            daysRemaining <= 30 -> 30
+            else -> null
+        }
+        val state = connection.prepareStatement(
+            """SELECT s.incident_id, s.certificate_expires_at, s.threshold_days, i.status AS incident_status
+                FROM tls_certificate_alert_state s JOIN incident i ON i.id = s.incident_id
+                WHERE s.monitor_id = ? FOR UPDATE OF s""",
+        ).use { statement ->
+            statement.setObject(1, task.id)
+            statement.executeQuery().use { rows ->
+                if (!rows.next()) null else TlsCertificateAlertState(
+                    incidentId = rows.getObject("incident_id", UUID::class.java),
+                    certificateExpiresAt = rows.getTimestamp("certificate_expires_at").toInstant(),
+                    thresholdDays = rows.getInt("threshold_days"),
+                    incidentStatus = rows.getString("incident_status"),
+                )
+            }
+        }
+        if (state?.incidentStatus == "RESOLVED") {
+            connection.prepareStatement("DELETE FROM tls_certificate_alert_state WHERE monitor_id = ?").use { statement ->
+                statement.setObject(1, task.id)
+                statement.executeUpdate()
+            }
+        }
+        val activeState = state?.takeUnless { it.incidentStatus == "RESOLVED" }
+        if (thresholdDays == null) {
+            if (activeState != null) resolveTlsCertificateIncident(connection, task, activeState.incidentId, daysRemaining, certificateExpiresAt)
+            return
+        }
+        if (activeState == null) {
+            val incidentId = openTlsCertificateIncident(connection, task, thresholdDays, daysRemaining, certificateExpiresAt)
+            connection.prepareStatement(
+                "INSERT INTO tls_certificate_alert_state(monitor_id, incident_id, certificate_expires_at, threshold_days) VALUES (?, ?, ?, ?)",
+            ).use { statement ->
+                statement.setObject(1, task.id)
+                statement.setObject(2, incidentId)
+                statement.setTimestamp(3, java.sql.Timestamp.from(certificateExpiresAt))
+                statement.setInt(4, thresholdDays)
+                statement.executeUpdate()
+            }
+            return
+        }
+        if (thresholdDays != activeState.thresholdDays) {
+            val severity = tlsSeverity(thresholdDays)
+            val title = "${task.resourceName} · TLS 证书将在 $thresholdDays 天内到期"
+            connection.prepareStatement("UPDATE incident SET severity = ?, title = ? WHERE id = ? AND status IN ('OPEN', 'ACKNOWLEDGED')").use { statement ->
+                statement.setString(1, severity)
+                statement.setString(2, title)
+                statement.setObject(3, activeState.incidentId)
+                statement.executeUpdate()
+            }
+            if (thresholdDays < activeState.thresholdDays) {
+                val eventId = UUID.randomUUID()
+                val note = "TLS 证书剩余 $daysRemaining 天，提醒级别升级为 $thresholdDays 天。"
+                val details = mapOf(
+                    "fromThresholdDays" to activeState.thresholdDays,
+                    "thresholdDays" to thresholdDays,
+                    "daysRemaining" to daysRemaining,
+                    "certificateExpiresAt" to certificateExpiresAt.toString(),
+                )
+                connection.prepareStatement(
+                    "INSERT INTO incident_event(id, incident_id, event_type, note, details) VALUES (?, ?, 'ESCALATED', ?, CAST(? AS jsonb))",
+                ).use { statement ->
+                    statement.setObject(1, eventId)
+                    statement.setObject(2, activeState.incidentId)
+                    statement.setString(3, note)
+                    statement.setString(4, objectMapper.writeValueAsString(details))
+                    statement.executeUpdate()
+                }
+                notificationOutbox.enqueueIncident(
+                    connection,
+                    activeState.incidentId,
+                    eventId,
+                    "ESCALATED",
+                    tlsNotificationPayload(eventId, activeState.incidentId, "incident.escalated", title, note, severity, daysRemaining, thresholdDays, certificateExpiresAt, task),
+                )
+            } else {
+                val note = "TLS 证书当前剩余 $daysRemaining 天，到期时间为 ${certificateExpiresAt}."
+                connection.prepareStatement(
+                    "INSERT INTO incident_event(id, incident_id, event_type, note, details) VALUES (?, ?, 'NOTE', ?, CAST(? AS jsonb))",
+                ).use { statement ->
+                    statement.setObject(1, UUID.randomUUID())
+                    statement.setObject(2, activeState.incidentId)
+                    statement.setString(3, note)
+                    statement.setString(4, objectMapper.writeValueAsString(mapOf("thresholdDays" to thresholdDays, "daysRemaining" to daysRemaining, "certificateExpiresAt" to certificateExpiresAt.toString())))
+                    statement.executeUpdate()
+                }
+            }
+        }
+        connection.prepareStatement(
+            "UPDATE tls_certificate_alert_state SET certificate_expires_at = ?, threshold_days = ?, updated_at = now() WHERE monitor_id = ?",
+        ).use { statement ->
+            statement.setTimestamp(1, java.sql.Timestamp.from(certificateExpiresAt))
+            statement.setInt(2, thresholdDays)
+            statement.setObject(3, task.id)
+            statement.executeUpdate()
+        }
+    }
+
+    private fun openTlsCertificateIncident(
+        connection: Connection,
+        task: CheckTask,
+        thresholdDays: Int,
+        daysRemaining: Long,
+        certificateExpiresAt: Instant,
+    ): UUID {
+        val incidentId = UUID.randomUUID()
+        val eventId = UUID.randomUUID()
+        val severity = tlsSeverity(thresholdDays)
+        val title = "${task.resourceName} · TLS 证书将在 $thresholdDays 天内到期"
+        val message = "${task.monitorName} 证书剩余 $daysRemaining 天，到期时间为 $certificateExpiresAt。"
+        connection.prepareStatement(
+            "INSERT INTO incident(id, deduplication_key, monitor_id, resource_id, category, severity, status, title) VALUES (?, ?, ?, ?, 'TLS_CERTIFICATE', ?, 'OPEN', ?)",
+        ).use { statement ->
+            statement.setObject(1, incidentId)
+            statement.setString(2, "${task.id}:TLS_CERTIFICATE:$incidentId")
+            statement.setObject(3, task.id)
+            statement.setObject(4, task.resourceId)
+            statement.setString(5, severity)
+            statement.setString(6, title)
+            statement.executeUpdate()
+        }
+        connection.prepareStatement(
+            "INSERT INTO incident_event(id, incident_id, event_type, note, details) VALUES (?, ?, 'OPENED', ?, CAST(? AS jsonb))",
+        ).use { statement ->
+            statement.setObject(1, eventId)
+            statement.setObject(2, incidentId)
+            statement.setString(3, message)
+            statement.setString(4, objectMapper.writeValueAsString(mapOf("category" to "TLS_CERTIFICATE", "severity" to severity, "daysRemaining" to daysRemaining, "thresholdDays" to thresholdDays, "certificateExpiresAt" to certificateExpiresAt.toString())))
+            statement.executeUpdate()
+        }
+        notificationOutbox.enqueueIncident(
+            connection,
+            incidentId,
+            eventId,
+            "OPENED",
+            tlsNotificationPayload(eventId, incidentId, "incident.opened", title, message, severity, daysRemaining, thresholdDays, certificateExpiresAt, task),
+        )
+        return incidentId
+    }
+
+    private fun resolveTlsCertificateIncident(
+        connection: Connection,
+        task: CheckTask,
+        incidentId: UUID,
+        daysRemaining: Long,
+        certificateExpiresAt: Instant,
+    ) {
+        val updated = connection.prepareStatement(
+            "UPDATE incident SET status = 'RESOLVED', resolved_at = now() WHERE id = ? AND status IN ('OPEN', 'ACKNOWLEDGED')",
+        ).use { statement ->
+            statement.setObject(1, incidentId)
+            statement.executeUpdate()
+        }
+        connection.prepareStatement("DELETE FROM tls_certificate_alert_state WHERE monitor_id = ?").use { statement ->
+            statement.setObject(1, task.id)
+            statement.executeUpdate()
+        }
+        if (updated != 1) return
+        val eventId = UUID.randomUUID()
+        val note = "TLS 证书当前剩余 $daysRemaining 天，到期时间为 $certificateExpiresAt；30 天提醒已关闭。"
+        connection.prepareStatement(
+            "INSERT INTO incident_event(id, incident_id, event_type, note, details) VALUES (?, ?, 'RESOLVED', ?, CAST(? AS jsonb))",
+        ).use { statement ->
+            statement.setObject(1, eventId)
+            statement.setObject(2, incidentId)
+            statement.setString(3, note)
+            statement.setString(4, objectMapper.writeValueAsString(mapOf("daysRemaining" to daysRemaining, "certificateExpiresAt" to certificateExpiresAt.toString())))
+            statement.executeUpdate()
+        }
+        notificationOutbox.enqueueIncident(
+            connection,
+            incidentId,
+            eventId,
+            "RESOLVED",
+            mapOf(
+                "eventId" to eventId.toString(), "eventType" to "incident.resolved", "incidentId" to incidentId.toString(),
+                "category" to "TLS_CERTIFICATE", "title" to "${task.resourceName} · TLS 证书到期提醒已解除",
+                "message" to note, "resourceName" to task.resourceName, "monitorName" to task.monitorName,
+                "severity" to "INFO", "status" to "UP", "daysRemaining" to daysRemaining,
+                "certificateExpiresAt" to certificateExpiresAt.toString(), "occurredAt" to Instant.now().toString(),
+            ),
+        )
+    }
+
+    private fun tlsNotificationPayload(
+        eventId: UUID,
+        incidentId: UUID,
+        eventType: String,
+        title: String,
+        message: String,
+        severity: String,
+        daysRemaining: Long,
+        thresholdDays: Int,
+        certificateExpiresAt: Instant,
+        task: CheckTask,
+    ) = mapOf(
+        "eventId" to eventId.toString(), "eventType" to eventType,
+        "incidentId" to incidentId.toString(), "category" to "TLS_CERTIFICATE", "title" to title,
+        "message" to message, "resourceName" to task.resourceName, "monitorName" to task.monitorName,
+        "severity" to severity, "status" to "UP", "daysRemaining" to daysRemaining,
+        "thresholdDays" to thresholdDays, "certificateExpiresAt" to certificateExpiresAt.toString(),
+        "occurredAt" to Instant.now().toString(),
+    )
+
+    private fun tlsSeverity(thresholdDays: Int) = when (thresholdDays) {
+        7 -> "CRITICAL"
+        14 -> "HIGH"
+        else -> "WARNING"
+    }
+
     private fun openIncident(connection: Connection, task: CheckTask, result: CheckResponse) {
         val incidentId = UUID.randomUUID()
         connection.prepareStatement(
-            "INSERT INTO incident(id, deduplication_key, monitor_id, resource_id, severity, status, title) VALUES (?, ?, ?, ?, 'WARNING', 'OPEN', ?)",
+            "INSERT INTO incident(id, deduplication_key, monitor_id, resource_id, category, severity, status, title) VALUES (?, ?, ?, ?, 'AVAILABILITY', 'WARNING', 'OPEN', ?)",
         ).use { statement ->
             statement.setObject(1, incidentId)
             statement.setString(2, "${task.id}:$incidentId")
@@ -311,7 +530,7 @@ class MonitorScheduler {
 
     private fun resolveIncident(connection: Connection, task: CheckTask) {
         val active = connection.prepareStatement(
-            "SELECT id FROM incident WHERE monitor_id = ? AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
+            "SELECT id FROM incident WHERE monitor_id = ? AND category = 'AVAILABILITY' AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
         ).use { statement ->
             statement.setObject(1, task.id)
             statement.executeQuery().use { rows -> if (rows.next()) rows.getObject("id", UUID::class.java) else null }
@@ -392,6 +611,13 @@ class MonitorScheduler {
         val critical: Boolean,
         val deleted: Boolean,
         val lastResultAt: Instant?,
+    )
+
+    private data class TlsCertificateAlertState(
+        val incidentId: UUID,
+        val certificateExpiresAt: Instant,
+        val thresholdDays: Int,
+        val incidentStatus: String,
     )
 
     private data class ResourceAggregate(val total: Int, val hasDown: Boolean, val hasUnknown: Boolean, val hasPending: Boolean)

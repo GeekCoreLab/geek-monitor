@@ -3950,6 +3950,14 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     minimum: 0,
                     maximum: 3650,
                   ),
+                  const SizedBox(height: 5),
+                  const Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      '证书到期会在剩余 30、14、7 天产生逐级提醒；此阈值决定监控状态何时标记为失败。',
+                      style: TextStyle(color: _muted, fontSize: 10),
+                    ),
+                  ),
                 ],
               ],
               const SizedBox(height: 11),
@@ -4399,7 +4407,7 @@ class _IncidentsPageState extends State<_IncidentsPage> {
                     ),
                     const SizedBox(height: 11),
                     Text(
-                      '${incident['resourceName'] ?? '资源'}  ·  开始于 ${_dateTime(incident['openedAt'] as String?)}  ·  ${incident['occurrenceCount']} 次失败',
+                      '${_incidentCategoryName(incident['category'] as String?)} · ${_incidentSeverityName(incident['severity'] as String?)}  ·  ${incident['resourceName'] ?? '资源'}  ·  开始于 ${_dateTime(incident['openedAt'] as String?)}  ·  ${incident['occurrenceCount']} 次失败',
                       style: const TextStyle(color: _muted, fontSize: 11),
                     ),
                     if (incident['acknowledgedBy'] != null) ...[
@@ -4690,7 +4698,21 @@ String _eventName(String type) => switch (type) {
   'OPENED' => '故障触发',
   'ACKNOWLEDGED' => '负责人确认',
   'RESOLVED' => '监控恢复',
+  'ESCALATED' => '提醒级别变化',
+  'NOTE' => '状态更新',
   _ => type,
+};
+
+String _incidentCategoryName(String? category) => switch (category) {
+  'TLS_CERTIFICATE' => 'TLS 证书',
+  _ => '可用性',
+};
+
+String _incidentSeverityName(String? severity) => switch (severity) {
+  'CRITICAL' => '严重',
+  'HIGH' => '高',
+  'WARNING' => '警告',
+  _ => severity ?? '警告',
 };
 
 class _ProjectDraft {

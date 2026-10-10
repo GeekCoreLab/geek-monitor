@@ -157,11 +157,18 @@ class NetworkCheckService {
             if (remainingMillis(deadline) == null) return result("DOWN", "TIMEOUT", "TLS 检查超过总超时时间", started, checkedAt)
             try {
                 val certificate = tlsHandshake(address, host, port, deadline)
-                val daysLeft = Duration.between(Instant.now(), certificate.notAfter.toInstant()).toDays()
+                val certificateExpiresAt = certificate.notAfter.toInstant()
+                val daysLeft = Duration.between(Instant.now(), certificateExpiresAt).toDays()
                 if (daysLeft < minimumValidityDays) {
-                    return CheckResponse("DOWN", null, "TLS_EXPIRING", "TLS 证书将在 $daysLeft 天后到期", elapsedMillis(started), checkedAt.toString())
+                    return CheckResponse(
+                        "DOWN", null, "TLS_EXPIRING", "TLS 证书将在 $daysLeft 天后到期",
+                        elapsedMillis(started), checkedAt.toString(), certificateExpiresAt.toString(), daysLeft,
+                    )
                 }
-                return CheckResponse("UP", null, null, "TLS 证书有效，剩余 $daysLeft 天", elapsedMillis(started), checkedAt.toString())
+                return CheckResponse(
+                    "UP", null, null, "TLS 证书有效，剩余 $daysLeft 天",
+                    elapsedMillis(started), checkedAt.toString(), certificateExpiresAt.toString(), daysLeft,
+                )
             } catch (_: SocketTimeoutException) {
                 lastCode = "TIMEOUT"
             } catch (_: SSLHandshakeException) {
