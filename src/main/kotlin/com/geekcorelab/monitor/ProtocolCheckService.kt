@@ -66,6 +66,7 @@ class ProtocolCheckService {
             config.path("graceSeconds").asInt(60),
         )
         "METRIC_THRESHOLD" -> metricThreshold(config)
+        "AGENT_OFFLINE" -> agentOffline(config)
         else -> CheckResponse("UNKNOWN", null, "UNSUPPORTED_CHECK", "不支持此监控类型", 0, Instant.now().toString())
     }
 
@@ -114,6 +115,37 @@ class ProtocolCheckService {
             }
         } catch (_: Exception) {
             CheckResponse("UNKNOWN", null, "HEARTBEAT_STATE_UNAVAILABLE", "无法读取心跳任务状态", elapsed(started), checkedAt.toString())
+        }
+    }
+
+    private fun agentOffline(config: JsonNode): CheckResponse {
+        val started = System.nanoTime()
+        val checkedAt = Instant.now()
+        fun result(status: String, code: String?, summary: String?) =
+            CheckResponse(status, null, code, summary, elapsed(started), checkedAt.toString())
+
+        val agentId = runCatching { UUID.fromString(config.path("agentId").asText()) }.getOrNull()
+            ?: return result("UNKNOWN", "CHECK_CONFIG_INVALID", "Agent 采集状态配置无效")
+        val resourceId = runCatching { UUID.fromString(config.path("resourceId").asText()) }.getOrNull()
+            ?: return result("UNKNOWN", "CHECK_CONFIG_INVALID", "Agent 资源配置无效")
+        return try {
+            val lastSeenAt = dataSource.connection.use { connection ->
+                connection.prepareStatement(
+                    "SELECT COALESCE(last_seen_at, created_at) AS last_seen_at FROM agent WHERE id = ? AND resource_id = ? AND revoked_at IS NULL",
+                ).use { statement ->
+                    statement.setObject(1, agentId)
+                    statement.setObject(2, resourceId)
+                    statement.executeQuery().use { rows -> if (rows.next()) rows.getTimestamp("last_seen_at")?.toInstant() else null }
+                }
+            } ?: return result("UNKNOWN", "AGENT_NOT_ACTIVE", "Agent 已吊销或不存在")
+            val ageSeconds = Duration.between(lastSeenAt, checkedAt).seconds.coerceAtLeast(0)
+            if (ageSeconds > AGENT_OFFLINE_AFTER_SECONDS) {
+                result("DOWN", "AGENT_OFFLINE", "Agent 已有 $ageSeconds 秒未上报；依赖该 Agent 的指标缺报事件已抑制")
+            } else {
+                result("UP", null, "Agent 最近一次上报于 $ageSeconds 秒前")
+            }
+        } catch (_: Exception) {
+            result("UNKNOWN", "AGENT_STATE_UNAVAILABLE", "无法读取 Agent 在线状态")
         }
     }
 
@@ -194,6 +226,19 @@ class ProtocolCheckService {
                             startGap > sampleIntervalSeconds * 2L || endGap > sampleIntervalSeconds * 2L ||
                             sampleSeries.maximumGapSeconds > sampleIntervalSeconds * 2.0
                     }) {
+                    val agentLastSeen = connection.prepareStatement(
+                        "SELECT max(COALESCE(last_seen_at, created_at)) FROM agent WHERE resource_id = ? AND revoked_at IS NULL",
+                    ).use { statement ->
+                        statement.setObject(1, resourceId)
+                        statement.executeQuery().use { rows -> rows.next(); rows.getTimestamp(1)?.toInstant() }
+                    }
+                    if (agentLastSeen == null) {
+                        return result("UNKNOWN", "AGENT_NOT_REGISTERED", "尚未注册有效 Agent，指标缺报事件已抑制")
+                    }
+                    val agentAgeSeconds = Duration.between(agentLastSeen, checkedAt).seconds.coerceAtLeast(0)
+                    if (agentAgeSeconds > AGENT_OFFLINE_AFTER_SECONDS) {
+                        return result("UNKNOWN", "AGENT_OFFLINE", "Agent 已有 $agentAgeSeconds 秒未上报，指标缺报事件已抑制")
+                    }
                     return result("UNKNOWN", "METRIC_DATA_INSUFFICIENT", "指标样本覆盖不足或窗口内存在过大空洞，无法评估阈值")
                 }
 
@@ -250,6 +295,7 @@ class ProtocolCheckService {
         private const val MIN_METRIC_WINDOW_SECONDS = 120
         private const val MAX_METRIC_WINDOW_SECONDS = 86400
         private const val MIN_SAMPLE_COVERAGE = 0.8
+        private const val AGENT_OFFLINE_AFTER_SECONDS = 90L
     }
 }
 

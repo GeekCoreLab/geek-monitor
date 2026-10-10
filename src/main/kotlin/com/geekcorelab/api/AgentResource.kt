@@ -1,6 +1,7 @@
 package com.geekcorelab.api
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.geekcorelab.notification.NotificationOutbox
 import com.geekcorelab.security.CredentialService
 import jakarta.inject.Inject
 import jakarta.ws.rs.Consumes
@@ -30,6 +31,7 @@ class AgentResource {
     @Inject lateinit var authenticator: SessionAuthenticator
     @Inject lateinit var credentials: CredentialService
     @Inject lateinit var objectMapper: ObjectMapper
+    @Inject lateinit var notificationOutbox: NotificationOutbox
 
     @POST
     @Path("/agent-enrollments")
@@ -133,6 +135,16 @@ class AgentResource {
                     statement.setString(4, hostname)
                     statement.setString(5, operatingSystem)
                     statement.setString(6, agentVersion)
+                    statement.executeUpdate()
+                }
+                connection.prepareStatement(
+                    """INSERT INTO monitor(id, resource_id, name, type, config, interval_seconds, timeout_seconds,
+                           failure_threshold, recovery_threshold, critical, enabled, reminder_interval_minutes, next_run_at)
+                       VALUES (?, ?, 'Agent 采集状态', 'AGENT_OFFLINE', CAST(? AS jsonb), 10, 1, 1, 1, FALSE, TRUE, 30, now() + INTERVAL '90 seconds')""",
+                ).use { statement ->
+                    statement.setObject(1, UUID.randomUUID())
+                    statement.setObject(2, enrollment.resourceId)
+                    statement.setString(3, objectMapper.writeValueAsString(mapOf("agentId" to agentId.toString(), "resourceId" to enrollment.resourceId.toString())))
                     statement.executeUpdate()
                 }
                 writeAudit(connection, enrollment.issuedBy, "agent.registered", "agent", agentId, mapOf("resourceId" to enrollment.resourceId.toString(), "hostname" to hostname, "agentVersion" to agentVersion))
@@ -318,21 +330,95 @@ class AgentResource {
         val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
         if (user.role != "ADMIN") return error(Response.Status.FORBIDDEN, "ADMIN_REQUIRED", "只有管理员可以吊销 Agent 凭据")
         val id = parseId(idText) ?: return error(Response.Status.BAD_REQUEST, "INVALID_AGENT", "Agent 编号无效")
-        val updated = dataSource.connection.use { connection ->
-            connection.prepareStatement(
-                """UPDATE agent a SET revoked_at = now(), updated_at = now()
-                   WHERE a.id = ? AND a.revoked_at IS NULL AND EXISTS (
-                     SELECT 1 FROM monitored_resource r JOIN project_membership pm ON pm.project_id = r.project_id
-                     WHERE r.id = a.resource_id AND pm.user_id = ?
-                   )""",
-            ).use { statement ->
-                statement.setObject(1, id)
-                statement.setObject(2, user.id)
-                statement.executeUpdate()
+        dataSource.connection.use { connection ->
+            connection.autoCommit = false
+            try {
+                val resourceId = connection.prepareStatement(
+                    """UPDATE agent a SET revoked_at = now(), updated_at = now()
+                       WHERE a.id = ? AND a.revoked_at IS NULL AND EXISTS (
+                         SELECT 1 FROM monitored_resource r JOIN project_membership pm ON pm.project_id = r.project_id
+                         WHERE r.id = a.resource_id AND pm.user_id = ?
+                       ) RETURNING a.resource_id""",
+                ).use { statement ->
+                    statement.setObject(1, id)
+                    statement.setObject(2, user.id)
+                    statement.executeQuery().use { rows -> if (rows.next()) rows.getObject("resource_id", UUID::class.java) else null }
+                } ?: run {
+                    connection.rollback()
+                    return error(Response.Status.NOT_FOUND, "AGENT_NOT_FOUND", "Agent 不存在或已吊销")
+                }
+                val monitorId = connection.prepareStatement(
+                    "SELECT id FROM monitor WHERE resource_id = ? AND type = 'AGENT_OFFLINE' AND config->>'agentId' = ? AND deleted_at IS NULL FOR UPDATE",
+                ).use { statement ->
+                    statement.setObject(1, resourceId)
+                    statement.setString(2, id.toString())
+                    statement.executeQuery().use { rows -> if (rows.next()) rows.getObject("id", UUID::class.java) else null }
+                }
+                if (monitorId != null) {
+                    connection.prepareStatement("UPDATE monitor SET enabled = FALSE, deleted_at = now(), updated_at = now() WHERE id = ?").use { statement ->
+                        statement.setObject(1, monitorId)
+                        statement.executeUpdate()
+                    }
+                    val activeIncidents = connection.prepareStatement(
+                        """SELECT i.id, i.title, r.name AS resource_name FROM incident i
+                           JOIN monitored_resource r ON r.id = i.resource_id
+                           WHERE i.monitor_id = ? AND i.category = 'COLLECTION' AND i.status IN ('OPEN', 'ACKNOWLEDGED')
+                           FOR UPDATE OF i""",
+                    ).use { statement ->
+                        statement.setObject(1, monitorId)
+                        statement.executeQuery().use { rows ->
+                            buildList {
+                                while (rows.next()) add(RevokedAgentIncident(
+                                    rows.getObject("id", UUID::class.java), rows.getString("title"), rows.getString("resource_name"),
+                                ))
+                            }
+                        }
+                    }
+                    activeIncidents.forEach { incident ->
+                        connection.prepareStatement("UPDATE incident SET status = 'RESOLVED', resolved_at = now() WHERE id = ?").use { statement ->
+                            statement.setObject(1, incident.id)
+                            statement.executeUpdate()
+                        }
+                        val eventId = UUID.randomUUID()
+                        val note = "Agent 凭据已吊销，采集失联事件已关闭。"
+                        connection.prepareStatement(
+                            "INSERT INTO incident_event(id, incident_id, actor_user_id, event_type, note, details) VALUES (?, ?, ?, 'RESOLVED', ?, CAST(? AS jsonb))",
+                        ).use { statement ->
+                            statement.setObject(1, eventId)
+                            statement.setObject(2, incident.id)
+                            statement.setObject(3, user.id)
+                            statement.setString(4, note)
+                            statement.setString(5, objectMapper.writeValueAsString(mapOf("category" to "COLLECTION", "agentId" to id.toString())))
+                            statement.executeUpdate()
+                        }
+                        notificationOutbox.enqueueIncident(
+                            connection,
+                            incident.id,
+                            eventId,
+                            "RESOLVED",
+                            mapOf(
+                                "eventId" to eventId.toString(),
+                                "eventType" to "incident.resolved",
+                                "incidentId" to incident.id.toString(),
+                                "category" to "COLLECTION",
+                                "title" to "采集失联已解除：${incident.title}",
+                                "message" to note,
+                                "resourceName" to incident.resourceName,
+                                "monitorName" to "Agent 采集状态",
+                                "severity" to "INFO",
+                                "status" to "UP",
+                                "occurredAt" to Instant.now().toString(),
+                            ),
+                        )
+                    }
+                }
+                writeAudit(connection, user.id, "agent.revoked", "agent", id, emptyMap<String, Any?>())
+                connection.commit()
+            } catch (exception: Exception) {
+                connection.rollback()
+                throw exception
             }
         }
-        if (updated != 1) return error(Response.Status.NOT_FOUND, "AGENT_NOT_FOUND", "Agent 不存在或已吊销")
-        audit(user.id, "agent.revoked", id, emptyMap<String, Any?>())
         return Response.noContent().build()
     }
 
@@ -406,10 +492,6 @@ class AgentResource {
         }
     }
 
-    private fun audit(userId: UUID, action: String, id: UUID, summary: Map<String, Any?>) = dataSource.connection.use { connection ->
-        writeAudit(connection, userId, action, "agent", id, summary)
-    }
-
     private fun bearer(headers: HttpHeaders): String? = headers.getHeaderString(HttpHeaders.AUTHORIZATION)
         ?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }
         ?.substringAfter(' ')
@@ -420,6 +502,7 @@ class AgentResource {
 
     private data class EnrollmentIdentity(val id: UUID, val resourceId: UUID, val issuedBy: UUID)
     private data class AgentIdentity(val id: UUID, val resourceId: UUID, val configVersion: Int)
+    private data class RevokedAgentIncident(val id: UUID, val title: String, val resourceName: String)
     private data class NormalizedMetric(val name: String, val labels: Map<String, String>, val value: Double)
 
     companion object {

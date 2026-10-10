@@ -54,6 +54,7 @@ class MonitorResource {
                     FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id
                     JOIN project_membership pm ON pm.project_id = r.project_id
                     WHERE pm.user_id = ? AND r.deleted_at IS NULL AND m.deleted_at IS NULL
+                      AND m.type <> 'AGENT_OFFLINE'
                       AND (?::uuid IS NULL OR r.id = ?::uuid)
                     ORDER BY m.created_at DESC LIMIT 500""",
             ).use { statement ->
@@ -351,7 +352,7 @@ class MonitorResource {
                 m.critical, m.enabled, m.reminder_interval_minutes, m.current_state, m.version, m.last_result_at, m.next_run_at
                 FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id
                 JOIN project_membership pm ON pm.project_id = r.project_id
-                WHERE m.id = ? AND pm.user_id = ? AND r.deleted_at IS NULL AND m.deleted_at IS NULL""",
+                WHERE m.id = ? AND pm.user_id = ? AND r.deleted_at IS NULL AND m.deleted_at IS NULL AND m.type <> 'AGENT_OFFLINE'""",
         ).use { statement ->
             statement.setObject(1, id)
             statement.setObject(2, userId)

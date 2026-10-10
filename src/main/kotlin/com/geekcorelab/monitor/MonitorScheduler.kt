@@ -241,7 +241,7 @@ class MonitorScheduler {
                     resolveIncident(connection, task)
                 }
                 if (!monitor.deleted && ((nextState == "DOWN" && failure) || (nextState == "DEGRADED" && degraded))) {
-                    val incidentCategory = if (task.type == "METRIC_THRESHOLD") "PERFORMANCE" else "AVAILABILITY"
+                    val incidentCategory = incidentCategory(task.type)
                     val activeIncident = connection.prepareStatement(
                         "SELECT id FROM incident WHERE monitor_id = ? AND category = ? AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
                     ).use { statement ->
@@ -513,15 +513,16 @@ class MonitorScheduler {
     ) {
         val incidentId = UUID.randomUUID()
         val performanceIncident = category == "PERFORMANCE"
-        val title = if (performanceIncident) {
-            "${task.resourceName} · ${task.monitorName} 指标超过阈值"
-        } else {
-            "${task.resourceName} · ${task.monitorName} 检查失败"
+        val collectionIncident = category == "COLLECTION"
+        val title = when {
+            performanceIncident -> "${task.resourceName} · ${task.monitorName} 指标超过阈值"
+            collectionIncident -> "${task.resourceName} · Agent 采集已失联"
+            else -> "${task.resourceName} · ${task.monitorName} 检查失败"
         }
-        val message = if (performanceIncident) {
-            result.summary ?: "${task.resourceName} 的 ${task.monitorName} 指标达到阈值。"
-        } else {
-            "${task.resourceName} 的 ${task.monitorName} 检查达到失败阈值。"
+        val message = when {
+            performanceIncident -> result.summary ?: "${task.resourceName} 的 ${task.monitorName} 指标达到阈值。"
+            collectionIncident -> result.summary ?: "主机 Agent 已超过预期间隔未上报。"
+            else -> "${task.resourceName} 的 ${task.monitorName} 检查达到失败阈值。"
         }
         connection.prepareStatement(
             "INSERT INTO incident(id, deduplication_key, monitor_id, resource_id, category, severity, status, title) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)",
@@ -541,7 +542,7 @@ class MonitorScheduler {
         ).use { statement ->
             statement.setObject(1, eventId)
             statement.setObject(2, incidentId)
-            statement.setString(3, result.summary.takeIf { performanceIncident })
+            statement.setString(3, result.summary.takeIf { performanceIncident || collectionIncident })
             statement.setString(4, objectMapper.writeValueAsString(mapOf("category" to category, "errorCode" to result.errorCode, "statusCode" to result.statusCode)))
             statement.executeUpdate()
         }
@@ -569,7 +570,7 @@ class MonitorScheduler {
     }
 
     private fun resolveIncident(connection: Connection, task: CheckTask) {
-        val category = if (task.type == "METRIC_THRESHOLD") "PERFORMANCE" else "AVAILABILITY"
+        val category = incidentCategory(task.type)
         val active = connection.prepareStatement(
             "SELECT id FROM incident WHERE monitor_id = ? AND category = ? AND status IN ('OPEN', 'ACKNOWLEDGED') FOR UPDATE",
         ).use { statement ->
@@ -605,6 +606,12 @@ class MonitorScheduler {
                 "occurredAt" to Instant.now().toString(),
             ),
         )
+    }
+
+    private fun incidentCategory(type: String) = when (type) {
+        "METRIC_THRESHOLD" -> "PERFORMANCE"
+        "AGENT_OFFLINE" -> "COLLECTION"
+        else -> "AVAILABILITY"
     }
 
     private fun updateResourceHealth(connection: Connection, resourceId: UUID) {

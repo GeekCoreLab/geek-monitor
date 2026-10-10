@@ -5783,6 +5783,7 @@ String _eventName(String type) => switch (type) {
 String _incidentCategoryName(String? category) => switch (category) {
   'TLS_CERTIFICATE' => 'TLS 证书',
   'PERFORMANCE' => '性能阈值',
+  'COLLECTION' => 'Agent 采集',
   _ => '可用性',
 };
 

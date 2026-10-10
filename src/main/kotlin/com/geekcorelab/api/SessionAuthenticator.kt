@@ -56,7 +56,7 @@ class SessionAuthenticator {
 
     fun canAccessMonitor(userId: UUID, monitorId: UUID): Boolean = dataSource.connection.use { connection ->
         connection.prepareStatement(
-            "SELECT 1 FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id JOIN project_membership pm ON pm.project_id = r.project_id WHERE m.id = ? AND m.deleted_at IS NULL AND r.deleted_at IS NULL AND pm.user_id = ?",
+            "SELECT 1 FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id JOIN project_membership pm ON pm.project_id = r.project_id WHERE m.id = ? AND m.deleted_at IS NULL AND m.type <> 'AGENT_OFFLINE' AND r.deleted_at IS NULL AND pm.user_id = ?",
         ).use { statement ->
             statement.setObject(1, monitorId)
             statement.setObject(2, userId)
