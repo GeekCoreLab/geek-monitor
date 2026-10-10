@@ -11,6 +11,7 @@ void main() {
 const _ink = Color(0xFF182433);
 const _muted = Color(0xFF6F7C8C);
 const _blue = Color(0xFF315CA8);
+const _red = Color(0xFFB42318);
 const _canvas = Color(0xFFF4F6F9);
 const _showDevCredentials =
     kDebugMode || bool.fromEnvironment('GEEK_MONITOR_DEV_CREDENTIALS');
@@ -1133,7 +1134,8 @@ class _DashboardShellState extends State<_DashboardShell> {
       if (!mounted) return;
       showDialog<void>(
         context: context,
-        builder: (_) => _MetricsDialog(resource: resource, result: result),
+        builder: (_) =>
+            _MetricsDialog(api: widget.api, resource: resource, result: result),
       );
     } catch (error) {
       if (mounted) _notice(error.toString(), isError: true);
@@ -2594,52 +2596,144 @@ class _AgentResourceDialogState extends State<_AgentResourceDialog> {
   );
 }
 
-class _MetricsDialog extends StatelessWidget {
-  const _MetricsDialog({required this.resource, required this.result});
+class _MetricsDialog extends StatefulWidget {
+  const _MetricsDialog({
+    required this.api,
+    required this.resource,
+    required this.result,
+  });
+  final ApiClient api;
   final Map<String, dynamic> resource;
   final Map<String, dynamic> result;
 
   @override
+  State<_MetricsDialog> createState() => _MetricsDialogState();
+}
+
+class _MetricsDialogState extends State<_MetricsDialog> {
+  late Map<String, dynamic> _result;
+  int _rangeDays = 1;
+  bool _loading = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _result = widget.result;
+  }
+
+  Future<void> _loadRange(int days) async {
+    setState(() {
+      _rangeDays = days;
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final result = await widget.api.resourceMetrics(
+        widget.resource['id'] as String,
+        rangeDays: days,
+      );
+      if (!mounted) return;
+      setState(() => _result = result);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final rawSeries = result['series'] as List? ?? const [];
+    final rawSeries = _result['series'] as List? ?? const [];
     final series = rawSeries
         .map((value) => Map<String, dynamic>.from(value as Map))
         .toList();
-    final stepSeconds = result['stepSeconds'] as int? ?? 60;
+    final stepSeconds = _result['stepSeconds'] as int? ?? 60;
+    final isDatabase = widget.resource['type'] == 'DATABASE';
     return AlertDialog(
       title: Text(
-        '${resource['name']} · ${resource['type'] == 'DATABASE' ? '数据库指标' : '主机指标'}',
+        '${widget.resource['name']} · ${isDatabase ? '数据库指标' : '主机指标'}',
       ),
       content: SizedBox(
         width: 760,
         height: 540,
-        child: series.isEmpty
-            ? _EmptyState(
-                icon: Icons.show_chart_rounded,
-                title: '当前时间范围没有指标',
-                subtitle: resource['type'] == 'DATABASE'
-                    ? '数据库检查采集到可用连接统计后，曲线会显示在这里。账号没有统计权限时不会生成对应指标。'
-                    : 'Agent 开始上报后，主机趋势会显示在这里。',
-              )
-            : ListView.separated(
-                itemCount: series.length,
-                separatorBuilder: (_, _) => const SizedBox(height: 10),
-                itemBuilder: (context, index) {
-                  final item = series[index];
-                  final labels = Map<String, dynamic>.from(
-                    item['labels'] as Map? ?? const {},
-                  );
-                  final points = (item['points'] as List? ?? const [])
-                      .map((point) => Map<String, dynamic>.from(point as Map))
-                      .toList();
-                  return _MetricChartCard(
-                    metricName: item['metricName'] as String? ?? '',
-                    labels: labels,
-                    points: points,
-                    stepSeconds: stepSeconds,
-                  );
-                },
+        child: Column(
+          children: [
+            Row(
+              children: [
+                const Text('时间范围', style: TextStyle(fontSize: 12)),
+                const SizedBox(width: 10),
+                DropdownButton<int>(
+                  value: _rangeDays,
+                  items: const [
+                    DropdownMenuItem(value: 1, child: Text('最近 24 小时')),
+                    DropdownMenuItem(value: 7, child: Text('最近 7 天')),
+                    DropdownMenuItem(value: 30, child: Text('最近 30 天')),
+                    DropdownMenuItem(value: 180, child: Text('最近 180 天')),
+                  ],
+                  onChanged: _loading
+                      ? null
+                      : (days) {
+                          if (days != null && days != _rangeDays) {
+                            _loadRange(days);
+                          }
+                        },
+                ),
+                const Spacer(),
+                if (_loading)
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+              ],
+            ),
+            if (_error != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    '读取曲线失败：$_error',
+                    style: const TextStyle(color: _red, fontSize: 11),
+                  ),
+                ),
               ),
+            Expanded(
+              child: series.isEmpty
+                  ? _EmptyState(
+                      icon: Icons.show_chart_rounded,
+                      title: '当前时间范围没有指标',
+                      subtitle: isDatabase
+                          ? '数据库检查采集到可用连接统计后，曲线会显示在这里。账号没有统计权限时不会生成对应指标。'
+                          : 'Agent 开始上报后，主机趋势会显示在这里。',
+                    )
+                  : ListView.separated(
+                      itemCount: series.length,
+                      separatorBuilder: (_, _) => const SizedBox(height: 10),
+                      itemBuilder: (context, index) {
+                        final item = series[index];
+                        final labels = Map<String, dynamic>.from(
+                          item['labels'] as Map? ?? const {},
+                        );
+                        final points = (item['points'] as List? ?? const [])
+                            .map(
+                              (point) =>
+                                  Map<String, dynamic>.from(point as Map),
+                            )
+                            .toList();
+                        return _MetricChartCard(
+                          metricName: item['metricName'] as String? ?? '',
+                          labels: labels,
+                          points: points,
+                          stepSeconds: stepSeconds,
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
       ),
       actions: [
         TextButton(

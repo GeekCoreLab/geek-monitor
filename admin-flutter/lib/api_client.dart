@@ -125,12 +125,25 @@ class ApiClient {
     await _send('DELETE', '/api/v1/resources/${Uri.encodeComponent(id)}');
   }
 
-  Future<Map<String, dynamic>> resourceMetrics(String id) async =>
-      (await _send(
-            'GET',
-            '/api/v1/resources/${Uri.encodeComponent(id)}/metrics',
-          ))
-          as Map<String, dynamic>;
+  Future<Map<String, dynamic>> resourceMetrics(
+    String id, {
+    int rangeDays = 1,
+  }) async {
+    final to = DateTime.now().toUtc();
+    final from = to.subtract(Duration(days: rangeDays));
+    final query = Uri(
+      queryParameters: {
+        'from': from.toIso8601String(),
+        'to': to.toIso8601String(),
+        'stepSeconds': '60',
+      },
+    ).query;
+    return (await _send(
+          'GET',
+          '/api/v1/resources/${Uri.encodeComponent(id)}/metrics?$query',
+        ))
+        as Map<String, dynamic>;
+  }
 
   Future<List<Map<String, dynamic>>> agents() async =>
       _asMapList(await _send('GET', '/api/v1/agents'));
