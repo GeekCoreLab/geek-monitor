@@ -29,6 +29,8 @@ const (
 	maxQueueBytes = 64 << 20
 	maxQueueAge   = 7 * 24 * time.Hour
 	maxBatchBytes = 1 << 20
+	// Bound offline replay per tick so recovery traffic stays predictable.
+	maxReplayBatchesPerCycle = 10
 )
 
 type agentConfig struct {
@@ -291,33 +293,41 @@ func collectAndQueue(config *agentConfig, configPath string, state *collector) e
 
 func deliverQueued(client *http.Client, config *agentConfig, configPath string) error {
 	path := queuePath(configPath)
-	entry, remainder, err := readFirstQueueEntry(path)
-	if err != nil || entry == nil {
-		return err
+	for replayed := 0; replayed < maxReplayBatchesPerCycle; replayed++ {
+		entry, remainder, err := readFirstQueueEntry(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil || entry == nil {
+			return err
+		}
+		body, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		request, err := http.NewRequest(http.MethodPost, config.ServerURL+"/api/v1/agents/"+config.AgentID+"/batches", bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Authorization", "Bearer "+config.Credential)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			return err
+		}
+		responseBody, err := io.ReadAll(io.LimitReader(response.Body, 32<<10))
+		response.Body.Close()
+		if err != nil {
+			return err
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return fmt.Errorf("batch request failed with HTTP %d: %s", response.StatusCode, safeError(responseBody))
+		}
+		if err := replaceQueue(path, remainder); err != nil {
+			return err
+		}
 	}
-	body, err := json.Marshal(entry)
-	if err != nil {
-		return err
-	}
-	request, err := http.NewRequest(http.MethodPost, config.ServerURL+"/api/v1/agents/"+config.AgentID+"/batches", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Bearer "+config.Credential)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := client.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 32<<10))
-	if err != nil {
-		return err
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("batch request failed with HTTP %d: %s", response.StatusCode, safeError(responseBody))
-	}
-	return replaceQueue(path, remainder)
+	return nil
 }
 
 func collectHostMetrics(state *collector, sampledAt time.Time) []metric {

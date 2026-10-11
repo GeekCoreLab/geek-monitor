@@ -41,7 +41,7 @@ func TestDeliverQueuedRetriesInOrderAndKeepsFailedBatch(t *testing.T) {
 
 	configPath := filepath.Join(t.TempDir(), "agent.json")
 	config := &agentConfig{ServerURL: server.URL, AgentID: "agent-test", Credential: "credential-test"}
-	for sequence := int64(1); sequence <= 2; sequence++ {
+	for sequence := int64(1); sequence <= maxReplayBatchesPerCycle+2; sequence++ {
 		entry := batch{
 			BootID: "boot-test", Sequence: sequence, SampledAt: time.Now().UTC().Format(time.RFC3339Nano),
 			ConfigVersion: 1, ClockSynced: true, Metrics: []metric{{Name: "load_1m", Value: float64(sequence)}},
@@ -55,26 +55,29 @@ func TestDeliverQueuedRetriesInOrderAndKeepsFailedBatch(t *testing.T) {
 		t.Fatal("expected the first upload to remain queued after HTTP 503")
 	}
 	first, remainder, err := readFirstQueueEntry(queuePath(configPath))
-	if err != nil || first == nil || first.Sequence != 1 || queuedLineCount(remainder) != 1 {
+	if err != nil || first == nil || first.Sequence != 1 || queuedLineCount(remainder) != maxReplayBatchesPerCycle+1 {
 		t.Fatalf("failed upload did not preserve FIFO queue: first=%+v remainder=%d err=%v", first, len(remainder), err)
 	}
 
 	if err := deliverQueued(server.Client(), config, configPath); err != nil {
-		t.Fatalf("replay first batch: %v", err)
+		t.Fatalf("replay queued batches: %v", err)
 	}
 	first, remainder, err = readFirstQueueEntry(queuePath(configPath))
-	if err != nil || first == nil || first.Sequence != 2 || queuedLineCount(remainder) != 0 {
-		t.Fatalf("successful replay did not remove only the first batch: first=%+v remainder=%d err=%v", first, len(remainder), err)
+	if err != nil || first == nil || first.Sequence != int64(maxReplayBatchesPerCycle+1) || queuedLineCount(remainder) != 1 {
+		t.Fatalf("replay exceeded its per-cycle limit or skipped FIFO order: first=%+v remainder=%d err=%v", first, queuedLineCount(remainder), err)
 	}
-
 	if err := deliverQueued(server.Client(), config, configPath); err != nil {
-		t.Fatalf("replay second batch: %v", err)
+		t.Fatalf("replay remaining queued batches: %v", err)
 	}
 	first, _, err = readFirstQueueEntry(queuePath(configPath))
 	if err != nil || first != nil {
 		t.Fatalf("queue is not empty after replay: first=%+v err=%v", first, err)
 	}
-	if !reflect.DeepEqual(received, []int64{1, 1, 2}) {
+	expected := []int64{1}
+	for sequence := int64(1); sequence <= maxReplayBatchesPerCycle+2; sequence++ {
+		expected = append(expected, sequence)
+	}
+	if !reflect.DeepEqual(received, expected) {
 		t.Fatalf("uploads were not retried in order: got %v", received)
 	}
 }
