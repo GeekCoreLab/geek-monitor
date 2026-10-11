@@ -2458,6 +2458,7 @@ class _AgentsPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => _PageScroll(
+    expand: true,
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -2512,91 +2513,105 @@ class _AgentsPage extends StatelessWidget {
                     ),
                   )
                 else
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: DataTable(
-                      columnSpacing: 22,
-                      headingRowHeight: 42,
-                      dataRowMinHeight: 58,
-                      dataRowMaxHeight: 66,
-                      columns: const [
-                        DataColumn(label: Text('主机资源')),
-                        DataColumn(label: Text('节点')),
-                        DataColumn(label: Text('操作系统')),
-                        DataColumn(label: Text('版本')),
-                        DataColumn(label: Text('状态')),
-                        DataColumn(label: Text('最后上报')),
-                        DataColumn(label: Text('')),
-                      ],
-                      rows: agents.map((agent) {
-                        final status = agent['status'] as String? ?? 'OFFLINE';
-                        final lastActivity = switch (status) {
-                          'WAITING_INSTALL' =>
-                            '令牌有效至 ${_dateTime(agent['expiresAt'] as String?)}',
-                          'INSTALL_EXPIRED' => '令牌已过期，可重新签发',
-                          _ => _dateTime(agent['lastSeenAt'] as String?),
-                        };
-                        return DataRow(
-                          cells: [
-                            DataCell(
-                              Text(
-                                agent['resourceName'] as String? ?? '主机',
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            DataCell(
-                              Text(
-                                agent['hostname'] as String? ?? '—',
-                                style: const TextStyle(fontSize: 12),
-                              ),
-                            ),
-                            DataCell(
-                              Text(
-                                agent['operatingSystem'] as String? ?? '—',
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: _muted,
-                                ),
-                              ),
-                            ),
-                            DataCell(
-                              Text(
-                                agent['agentVersion'] as String? ?? '—',
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: _muted,
-                                ),
-                              ),
-                            ),
-                            DataCell(_AgentStatusTag(status: status)),
-                            DataCell(
-                              Text(
-                                lastActivity,
-                                style: const TextStyle(
-                                  fontSize: 10,
-                                  color: _muted,
-                                ),
-                              ),
-                            ),
-                            DataCell(
-                              isAdmin && (status == 'ONLINE' || status == 'OFFLINE')
-                                  ? IconButton(
-                                      tooltip: '吊销凭据',
-                                      onPressed: () => onRevoke(agent),
-                                      icon: const Icon(
-                                        Icons.key_off_outlined,
-                                        size: 18,
+                  LayoutBuilder(
+                    builder: (context, constraints) => SizedBox(
+                      width: constraints.maxWidth,
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(
+                            minWidth: constraints.maxWidth,
+                          ),
+                          child: DataTable(
+                            columnSpacing: 22,
+                            headingRowHeight: 42,
+                            dataRowMinHeight: 58,
+                            dataRowMaxHeight: 66,
+                            columns: const [
+                              DataColumn(label: Text('主机资源')),
+                              DataColumn(label: Text('节点')),
+                              DataColumn(label: Text('操作系统')),
+                              DataColumn(label: Text('版本')),
+                              DataColumn(label: Text('状态')),
+                              DataColumn(label: Text('最后上报')),
+                              DataColumn(label: Text('')),
+                            ],
+                            rows: agents.map((agent) {
+                              final status =
+                                  agent['status'] as String? ?? 'OFFLINE';
+                              final lastActivity = switch (status) {
+                                'WAITING_INSTALL' =>
+                                  '令牌有效至 ${_dateTime(agent['expiresAt'] as String?)}',
+                                'INSTALL_EXPIRED' => '令牌已过期，可重新签发',
+                                _ => _dateTime(agent['lastSeenAt'] as String?),
+                              };
+                              return DataRow(
+                                cells: [
+                                  DataCell(
+                                    Text(
+                                      agent['resourceName'] as String? ?? '主机',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                  DataCell(
+                                    Text(
+                                      agent['hostname'] as String? ?? '—',
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                  ),
+                                  DataCell(
+                                    Text(
+                                      agent['operatingSystem'] as String? ??
+                                          '—',
+                                      style: const TextStyle(
+                                        fontSize: 11,
                                         color: _muted,
                                       ),
-                                    )
-                                  : const SizedBox(width: 32),
-                            ),
-                          ],
-                        );
-                      }).toList(),
+                                    ),
+                                  ),
+                                  DataCell(
+                                    Text(
+                                      agent['agentVersion'] as String? ?? '—',
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        color: _muted,
+                                      ),
+                                    ),
+                                  ),
+                                  DataCell(_AgentStatusTag(status: status)),
+                                  DataCell(
+                                    Text(
+                                      lastActivity,
+                                      style: const TextStyle(
+                                        fontSize: 10,
+                                        color: _muted,
+                                      ),
+                                    ),
+                                  ),
+                                  DataCell(
+                                    isAdmin &&
+                                            (status == 'ONLINE' ||
+                                                status == 'OFFLINE')
+                                        ? IconButton(
+                                            tooltip: '吊销凭据',
+                                            onPressed: () => onRevoke(agent),
+                                            icon: const Icon(
+                                              Icons.key_off_outlined,
+                                              size: 18,
+                                              color: _muted,
+                                            ),
+                                          )
+                                        : const SizedBox(width: 32),
+                                  ),
+                                ],
+                              );
+                            }).toList(),
+                          ),
+                        ),
+                      ),
                     ),
                   ),
               ],
@@ -7798,18 +7813,21 @@ class _StatusTag extends StatelessWidget {
 }
 
 class _PageScroll extends StatelessWidget {
-  const _PageScroll({required this.child});
+  const _PageScroll({required this.child, this.expand = false});
   final Widget child;
+  final bool expand;
 
   @override
   Widget build(BuildContext context) => SingleChildScrollView(
     padding: const EdgeInsets.fromLTRB(28, 27, 28, 36),
-    child: Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 1400),
-        child: child,
-      ),
-    ),
+    child: expand
+        ? SizedBox(width: double.infinity, child: child)
+        : Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 1400),
+              child: child,
+            ),
+          ),
   );
 }
 
