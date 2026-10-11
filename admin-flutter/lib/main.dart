@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -5584,6 +5586,8 @@ class _MonitorDraft {
     required this.reminderIntervalMinutes,
     required this.expectedStatusCodes,
     required this.textContains,
+    required this.jsonPath,
+    required this.jsonExpectedValue,
     required this.critical,
     required this.enabled,
   });
@@ -5617,6 +5621,8 @@ class _MonitorDraft {
   final int reminderIntervalMinutes;
   final List<int> expectedStatusCodes;
   final String? textContains;
+  final String? jsonPath;
+  final String? jsonExpectedValue;
   final bool critical;
   final bool enabled;
 
@@ -5655,6 +5661,8 @@ class _MonitorDraft {
       'method': method,
       'expectedStatusCodes': expectedStatusCodes,
       'textContains': textContains,
+      'jsonPath': jsonPath,
+      'jsonExpectedValue': jsonExpectedValue,
     },
     if (type == 'TCP') ...{'targetHost': target, 'port': port},
     if (type == 'DNS') ...{
@@ -5767,6 +5775,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   late final _contains = TextEditingController(
     text: widget.existing?['textContains'] as String? ?? '',
   );
+  late final _jsonPath = TextEditingController(
+    text: widget.existing?['jsonPath'] as String? ?? '',
+  );
+  late final _jsonExpectedValue = TextEditingController(
+    text: widget.existing?['jsonExpectedValue'] as String? ?? '',
+  );
   late bool _critical = widget.existing?['critical'] as bool? ?? true;
   late bool _enabled = widget.existing?['enabled'] as bool? ?? true;
   late bool _databaseTls =
@@ -5804,6 +5818,8 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     _reminderInterval.dispose();
     _statuses.dispose();
     _contains.dispose();
+    _jsonPath.dispose();
+    _jsonExpectedValue.dispose();
     super.dispose();
   }
 
@@ -6049,6 +6065,28 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     labelText: '响应内容必须包含（可选）',
                     hintText: '例：service is healthy',
                   ),
+                ),
+                const SizedBox(height: 11),
+                TextFormField(
+                  controller: _jsonPath,
+                  maxLength: 256,
+                  decoration: const InputDecoration(
+                    labelText: 'JSON 路径（JSON Pointer，可选）',
+                    hintText: '/status/ready',
+                  ),
+                ),
+                const SizedBox(height: 11),
+                TextFormField(
+                  controller: _jsonExpectedValue,
+                  maxLength: 500,
+                  minLines: 1,
+                  maxLines: 3,
+                  decoration: const InputDecoration(
+                    labelText: 'JSON 期望值（JSON 字面量）',
+                    hintText: 'true、200 或 "ok"',
+                    helperText: '路径和期望值需同时填写；与正文包含同时设置时，两项都必须匹配。',
+                  ),
+                  validator: (_) => _validateJsonAssertion(),
                 ),
               ] else if (_type != 'HEARTBEAT') ...[
                 TextFormField(
@@ -6605,10 +6643,33 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         textContains: _contains.text.trim().isEmpty
             ? null
             : _contains.text.trim(),
+        jsonPath: _jsonPath.text.trim().isEmpty ? null : _jsonPath.text.trim(),
+        jsonExpectedValue: _jsonExpectedValue.text.trim().isEmpty
+            ? null
+            : _jsonExpectedValue.text.trim(),
         critical: _critical,
         enabled: _enabled,
       ),
     );
+  }
+
+  String? _validateJsonAssertion() {
+    final path = _jsonPath.text.trim();
+    final expected = _jsonExpectedValue.text.trim();
+    if (path.isEmpty && expected.isEmpty) return null;
+    if (path.isEmpty || expected.isEmpty) return 'JSON 路径和期望值必须同时填写';
+    if (!path.startsWith('/') ||
+        path.length > 256 ||
+        RegExp(r'~(?![01])').hasMatch(path)) {
+      return 'JSON Pointer 必须以 / 开头、正确转义 ~，且不超过 256 个字符';
+    }
+    if (expected.length > 500) return '期望值不能超过 500 个字符';
+    try {
+      jsonDecode(expected);
+    } on FormatException {
+      return '期望值必须是有效的 JSON 字面量，例如 true、200 或 "ok"';
+    }
+    return null;
   }
 }
 

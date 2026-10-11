@@ -2,6 +2,7 @@ package com.geekcorelab.api
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.geekcorelab.monitor.ProtocolCheckService
+import com.geekcorelab.monitor.JsonPointerAssertions
 import com.geekcorelab.security.CredentialService
 import com.geekcorelab.security.SecretEncryptionService
 import jakarta.inject.Inject
@@ -296,6 +297,9 @@ class MonitorResource {
         val recoveries = request.recoveryThreshold ?: 2
         val expectedCodes = (request.expectedStatusCodes ?: (200..299).toList()).distinct().sorted()
         val contains = request.textContains?.takeIf(String::isNotBlank)
+        val jsonPath = request.jsonPath?.trim()?.takeIf(String::isNotBlank)
+        val jsonExpectedValue = request.jsonExpectedValue?.trim()?.takeIf(String::isNotBlank)
+        val jsonAssertionValid = JsonPointerAssertions.isValidConfiguration(jsonPath, jsonExpectedValue)
         if (name.isBlank() || name.length > 160 || type !in setOf("HTTP", "TCP", "DNS", "TLS", "POSTGRESQL", "MYSQL", "REDIS", "HEARTBEAT", "METRIC_THRESHOLD") ||
             interval !in 10..86400 || timeout !in 1..30 || interval <= timeout || failures !in 1..20 || recoveries !in 1..20 ||
             reminderInterval !in 0..1440 || heartbeatGraceSeconds !in 0..86400) {
@@ -323,12 +327,14 @@ class MonitorResource {
                 if (uri == null || uri.scheme.lowercase() !in setOf("http", "https") || uri.host.isNullOrBlank() ||
                     uri.userInfo != null || uri.fragment != null || (uri.port != -1 && uri.port !in 1..65535) ||
                     method !in setOf("GET", "HEAD") || expectedCodes.isEmpty() || expectedCodes.size > 100 ||
-                    expectedCodes.any { it !in 100..599 } || (contains?.length ?: 0) > 500) return null
+                    expectedCodes.any { it !in 100..599 } || (contains?.length ?: 0) > 500 || !jsonAssertionValid) return null
                 mapOf(
                     "url" to uri.normalize().toASCIIString(),
                     "method" to method,
                     "expectedStatusCodes" to expectedCodes,
                     "textContains" to contains,
+                    "jsonPath" to jsonPath,
+                    "jsonExpectedValue" to jsonExpectedValue,
                 )
             }
             "TCP" -> {
@@ -431,7 +437,14 @@ class MonitorResource {
     }
 
     private fun MonitorResponse.toCheckConfig(): Map<String, Any?> = when (type) {
-        "HTTP" -> mapOf("url" to targetUrl, "method" to method, "expectedStatusCodes" to expectedStatusCodes, "textContains" to textContains)
+        "HTTP" -> mapOf(
+            "url" to targetUrl,
+            "method" to method,
+            "expectedStatusCodes" to expectedStatusCodes,
+            "textContains" to textContains,
+            "jsonPath" to jsonPath,
+            "jsonExpectedValue" to jsonExpectedValue,
+        )
         "TCP" -> mapOf("host" to targetHost, "port" to port)
         "DNS" -> mapOf("host" to targetHost, "recordType" to recordType, "resolver" to resolver, "expectedValue" to expectedRecordValue)
         "TLS" -> mapOf("host" to targetHost, "port" to port, "minimumValidityDays" to minimumValidityDays)
@@ -487,6 +500,8 @@ class MonitorResource {
             recoveryThreshold = getInt("recovery_threshold"),
             expectedStatusCodes = config.path("expectedStatusCodes").map { it.asInt() },
             textContains = config.path("textContains").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            jsonPath = config.path("jsonPath").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            jsonExpectedValue = config.path("jsonExpectedValue").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             critical = getBoolean("critical"),
             enabled = getBoolean("enabled"),
             reminderIntervalMinutes = getInt("reminder_interval_minutes"),

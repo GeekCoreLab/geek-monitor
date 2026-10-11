@@ -46,6 +46,8 @@ class ProtocolCheckService {
             timeoutSeconds,
             config.path("expectedStatusCodes").map { it.asInt() }.toSet().ifEmpty { (200..299).toSet() },
             config.path("textContains").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            config.path("jsonPath").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            config.path("jsonExpectedValue").takeUnless { it.isMissingNode || it.isNull }?.asText(),
         )
         "TCP" -> networkChecker.tcp(config.path("host").asText(), config.path("port").asInt(), timeoutSeconds)
         "DNS" -> networkChecker.dns(

@@ -106,9 +106,16 @@ class HttpCheckService {
         timeoutSeconds: Int,
         expectedStatusCodes: Set<Int>,
         textContains: String?,
+        jsonPath: String? = null,
+        jsonExpectedValue: String? = null,
     ): CheckResponse {
         val startedNanos = System.nanoTime()
         val checkedAt = Instant.now()
+        val normalizedJsonPath = jsonPath?.takeIf(String::isNotBlank)
+        val normalizedJsonExpectedValue = jsonExpectedValue?.takeIf(String::isNotBlank)
+        if (!JsonPointerAssertions.isValidConfiguration(normalizedJsonPath, normalizedJsonExpectedValue)) {
+            return unknown(startedNanos, checkedAt, "CHECK_CONFIG_INVALID", "JSON 路径断言配置无效")
+        }
         val deadlineNanos = startedNanos + TimeUnit.SECONDS.toNanos(timeoutSeconds.toLong())
         val allowedNetworks = parseAllowedNetworks()
         var uri = try {
@@ -171,16 +178,20 @@ class HttpCheckService {
                         return@use
                     }
 
-                    val bodyContainsText = if (textContains == null) true else {
+                    val body = if (textContains != null || normalizedJsonPath != null) {
                         val bytes = response.body.byteStream().use { it.readNBytes(MAX_RESPONSE_BYTES + 1) }
-                        String(bytes.copyOf(minOf(bytes.size, MAX_RESPONSE_BYTES)), Charsets.UTF_8).contains(textContains)
-                    }
+                        bytes.copyOf(minOf(bytes.size, MAX_RESPONSE_BYTES))
+                    } else null
+                    val bodyContainsText = textContains == null ||
+                        String(body!!, Charsets.UTF_8).contains(textContains)
+                    val jsonAssertionMatches = normalizedJsonPath == null ||
+                        JsonPointerAssertions.matches(body!!, normalizedJsonPath, normalizedJsonExpectedValue!!)
                     val statusMatches = response.code in expectedStatusCodes
                     if (!statusMatches) {
                         return CheckResponse("DOWN", response.code, "HTTP_STATUS", "HTTP 状态码 ${response.code} 不符合期望", elapsedMillis(startedNanos), checkedAt.toString())
                     }
-                    if (!bodyContainsText) {
-                        return CheckResponse("DOWN", response.code, "ASSERTION_FAILED", "响应内容未包含配置的文本", elapsedMillis(startedNanos), checkedAt.toString())
+                    if (!bodyContainsText || !jsonAssertionMatches) {
+                        return CheckResponse("DOWN", response.code, "ASSERTION_FAILED", "响应内容断言未通过", elapsedMillis(startedNanos), checkedAt.toString())
                     }
                     return CheckResponse("UP", response.code, null, null, elapsedMillis(startedNanos), checkedAt.toString())
                 }

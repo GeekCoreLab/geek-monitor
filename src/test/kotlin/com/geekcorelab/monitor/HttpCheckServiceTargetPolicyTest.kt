@@ -52,6 +52,22 @@ class HttpCheckServiceTargetPolicyTest {
         assertEquals("TARGET_BLOCKED", blocked.errorCode)
     }
 
+    @Test
+    fun `invalid JSON assertion configuration is rejected before network access`() {
+        val result = service().execute(
+            targetUrl = "http://127.0.0.1/",
+            method = "GET",
+            timeoutSeconds = 2,
+            expectedStatusCodes = setOf(200),
+            textContains = null,
+            jsonPath = "/status",
+            jsonExpectedValue = "ok",
+        )
+
+        assertEquals("UNKNOWN", result.status)
+        assertEquals("CHECK_CONFIG_INVALID", result.errorCode)
+    }
+
     private fun service(
         allowPrivateTargets: Boolean = false,
         allowedCidrs: String = "none",

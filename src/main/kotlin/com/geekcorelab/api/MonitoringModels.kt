@@ -18,6 +18,8 @@ data class MonitorRequest(
     val recoveryThreshold: Int? = 2,
     val expectedStatusCodes: List<Int>? = null,
     val textContains: String? = null,
+    val jsonPath: String? = null,
+    val jsonExpectedValue: String? = null,
     val critical: Boolean? = true,
     val enabled: Boolean? = true,
     val reminderIntervalMinutes: Int? = null,
@@ -77,6 +79,8 @@ data class MonitorResponse(
     val databasePasswordConfigured: Boolean = false,
     val databaseTls: Boolean? = null,
     val redisDatabase: Int? = null,
+    val jsonPath: String? = null,
+    val jsonExpectedValue: String? = null,
 )
 
 data class CheckResponse(
