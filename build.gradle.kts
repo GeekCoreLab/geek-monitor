@@ -23,6 +23,7 @@ dependencies {
     implementation("io.quarkus:quarkus-jdbc-postgresql")
     implementation("io.quarkus:quarkus-jdbc-mysql")
     implementation("io.quarkus:quarkus-flyway")
+    implementation("io.quarkus:quarkus-smallrye-health")
     implementation("io.quarkus:quarkus-scheduler")
     implementation("io.quarkus:quarkus-mailer")
     implementation("dnsjava:dnsjava:3.6.5")

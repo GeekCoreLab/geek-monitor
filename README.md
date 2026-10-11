@@ -55,6 +55,8 @@ openssl rand -base64 32
 
 首次安装状态保存在数据库中。重新部署不会重置管理员或项目；重置操作需按备份与恢复流程直接管理数据库。
 
+完整的容器部署、升级、备份与恢复步骤见[部署手册](docs/deployment.md)。开发环境也可使用 `podman compose` 或 `docker compose` 启动 PostgreSQL 与应用。
+
 ## 当前管理端能力
 
 - 首次安装、管理员登录、会话恢复和退出。
