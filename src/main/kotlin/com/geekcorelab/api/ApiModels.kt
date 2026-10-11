@@ -15,6 +15,7 @@ data class ResourceRequest(
     val tags: List<String>? = emptyList(),
     val ownerEmail: String? = null,
 )
+data class ResourcePauseRequest(val paused: Boolean?)
 data class ResourceResponse(
     val id: String,
     val projectId: String,

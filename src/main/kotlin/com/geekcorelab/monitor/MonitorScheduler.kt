@@ -74,11 +74,12 @@ class MonitorScheduler {
             }
             tasks.forEach { task ->
                 connection.prepareStatement(
-                    "INSERT INTO check_execution(id, monitor_id, scheduled_at, started_at, result_status) VALUES (?, ?, ?, now(), 'RUNNING')",
+                    "INSERT INTO check_execution(id, monitor_id, scheduled_at, started_at, result_status, interval_seconds) VALUES (?, ?, ?, now(), 'RUNNING', ?)",
                 ).use { statement ->
                     statement.setObject(1, task.executionId)
                     statement.setObject(2, task.id)
                     statement.setObject(3, java.sql.Timestamp.from(task.scheduledAt))
+                    statement.setInt(4, task.intervalSeconds)
                     statement.executeUpdate()
                 }
                 connection.prepareStatement(

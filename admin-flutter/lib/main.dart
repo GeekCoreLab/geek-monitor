@@ -1128,6 +1128,20 @@ class _DashboardShellState extends State<_DashboardShell> {
     }
   }
 
+  Future<void> _toggleResourcePause(Map<String, dynamic> resource) async {
+    final paused = resource['paused'] == true;
+    try {
+      await widget.api.setResourcePaused(
+        resource['id'] as String,
+        paused: !paused,
+      );
+      await _reload();
+      if (mounted) _notice(paused ? '资源监控已恢复' : '资源监控已暂停');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
   Future<void> _showResourceMetrics(Map<String, dynamic> resource) async {
     try {
       final result = await widget.api.resourceMetrics(resource['id'] as String);
@@ -1318,6 +1332,7 @@ class _DashboardShellState extends State<_DashboardShell> {
         onCreate: _createResource,
         onDelete: _deleteResource,
         onMetrics: _showResourceMetrics,
+        onTogglePause: _toggleResourcePause,
       ),
       _Section.monitors => _MonitorsPage(
         monitors: _monitors,
@@ -1361,11 +1376,20 @@ class _DashboardShellState extends State<_DashboardShell> {
 
   Future<void> _showMonitorHistory(Map<String, dynamic> monitor) async {
     try {
-      final results = await widget.api.checkResults(monitor['id'] as String);
+      final monitorId = monitor['id'] as String;
+      final data = await Future.wait<Object>([
+        widget.api.checkResults(monitorId),
+        widget.api.monitorAvailability(monitorId),
+      ]);
       if (!mounted) return;
       showDialog<void>(
         context: context,
-        builder: (_) => _CheckHistoryDialog(monitor: monitor, results: results),
+        builder: (_) => _CheckHistoryDialog(
+          api: widget.api,
+          monitor: monitor,
+          results: data[0] as List<Map<String, dynamic>>,
+          availability: data[1] as Map<String, dynamic>,
+        ),
       );
     } catch (error) {
       if (mounted) _notice(error.toString(), isError: true);
@@ -2175,6 +2199,7 @@ class _ResourcesPage extends StatelessWidget {
     required this.onCreate,
     required this.onDelete,
     required this.onMetrics,
+    required this.onTogglePause,
   });
 
   final List<Map<String, dynamic>> resources;
@@ -2183,6 +2208,7 @@ class _ResourcesPage extends StatelessWidget {
   final VoidCallback onCreate;
   final ValueChanged<Map<String, dynamic>> onDelete;
   final ValueChanged<Map<String, dynamic>> onMetrics;
+  final ValueChanged<Map<String, dynamic>> onTogglePause;
 
   @override
   Widget build(BuildContext context) => _PageScroll(
@@ -2300,6 +2326,24 @@ class _ResourcesPage extends StatelessWidget {
                                   Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
+                                      IconButton(
+                                        tooltip: resource['paused'] == true
+                                            ? '恢复监控'
+                                            : '暂停监控',
+                                        onPressed: () =>
+                                            onTogglePause(resource),
+                                        icon: Icon(
+                                          resource['paused'] == true
+                                              ? Icons
+                                                    .play_circle_outline_rounded
+                                              : Icons
+                                                    .pause_circle_outline_rounded,
+                                          color: resource['paused'] == true
+                                              ? const Color(0xFFB47B32)
+                                              : _muted,
+                                          size: 18,
+                                        ),
+                                      ),
                                       if (const {
                                         'HOST',
                                         'DATABASE',
@@ -5569,65 +5613,248 @@ class _CheckResultDialog extends StatelessWidget {
   }
 }
 
-class _CheckHistoryDialog extends StatelessWidget {
-  const _CheckHistoryDialog({required this.monitor, required this.results});
+class _CheckHistoryDialog extends StatefulWidget {
+  const _CheckHistoryDialog({
+    required this.api,
+    required this.monitor,
+    required this.results,
+    required this.availability,
+  });
+
+  final ApiClient api;
   final Map<String, dynamic> monitor;
   final List<Map<String, dynamic>> results;
 
+  final Map<String, dynamic> availability;
+
+  @override
+  State<_CheckHistoryDialog> createState() => _CheckHistoryDialogState();
+}
+
+class _CheckHistoryDialogState extends State<_CheckHistoryDialog> {
+  late Map<String, dynamic> _availability = widget.availability;
+  int _rangeDays = 1;
+  bool _loadingAvailability = false;
+
+  Future<void> _loadAvailability(int days) async {
+    setState(() {
+      _rangeDays = days;
+      _loadingAvailability = true;
+    });
+    try {
+      final value = await widget.api.monitorAvailability(
+        widget.monitor['id'] as String,
+        rangeDays: days,
+      );
+      if (mounted) setState(() => _availability = value);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    } finally {
+      if (mounted) setState(() => _loadingAvailability = false);
+    }
+  }
+
+  String _percentage(String key) {
+    if (_availability['ready'] != true) return '汇总中';
+    final value = _availability[key];
+    return value is num ? '${value.toStringAsFixed(2)}%' : '无数据';
+  }
+
+  String _duration(String key) {
+    if (_availability['ready'] != true) return '汇总中';
+    final seconds = _availability[key];
+    if (seconds is! num) return '—';
+    final duration = Duration(seconds: seconds.toInt());
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60);
+    return hours > 0 ? '$hours小时$minutes分' : '$minutes分';
+  }
+
   @override
   Widget build(BuildContext context) => AlertDialog(
-    title: Text('${monitor['name']} · 检查历史'),
+    title: Text('${widget.monitor['name']} · 检查历史'),
     content: SizedBox(
-      width: 620,
-      height: 440,
-      child: results.isEmpty
-          ? const _EmptyState(
-              icon: Icons.history_rounded,
-              title: '还没有检查结果',
-              subtitle: '首次运行后，最近执行记录会显示在这里。',
-            )
-          : ListView.separated(
-              itemCount: results.length,
-              separatorBuilder: (_, _) => const Divider(height: 1),
-              itemBuilder: (context, index) {
-                final result = results[index];
-                final success = result['status'] == 'UP';
-                final unknown = result['status'] == 'UNKNOWN';
-                final color = success
-                    ? const Color(0xFF2C8B66)
-                    : result['status'] == 'RUNNING'
-                    ? const Color(0xFF7C6CAC)
-                    : unknown
-                    ? const Color(0xFF7B8794)
-                    : const Color(0xFFB44438);
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 9),
-                  child: Row(
-                    children: [
-                      Icon(
-                        success
-                            ? Icons.check_circle_outline
-                            : unknown
-                            ? Icons.help_outline_rounded
-                            : Icons.error_outline,
-                        color: color,
-                        size: 17,
+      width: 650,
+      height: 590,
+      child: Column(
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  '可用率统计',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+                ),
+              ),
+              DropdownButton<int>(
+                value: _rangeDays,
+                onChanged: _loadingAvailability
+                    ? null
+                    : (value) {
+                        if (value != null) _loadAvailability(value);
+                      },
+                items: const [
+                  DropdownMenuItem(value: 1, child: Text('24 小时')),
+                  DropdownMenuItem(value: 7, child: Text('7 天')),
+                  DropdownMenuItem(value: 30, child: Text('30 天')),
+                  DropdownMenuItem(value: 180, child: Text('180 天')),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(13),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF4F7FA),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: const Color(0xFFE5EAF0)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: _AvailabilityValue(
+                        label: '可用率',
+                        value: _percentage('availabilityPercent'),
+                        color: const Color(0xFF2C8B66),
                       ),
-                      const SizedBox(width: 9),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                    ),
+                    Expanded(
+                      child: _AvailabilityValue(
+                        label: '数据覆盖率',
+                        value: _percentage('coveragePercent'),
+                        color: _blue,
+                      ),
+                    ),
+                    if (_loadingAvailability)
+                      const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 11),
+                SizedBox(
+                  height: 16,
+                  width: double.infinity,
+                  child: CustomPaint(
+                    painter: _AvailabilityTimelinePainter(
+                      points:
+                          (_availability['points'] as List?)
+                              ?.whereType<Map>()
+                              .map((point) => Map<String, dynamic>.from(point))
+                              .toList() ??
+                          const [],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 14,
+                  runSpacing: 5,
+                  children: [
+                    _AvailabilityLegend('可用', const Color(0xFF52A780)),
+                    _AvailabilityLegend('DOWN', const Color(0xFFC6534A)),
+                    _AvailabilityLegend('UNKNOWN', const Color(0xFFAAB4C0)),
+                    _AvailabilityLegend('维护/暂停', const Color(0xFFE1AC52)),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '可用 ${_duration('upSeconds')}（降级 ${_duration('degradedSeconds')}） · '
+                  'DOWN ${_duration('downSeconds')} · UNKNOWN ${_duration('unknownSeconds')} · '
+                  '维护/暂停 ${_duration('excludedSeconds')}',
+                  style: const TextStyle(color: _muted, fontSize: 10),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  _availability['ready'] == true
+                      ? '按 UTC 整点小时统计；降级计入可用时长。'
+                      : '历史小时数据正在补齐，完成前的百分比暂不显示。',
+                  style: const TextStyle(color: _muted, fontSize: 10),
+                ),
+              ],
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 10),
+            child: Divider(height: 1),
+          ),
+          const Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              '最近检查记录',
+              style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Expanded(
+            child: widget.results.isEmpty
+                ? const _EmptyState(
+                    icon: Icons.history_rounded,
+                    title: '还没有检查结果',
+                    subtitle: '首次运行后，最近执行记录会显示在这里。',
+                  )
+                : ListView.separated(
+                    itemCount: widget.results.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final result = widget.results[index];
+                      final success = result['status'] == 'UP';
+                      final unknown = result['status'] == 'UNKNOWN';
+                      final color = success
+                          ? const Color(0xFF2C8B66)
+                          : result['status'] == 'RUNNING'
+                          ? const Color(0xFF7C6CAC)
+                          : unknown
+                          ? const Color(0xFF7B8794)
+                          : const Color(0xFFB44438);
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 9),
+                        child: Row(
                           children: [
-                            Text(
-                              '${result['status']}  ·  ${_dateTime(result['scheduledAt'] as String?)}',
-                              style: const TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
+                            Icon(
+                              success
+                                  ? Icons.check_circle_outline
+                                  : unknown
+                                  ? Icons.help_outline_rounded
+                                  : Icons.error_outline,
+                              color: color,
+                              size: 17,
+                            ),
+                            const SizedBox(width: 9),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    '${result['status']}  ·  ${_dateTime(result['scheduledAt'] as String?)}',
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    (result['summary'] as String?) ?? '检查完成',
+                                    style: const TextStyle(
+                                      color: _muted,
+                                      fontSize: 10,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                            const SizedBox(height: 3),
                             Text(
-                              (result['summary'] as String?) ?? '检查完成',
+                              '${result['durationMs'] ?? '—'} ms',
                               style: const TextStyle(
                                 color: _muted,
                                 fontSize: 10,
@@ -5635,16 +5862,12 @@ class _CheckHistoryDialog extends StatelessWidget {
                             ),
                           ],
                         ),
-                      ),
-                      Text(
-                        '${result['durationMs'] ?? '—'} ms',
-                        style: const TextStyle(color: _muted, fontSize: 10),
-                      ),
-                    ],
+                      );
+                    },
                   ),
-                );
-              },
-            ),
+          ),
+        ],
+      ),
     ),
     actions: [
       TextButton(
@@ -5653,6 +5876,108 @@ class _CheckHistoryDialog extends StatelessWidget {
       ),
     ],
   );
+}
+
+class _AvailabilityValue extends StatelessWidget {
+  const _AvailabilityValue({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(label, style: const TextStyle(color: _muted, fontSize: 10)),
+      const SizedBox(height: 3),
+      Text(
+        value,
+        style: TextStyle(
+          color: color,
+          fontSize: 19,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    ],
+  );
+}
+
+class _AvailabilityLegend extends StatelessWidget {
+  const _AvailabilityLegend(this.label, this.color);
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Container(
+        width: 8,
+        height: 8,
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(2),
+        ),
+      ),
+      const SizedBox(width: 5),
+      Text(label, style: const TextStyle(color: _muted, fontSize: 9)),
+    ],
+  );
+}
+
+class _AvailabilityTimelinePainter extends CustomPainter {
+  _AvailabilityTimelinePainter({required this.points});
+
+  final List<Map<String, dynamic>> points;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.isEmpty) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(5)),
+        Paint()..color = const Color(0xFFE0E5EB),
+      );
+      return;
+    }
+    final colors = <String, Color>{
+      'upSeconds': const Color(0xFF52A780),
+      'downSeconds': const Color(0xFFC6534A),
+      'unknownSeconds': const Color(0xFFAAB4C0),
+      'excludedSeconds': const Color(0xFFE1AC52),
+    };
+    final keys = colors.keys.toList();
+    final paint = Paint();
+    for (var index = 0; index < points.length; index++) {
+      final point = points[index];
+      final scheduled = (point['scheduledSeconds'] as num?)?.toDouble() ?? 0;
+      if (scheduled <= 0) continue;
+      var left = size.width * index / points.length;
+      final right = size.width * (index + 1) / points.length;
+      for (final key in keys) {
+        final seconds = (point[key] as num?)?.toDouble() ?? 0;
+        if (seconds <= 0) continue;
+        final next =
+            (left +
+                    (right - size.width * index / points.length) *
+                        seconds /
+                        scheduled)
+                .clamp(left, right);
+        paint.color = colors[key]!;
+        canvas.drawRect(Rect.fromLTRB(left, 0, next, size.height), paint);
+        left = next;
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _AvailabilityTimelinePainter oldDelegate) =>
+      oldDelegate.points != points;
 }
 
 class _DialogInfoRow extends StatelessWidget {

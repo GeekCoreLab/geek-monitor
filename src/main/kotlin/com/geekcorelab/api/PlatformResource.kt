@@ -6,6 +6,7 @@ import jakarta.inject.Inject
 import jakarta.ws.rs.Consumes
 import jakarta.ws.rs.DELETE
 import jakarta.ws.rs.GET
+import jakarta.ws.rs.PATCH
 import jakarta.ws.rs.POST
 import jakarta.ws.rs.Path
 import jakarta.ws.rs.PathParam
@@ -266,6 +267,36 @@ class PlatformResource {
         }
         val created = getResource(id, user.id) ?: return error(Response.Status.INTERNAL_SERVER_ERROR, "RESOURCE_LOAD_FAILED", "资源已创建，但无法读取")
         return Response.status(Response.Status.CREATED).entity(created).build()
+    }
+
+    @PATCH
+    @Path("/resources/{id}/pause")
+    fun setResourcePaused(
+        @PathParam("id") idText: String,
+        request: ResourcePauseRequest,
+        @Context headers: HttpHeaders,
+    ): Response {
+        val user = authenticator.currentUser(headers)
+            ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        if (user.role == "READ_ONLY") return error(Response.Status.FORBIDDEN, "READ_ONLY", "只读成员不能暂停资源")
+        val id = runCatching { UUID.fromString(idText) }.getOrNull()
+            ?: return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "资源编号无效")
+        val paused = request.paused ?: return error(Response.Status.BAD_REQUEST, "INVALID_PAUSE_STATE", "请指定暂停状态")
+        val updated = dataSource.connection.use { connection ->
+            connection.prepareStatement(
+                """UPDATE monitored_resource r SET paused = ?, updated_at = now()
+                   WHERE r.id = ? AND r.deleted_at IS NULL
+                     AND EXISTS (SELECT 1 FROM project_membership pm WHERE pm.project_id = r.project_id AND pm.user_id = ?)""",
+            ).use { statement ->
+                statement.setBoolean(1, paused)
+                statement.setObject(2, id)
+                statement.setObject(3, user.id)
+                statement.executeUpdate()
+            }
+        }
+        if (updated != 1) return error(Response.Status.NOT_FOUND, "RESOURCE_NOT_FOUND", "资源不存在或无权访问")
+        return getResource(id, user.id)?.let { Response.ok(it).build() }
+            ?: error(Response.Status.INTERNAL_SERVER_ERROR, "RESOURCE_LOAD_FAILED", "无法读取已更新的资源")
     }
 
     @DELETE
