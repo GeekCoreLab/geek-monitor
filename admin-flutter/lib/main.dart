@@ -2462,7 +2462,7 @@ class _AgentsPage extends StatelessWidget {
         _PageHeading(
           eyebrow: 'LINUX AGENTS',
           title: 'Agent 节点',
-          subtitle: '查看节点在线状态、配置版本并单独吊销节点凭据。',
+          subtitle: '注册 Linux Agent，并生成从 GitHub Release 安装的命令。',
           actions: [
             if (isAdmin)
               FilledButton.icon(
@@ -2506,7 +2506,7 @@ class _AgentsPage extends StatelessWidget {
                     child: _EmptyState(
                       icon: Icons.memory_outlined,
                       title: '还没有 Agent 节点',
-                      subtitle: '为主机资源签发一次性注册令牌，然后在 Linux 主机运行采集器。',
+                      subtitle: '点击右上角“注册主机 Agent”。签发令牌后会显示可复制的 Linux 安装命令。',
                     ),
                   )
                 else
@@ -2655,7 +2655,7 @@ class _AgentResourceDialogState extends State<_AgentResourceDialog> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text(
-            '选择要绑定的主机资源。令牌一次有效，15 分钟后过期。',
+            '选择要绑定的主机资源。继续后会签发 15 分钟内有效的一次性令牌，并生成可复制的 Linux 安装命令。',
             style: TextStyle(fontSize: 12, height: 1.5),
           ),
           const SizedBox(height: 14),
@@ -2686,7 +2686,7 @@ class _AgentResourceDialogState extends State<_AgentResourceDialog> {
       ),
       FilledButton(
         onPressed: () => Navigator.pop(context, _resourceId),
-        child: const Text('签发令牌'),
+        child: const Text('签发令牌并生成命令'),
       ),
     ],
   );
