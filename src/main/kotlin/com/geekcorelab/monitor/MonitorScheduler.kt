@@ -4,9 +4,11 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.geekcorelab.api.CheckResponse
 import com.geekcorelab.notification.NotificationOutbox
+import io.quarkus.runtime.StartupEvent
 import io.quarkus.scheduler.Scheduled
 import jakarta.annotation.PreDestroy
 import jakarta.enterprise.context.ApplicationScoped
+import jakarta.enterprise.event.Observes
 import jakarta.inject.Inject
 import java.sql.Connection
 import java.sql.ResultSet
@@ -27,6 +29,7 @@ class MonitorScheduler {
     @Inject lateinit var checker: ProtocolCheckService
     @Inject lateinit var notificationOutbox: NotificationOutbox
 
+    private val instanceId = UUID.randomUUID()
     private val threadNumber = AtomicInteger()
     private val executor = ThreadPoolExecutor(
         16,
@@ -49,6 +52,64 @@ class MonitorScheduler {
                 persistResult(task, CheckResponse("UNKNOWN", null, "EXECUTOR_BUSY", "检查执行队列已满", 0, Instant.now().toString()))
             }
         }
+    }
+
+    @Scheduled(every = "10s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
+    fun recoverInterruptedExecutions() {
+        val criticalResources = mutableSetOf<UUID>()
+        dataSource.connection.use { connection ->
+            connection.autoCommit = false
+            try {
+                connection.prepareStatement(
+                    """WITH interrupted AS (
+                           UPDATE check_execution execution
+                           SET finished_at = now(), result_status = 'UNKNOWN', error_code = 'EXECUTION_INTERRUPTED',
+                               error_summary = '检查执行中断，结果未知',
+                               duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (now() - COALESCE(execution.started_at, execution.scheduled_at))) * 1000)::BIGINT)
+                           FROM monitor m
+                           WHERE execution.monitor_id = m.id AND execution.result_status = 'RUNNING'
+                             AND (execution.execution_owner IS NULL OR execution.execution_owner <> ?
+                                  OR (execution.started_at IS NOT NULL AND execution.started_at < now() - ((m.timeout_seconds + ?) * INTERVAL '1 second')))
+                           RETURNING execution.monitor_id, execution.scheduled_at
+                       ), stale_monitors AS (
+                           SELECT monitor_id, MAX(scheduled_at) AS scheduled_at
+                           FROM interrupted GROUP BY monitor_id
+                       )
+                       UPDATE monitor m
+                       SET current_state = CASE WHEN m.current_state IN ('DOWN', 'DEGRADED') THEN m.current_state ELSE 'UNKNOWN' END,
+                           consecutive_failures = 0, consecutive_successes = 0, last_result_at = now(),
+                           next_run_at = CASE WHEN NOT EXISTS (
+                               SELECT 1 FROM check_execution active
+                               WHERE active.monitor_id = m.id AND active.result_status = 'RUNNING'
+                                 AND active.execution_owner = ?
+                                 AND (active.started_at IS NULL OR active.started_at >= now() - ((m.timeout_seconds + ?) * INTERVAL '1 second'))
+                           ) THEN now() ELSE m.next_run_at END,
+                           updated_at = now()
+                       FROM stale_monitors stale
+                       WHERE m.id = stale.monitor_id AND m.enabled AND m.deleted_at IS NULL
+                       RETURNING m.resource_id, m.critical""",
+                ).use { statement ->
+                    statement.setObject(1, instanceId)
+                    statement.setInt(2, INTERRUPTED_EXECUTION_GRACE_SECONDS)
+                    statement.setObject(3, instanceId)
+                    statement.setInt(4, INTERRUPTED_EXECUTION_GRACE_SECONDS)
+                    statement.executeQuery().use { rows ->
+                        while (rows.next()) {
+                            if (rows.getBoolean("critical")) criticalResources += rows.getObject("resource_id", UUID::class.java)
+                        }
+                    }
+                }
+                criticalResources.forEach { updateResourceHealth(connection, it) }
+                connection.commit()
+            } catch (exception: Exception) {
+                connection.rollback()
+                throw exception
+            }
+        }
+    }
+
+    fun recoverAfterStartup(@Observes event: StartupEvent) {
+        recoverInterruptedExecutions()
     }
 
     @PreDestroy
@@ -74,12 +135,13 @@ class MonitorScheduler {
             }
             tasks.forEach { task ->
                 connection.prepareStatement(
-                    "INSERT INTO check_execution(id, monitor_id, scheduled_at, result_status, interval_seconds) VALUES (?, ?, ?, 'RUNNING', ?)",
+                    "INSERT INTO check_execution(id, monitor_id, scheduled_at, result_status, interval_seconds, execution_owner) VALUES (?, ?, ?, 'RUNNING', ?, ?)",
                 ).use { statement ->
                     statement.setObject(1, task.executionId)
                     statement.setObject(2, task.id)
                     statement.setObject(3, java.sql.Timestamp.from(task.scheduledAt))
                     statement.setInt(4, task.intervalSeconds)
+                    statement.setObject(5, instanceId)
                     statement.executeUpdate()
                 }
                 connection.prepareStatement(
@@ -149,8 +211,8 @@ class MonitorScheduler {
                 val processedAt = connection.prepareStatement("SELECT now()").use { statement ->
                     statement.executeQuery().use { rows -> rows.next(); rows.getTimestamp(1).toInstant() }
                 }
-                connection.prepareStatement(
-                    "UPDATE check_execution SET finished_at = ?, result_status = ?, error_code = ?, error_summary = ?, duration_ms = ?, http_status = ? WHERE id = ?",
+                val updatedExecution = connection.prepareStatement(
+                    "UPDATE check_execution SET finished_at = ?, result_status = ?, error_code = ?, error_summary = ?, duration_ms = ?, http_status = ? WHERE id = ? AND result_status = 'RUNNING'",
                 ).use { statement ->
                     statement.setObject(1, java.sql.Timestamp.from(processedAt))
                     statement.setString(2, result.status)
@@ -159,7 +221,11 @@ class MonitorScheduler {
                     statement.setLong(5, result.durationMs)
                     if (result.statusCode == null) statement.setNull(6, java.sql.Types.INTEGER) else statement.setInt(6, result.statusCode)
                     statement.setObject(7, task.executionId)
-                    statement.executeUpdate()
+                    statement.executeUpdate() == 1
+                }
+                if (!updatedExecution) {
+                    connection.commit()
+                    return
                 }
                 if (task.type in DATABASE_MONITOR_TYPES && result.status == "UP" && result.metrics.isNotEmpty()) {
                     persistDatabaseMetricSamples(connection, task, result)
@@ -712,6 +778,7 @@ class MonitorScheduler {
     )
 
     companion object {
+        private const val INTERRUPTED_EXECUTION_GRACE_SECONDS = 30
         private const val MAX_CLAIM_PER_TICK = 500
         private val DATABASE_MONITOR_TYPES = setOf("POSTGRESQL", "MYSQL", "REDIS")
     }
