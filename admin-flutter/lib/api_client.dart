@@ -155,6 +155,62 @@ class ApiClient {
     );
   }
 
+  Future<List<Map<String, dynamic>>> projectCredentials(
+    String projectId,
+  ) async => _asMapList(
+    await _send(
+      'GET',
+      '/api/v1/projects/${Uri.encodeComponent(projectId)}/credentials',
+    ),
+  );
+
+  Future<Map<String, dynamic>> createProjectCredential({
+    required String projectId,
+    required String name,
+    required Map<String, String> headers,
+    required List<String> allowedOrigins,
+  }) async =>
+      (await _send(
+            'POST',
+            '/api/v1/projects/${Uri.encodeComponent(projectId)}/credentials',
+            body: {
+              'name': name,
+              'headers': headers,
+              'allowedOrigins': allowedOrigins,
+            },
+          ))
+          as Map<String, dynamic>;
+
+  Future<Map<String, dynamic>> updateProjectCredential({
+    required String projectId,
+    required String id,
+    required String name,
+    required Map<String, String> headers,
+    required List<String> allowedOrigins,
+    required int version,
+  }) async =>
+      (await _send(
+            'PATCH',
+            '/api/v1/projects/${Uri.encodeComponent(projectId)}/credentials/${Uri.encodeComponent(id)}',
+            body: {
+              'name': name,
+              'headers': headers,
+              'allowedOrigins': allowedOrigins,
+              'version': version,
+            },
+          ))
+          as Map<String, dynamic>;
+
+  Future<void> deleteProjectCredential({
+    required String projectId,
+    required String id,
+  }) async {
+    await _send(
+      'DELETE',
+      '/api/v1/projects/${Uri.encodeComponent(projectId)}/credentials/${Uri.encodeComponent(id)}',
+    );
+  }
+
   Future<List<Map<String, dynamic>>> resources({String? projectId}) async {
     final query = projectId == null
         ? ''

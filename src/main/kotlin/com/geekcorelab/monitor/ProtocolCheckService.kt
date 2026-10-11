@@ -1,8 +1,10 @@
 package com.geekcorelab.monitor
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.JsonNode
 import com.geekcorelab.api.CheckResponse
 import com.geekcorelab.api.MetricCatalog
+import com.geekcorelab.api.ProjectCredentialOrigins
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import java.net.ConnectException
@@ -38,22 +40,10 @@ class ProtocolCheckService {
     @Inject lateinit var networkChecker: NetworkCheckService
     @Inject lateinit var databaseChecker: DatabaseCheckService
     @Inject lateinit var dataSource: DataSource
+    @Inject lateinit var objectMapper: ObjectMapper
 
     fun execute(type: String, config: JsonNode, timeoutSeconds: Int): CheckResponse = when (type.uppercase()) {
-        "HTTP" -> httpChecker.execute(
-            config.path("url").asText(),
-            config.path("method").asText("GET"),
-            timeoutSeconds,
-            config.path("expectedStatusCodes").map { it.asInt() }.toSet().ifEmpty { (200..299).toSet() },
-            config.path("textContains").takeUnless { it.isMissingNode || it.isNull }?.asText(),
-            config.path("jsonPath").takeUnless { it.isMissingNode || it.isNull }?.asText(),
-            config.path("jsonExpectedValue").takeUnless { it.isMissingNode || it.isNull }?.asText(),
-            config.path("allowPostNoSideEffects").asBoolean(false),
-            config.path("requestHeadersEncrypted").let { headers ->
-                if (headers.isObject) headers.fieldNames().asSequence().associateWith { headers.path(it).asText() }
-                else emptyMap()
-            },
-        )
+        "HTTP" -> http(config, timeoutSeconds)
         "TCP" -> networkChecker.tcp(config.path("host").asText(), config.path("port").asInt(), timeoutSeconds)
         "DNS" -> networkChecker.dns(
             config.path("host").asText(),
@@ -78,6 +68,72 @@ class ProtocolCheckService {
         "AGENT_OFFLINE" -> agentOffline(config)
         else -> CheckResponse("UNKNOWN", null, "UNSUPPORTED_CHECK", "不支持此监控类型", 0, Instant.now().toString())
     }
+
+    private fun http(config: JsonNode, timeoutSeconds: Int): CheckResponse {
+        val inlineHeaders = config.path("requestHeadersEncrypted").let { headers ->
+            if (headers.isObject) headers.fieldNames().asSequence().associateWith { headers.path(it).asText() }
+            else emptyMap()
+        }
+        val credentialIdText = config.path("credentialId").takeUnless { it.isMissingNode || it.isNull }
+            ?.asText()?.takeIf(String::isNotBlank)
+        val referencedHeaders = if (credentialIdText == null) emptyMap() else {
+            val credentialId = runCatching { UUID.fromString(credentialIdText) }.getOrNull()
+                ?: return invalidCredentialReference()
+            val resourceId = runCatching { UUID.fromString(config.path("resourceId").asText()) }.getOrNull()
+                ?: return invalidCredentialReference()
+            val credentialData = dataSource.connection.use { connection ->
+                connection.prepareStatement(
+                    "SELECT c.encrypted_headers::text, c.allowed_origins::text FROM project_credential c JOIN monitored_resource r ON r.project_id = c.project_id WHERE c.id = ? AND r.id = ? AND r.deleted_at IS NULL",
+                ).use { statement ->
+                    statement.setObject(1, credentialId)
+                    statement.setObject(2, resourceId)
+                    statement.executeQuery().use { rows ->
+                        if (rows.next()) rows.getString(1) to rows.getString(2) else null
+                    }
+                }
+            } ?: return invalidCredentialReference()
+            val allowedOrigins = runCatching { objectMapper.readTree(credentialData.second) }
+                .getOrNull()?.takeIf { it.isArray }?.map { it.asText() }
+                ?: return invalidCredentialReference()
+            val targetOrigin = ProjectCredentialOrigins.fromUrl(config.path("url").asText())
+                ?: return invalidCredentialReference()
+            if (targetOrigin !in allowedOrigins) return forbiddenCredentialOrigin()
+            runCatching {
+                val headers = objectMapper.readTree(credentialData.first)
+                if (headers.isObject) headers.fieldNames().asSequence().associateWith { headers.path(it).asText() }
+                else return invalidCredentialReference()
+            }.getOrElse { return invalidCredentialReference() }
+        }
+        return httpChecker.execute(
+            config.path("url").asText(),
+            config.path("method").asText("GET"),
+            timeoutSeconds,
+            config.path("expectedStatusCodes").map { it.asInt() }.toSet().ifEmpty { (200..299).toSet() },
+            config.path("textContains").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            config.path("jsonPath").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            config.path("jsonExpectedValue").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            config.path("allowPostNoSideEffects").asBoolean(false),
+            referencedHeaders + inlineHeaders,
+        )
+    }
+
+    private fun invalidCredentialReference() = CheckResponse(
+        "UNKNOWN",
+        null,
+        "CREDENTIAL_REFERENCE_INVALID",
+        "HTTP 凭据引用无效",
+        0,
+        Instant.now().toString(),
+    )
+
+    private fun forbiddenCredentialOrigin() = CheckResponse(
+        "UNKNOWN",
+        null,
+        "CREDENTIAL_ORIGIN_FORBIDDEN",
+        "请求目标不在共享凭据的授权源站范围内",
+        0,
+        Instant.now().toString(),
+    )
 
     private fun heartbeat(monitorIdText: String, intervalSeconds: Int, graceSeconds: Int): CheckResponse {
         val started = System.nanoTime()

@@ -914,7 +914,11 @@ class _DashboardShellState extends State<_DashboardShell> {
     }
     final draft = await showDialog<_MonitorDraft>(
       context: context,
-      builder: (_) => _MonitorDialog(resources: _resources, existing: current),
+      builder: (_) => _MonitorDialog(
+        api: widget.api,
+        resources: _resources,
+        existing: current,
+      ),
     );
     if (draft == null) return;
     try {
@@ -2748,9 +2752,9 @@ class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
     final authorityIsSafe =
         uri != null &&
         (RegExp(r'^[A-Za-z0-9.-]+(:[0-9]{1,5})?$').hasMatch(uri.authority) ||
-            RegExp(r'^\[[0-9A-Fa-f:]+\](:[0-9]{1,5})?$').hasMatch(
-              uri.authority,
-            ));
+            RegExp(
+              r'^\[[0-9A-Fa-f:]+\](:[0-9]{1,5})?$',
+            ).hasMatch(uri.authority));
     final pathIsSafe =
         uri != null && RegExp(r'^(/[A-Za-z0-9._/-]*)?$').hasMatch(uri.path);
     if (uri == null ||
@@ -5564,6 +5568,7 @@ class _MonitorDraft {
     required this.target,
     required this.method,
     required this.allowPostNoSideEffects,
+    required this.credentialId,
     required this.port,
     required this.recordType,
     required this.resolver,
@@ -5601,6 +5606,7 @@ class _MonitorDraft {
   final String target;
   final String method;
   final bool allowPostNoSideEffects;
+  final String credentialId;
   final int? port;
   final String? recordType;
   final String? resolver;
@@ -5665,6 +5671,7 @@ class _MonitorDraft {
       'targetUrl': target,
       'method': method,
       'allowPostNoSideEffects': method == 'POST' && allowPostNoSideEffects,
+      'credentialId': credentialId,
       'expectedStatusCodes': expectedStatusCodes,
       'textContains': textContains,
       'jsonPath': jsonPath,
@@ -5686,8 +5693,227 @@ class _MonitorDraft {
   };
 }
 
+class _ProjectCredentialDraft {
+  const _ProjectCredentialDraft({
+    required this.name,
+    required this.headers,
+    required this.allowedOrigins,
+  });
+
+  final String name;
+  final Map<String, String> headers;
+  final List<String> allowedOrigins;
+}
+
+class _ProjectCredentialDialog extends StatefulWidget {
+  const _ProjectCredentialDialog({this.credential});
+
+  final Map<String, dynamic>? credential;
+
+  @override
+  State<_ProjectCredentialDialog> createState() =>
+      _ProjectCredentialDialogState();
+}
+
+class _ProjectCredentialDialogState extends State<_ProjectCredentialDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final _name = TextEditingController(
+    text: widget.credential?['name'] as String? ?? '',
+  );
+  late final _headers = TextEditingController(
+    text: ((widget.credential?['headerNames'] as List?) ?? const [])
+        .map((name) => '$name: ')
+        .join('\n'),
+  );
+  late final _allowedOrigins = TextEditingController(
+    text: ((widget.credential?['allowedOrigins'] as List?) ?? const []).join(
+      '\n',
+    ),
+  );
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _headers.dispose();
+    _allowedOrigins.dispose();
+    super.dispose();
+  }
+
+  Map<String, String>? _parseHeaders() {
+    final parsed = <String, String>{};
+    final seen = <String>{};
+    for (final line in _headers.text.split('\n')) {
+      if (line.trim().isEmpty) continue;
+      final separator = line.indexOf(':');
+      if (separator <= 0) return null;
+      final name = line.substring(0, separator).trim();
+      final value = line.substring(separator + 1).trim();
+      final normalized = name.toLowerCase();
+      if (name.length > 128 ||
+          !RegExp(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$").hasMatch(name) ||
+          const {
+            'host',
+            'content-length',
+            'transfer-encoding',
+            'connection',
+            'keep-alive',
+            'proxy-authenticate',
+            'proxy-authorization',
+            'proxy-connection',
+            'te',
+            'trailer',
+            'upgrade',
+          }.contains(normalized) ||
+          normalized.startsWith('proxy-') ||
+          value.length > 4096 ||
+          value.codeUnits.any(
+            (code) => code < 32 || (code >= 127 && code <= 159),
+          ) ||
+          !seen.add(normalized)) {
+        return null;
+      }
+      parsed[normalized] = value;
+    }
+    if (parsed.length > 32 ||
+        parsed.entries.fold<int>(
+              0,
+              (total, entry) => total + entry.key.length + entry.value.length,
+            ) >
+            16384) {
+      return null;
+    }
+    if (widget.credential == null &&
+        (parsed.isEmpty || parsed.values.every((value) => value.isEmpty))) {
+      return null;
+    }
+    return parsed;
+  }
+
+  List<String>? _parseAllowedOrigins() {
+    final origins = <String>{};
+    for (final line in _allowedOrigins.text.split('\n')) {
+      final value = line.trim();
+      if (value.isEmpty) continue;
+      final uri = Uri.tryParse(value);
+      if (uri == null ||
+          !uri.hasAuthority ||
+          !{'http', 'https'}.contains(uri.scheme.toLowerCase()) ||
+          uri.host.isEmpty ||
+          uri.userInfo.isNotEmpty ||
+          !{'', '/'}.contains(uri.path) ||
+          uri.hasQuery ||
+          uri.hasFragment) {
+        return null;
+      }
+      final port = uri.hasPort ? uri.port : null;
+      if (port != null && (port < 1 || port > 65535)) return null;
+      final scheme = uri.scheme.toLowerCase();
+      final defaultPort =
+          (scheme == 'http' && port == 80) ||
+          (scheme == 'https' && port == 443);
+      final host = uri.host.toLowerCase();
+      final formattedHost = host.contains(':') && !host.startsWith('[')
+          ? '[$host]'
+          : host;
+      origins.add(
+        '$scheme://$formattedHost${port == null || defaultPort ? '' : ':$port'}',
+      );
+    }
+    if (origins.isEmpty || origins.length > 32) return null;
+    return origins.toList();
+  }
+
+  void _save() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.pop(
+      context,
+      _ProjectCredentialDraft(
+        name: _name.text.trim(),
+        headers: _parseHeaders()!,
+        allowedOrigins: _parseAllowedOrigins()!,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.credential == null ? '新建项目共享凭据' : '编辑项目共享凭据'),
+    content: SizedBox(
+      width: 520,
+      child: SingleChildScrollView(
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: _name,
+                maxLength: 100,
+                decoration: const InputDecoration(labelText: '凭据名称'),
+                validator: (value) => value == null || value.trim().isEmpty
+                    ? '请输入凭据名称'
+                    : value.trim().length > 100
+                    ? '名称不能超过 100 个字符'
+                    : null,
+              ),
+              const SizedBox(height: 8),
+              TextFormField(
+                controller: _headers,
+                maxLength: 16384,
+                minLines: 4,
+                maxLines: 8,
+                decoration: InputDecoration(
+                  labelText: 'HTTP 请求头',
+                  hintText: 'Authorization: Bearer …\nX-API-Key: …',
+                  helperText: widget.credential == null
+                      ? '每行填写 Name: value。仅保存 AES-GCM 密文；创建后不会再次显示明文。'
+                      : '已保存的值不回显。留空保留原值，删除整行移除该请求头。',
+                  helperMaxLines: 3,
+                  alignLabelWithHint: true,
+                ),
+                validator: (_) =>
+                    _parseHeaders() == null ? '请求头格式无效、为空、重复或超过限制' : null,
+              ),
+              const SizedBox(height: 8),
+              TextFormField(
+                controller: _allowedOrigins,
+                maxLength: 4096,
+                minLines: 2,
+                maxLines: 5,
+                decoration: const InputDecoration(
+                  labelText: '授权源站范围',
+                  hintText:
+                      'https://api.example.com\nhttps://login.example.com:8443',
+                  helperText: '每行一个精确源站（协议、主机和端口）。请求头只会发送到这些源站。',
+                  helperMaxLines: 2,
+                  alignLabelWithHint: true,
+                ),
+                validator: (_) => _parseAllowedOrigins() == null
+                    ? '至少填写一个有效源站，最多 32 个；不要填写路径、查询参数或片段'
+                    : null,
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(onPressed: _save, child: const Text('保存凭据')),
+    ],
+  );
+}
+
 class _MonitorDialog extends StatefulWidget {
-  const _MonitorDialog({required this.resources, this.existing});
+  const _MonitorDialog({
+    required this.api,
+    required this.resources,
+    this.existing,
+  });
+  final ApiClient api;
   final List<Map<String, dynamic>> resources;
   final Map<String, dynamic>? existing;
 
@@ -5708,6 +5934,10 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   late String _method = widget.existing?['method'] as String? ?? 'GET';
   late bool _allowPostNoSideEffects =
       widget.existing?['allowPostNoSideEffects'] as bool? ?? false;
+  late String _credentialId = widget.existing?['credentialId'] as String? ?? '';
+  List<Map<String, dynamic>> _projectCredentials = [];
+  bool _credentialsLoading = false;
+  String? _credentialsError;
   late String _recordType = widget.existing?['recordType'] as String? ?? 'A';
   late String _metricName =
       widget.existing?['metricName'] as String? ?? 'cpu_usage_percent';
@@ -5791,8 +6021,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     text: widget.existing?['jsonExpectedValue'] as String? ?? '',
   );
   late final _requestHeaders = TextEditingController(
-    text: (widget.existing?['requestHeaders'] as Map? ?? const {})
-        .keys
+    text: (widget.existing?['requestHeaders'] as Map? ?? const {}).keys
         .map((name) => '$name: ')
         .join('\n'),
   );
@@ -5800,6 +6029,171 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   late bool _enabled = widget.existing?['enabled'] as bool? ?? true;
   late bool _databaseTls =
       (widget.existing?['databaseTls'] as bool?) ?? (_type == 'MYSQL');
+
+  @override
+  void initState() {
+    super.initState();
+    _reloadProjectCredentials();
+  }
+
+  String? _projectIdForResource([String? resourceId]) {
+    final selected = widget.resources.firstWhere(
+      (resource) => resource['id'] == (resourceId ?? _resourceId),
+      orElse: () => const <String, dynamic>{},
+    );
+    return selected['projectId'] as String?;
+  }
+
+  Future<void> _reloadProjectCredentials() async {
+    final projectId = _projectIdForResource();
+    if (projectId == null) {
+      setState(() {
+        _projectCredentials = [];
+        _credentialsError = '无法确定资源所属项目';
+        _credentialsLoading = false;
+      });
+      return;
+    }
+    setState(() {
+      _credentialsLoading = true;
+      _credentialsError = null;
+    });
+    try {
+      final values = await widget.api.projectCredentials(projectId);
+      if (!mounted) return;
+      setState(() {
+        _projectCredentials = values;
+        _credentialsLoading = false;
+        if (_credentialId.isNotEmpty &&
+            !values.any((credential) => credential['id'] == _credentialId)) {
+          _credentialId = '';
+        }
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _credentialsError = error.toString();
+        _credentialsLoading = false;
+      });
+    }
+  }
+
+  Future<void> _createProjectCredential() async {
+    final projectId = _projectIdForResource();
+    if (projectId == null) return;
+    final draft = await showDialog<_ProjectCredentialDraft>(
+      context: context,
+      builder: (_) => const _ProjectCredentialDialog(),
+    );
+    if (draft == null) return;
+    try {
+      final credential = await widget.api.createProjectCredential(
+        projectId: projectId,
+        name: draft.name,
+        headers: draft.headers,
+        allowedOrigins: draft.allowedOrigins,
+      );
+      await _reloadProjectCredentials();
+      if (!mounted) return;
+      setState(() => _credentialId = credential['id'] as String);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('项目共享凭据已创建并选中')));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    }
+  }
+
+  Future<void> _editProjectCredential() async {
+    final projectId = _projectIdForResource();
+    final credential = _projectCredentials
+        .cast<Map<String, dynamic>?>()
+        .firstWhere(
+          (value) => value?['id'] == _credentialId,
+          orElse: () => null,
+        );
+    if (projectId == null || credential == null) return;
+    final draft = await showDialog<_ProjectCredentialDraft>(
+      context: context,
+      builder: (_) => _ProjectCredentialDialog(credential: credential),
+    );
+    if (draft == null) return;
+    try {
+      await widget.api.updateProjectCredential(
+        projectId: projectId,
+        id: _credentialId,
+        name: draft.name,
+        headers: draft.headers,
+        allowedOrigins: draft.allowedOrigins,
+        version: credential['version'] as int,
+      );
+      await _reloadProjectCredentials();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('项目共享凭据已更新')));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    }
+  }
+
+  Future<void> _deleteProjectCredential() async {
+    final projectId = _projectIdForResource();
+    final credential = _projectCredentials
+        .cast<Map<String, dynamic>?>()
+        .firstWhere(
+          (value) => value?['id'] == _credentialId,
+          orElse: () => null,
+        );
+    if (projectId == null || credential == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('删除项目共享凭据？'),
+        content: Text('“${credential['name']}”将被删除。仍被监控项引用时，服务端会拒绝删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.api.deleteProjectCredential(
+        projectId: projectId,
+        id: _credentialId,
+      );
+      if (!mounted) return;
+      setState(() => _credentialId = '');
+      await _reloadProjectCredentials();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('项目共享凭据已删除')));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    }
+  }
 
   String _statusText(List? codes) {
     if (codes == null || codes.isEmpty) return '200-299';
@@ -5911,6 +6305,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         _resourceId = compatibleResource['id'] as String;
       }
     });
+    _reloadProjectCredentials();
   }
 
   @override
@@ -5939,7 +6334,11 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                       ),
                     )
                     .toList(),
-                onChanged: (value) => setState(() => _resourceId = value!),
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() => _resourceId = value);
+                  _reloadProjectCredentials();
+                },
               ),
               const SizedBox(height: 11),
               DropdownButtonFormField<String>(
@@ -6133,12 +6532,78 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                   decoration: const InputDecoration(
                     labelText: '自定义请求头（可选）',
                     hintText: 'Accept-Language: zh-CN\nAuthorization: Bearer …',
-                    helperText: '每行填写 Name: value。值会加密保存且读取时隐藏；编辑时留空保留原值，删除整行可移除。',
+                    helperText:
+                        '每行填写 Name: value。值会加密保存且读取时隐藏；编辑时留空保留原值，删除整行可移除。',
                     alignLabelWithHint: true,
                   ),
-                  validator: (_) => _parseRequestHeaders() == null
-                      ? '请求头格式无效、重复或超过限制'
-                      : null,
+                  validator: (_) =>
+                      _parseRequestHeaders() == null ? '请求头格式无效、重复或超过限制' : null,
+                ),
+                const SizedBox(height: 11),
+                DropdownButtonFormField<String>(
+                  initialValue: _credentialId,
+                  decoration: InputDecoration(
+                    labelText: '项目共享 HTTP 凭据',
+                    helperText:
+                        _credentialsError ?? '凭据仅在此项目内可用；同名自定义请求头会覆盖共享值。',
+                    helperMaxLines: 2,
+                  ),
+                  items: [
+                    const DropdownMenuItem(value: '', child: Text('不使用共享凭据')),
+                    if (_credentialId.isNotEmpty &&
+                        !_projectCredentials.any(
+                          (credential) => credential['id'] == _credentialId,
+                        ))
+                      DropdownMenuItem(
+                        value: _credentialId,
+                        child: Text(_credentialsLoading ? '正在加载凭据…' : '凭据不可用'),
+                      ),
+                    ..._projectCredentials.map(
+                      (credential) => DropdownMenuItem(
+                        value: credential['id'] as String,
+                        child: Text(
+                          '${credential['name']} · ${(credential['headerNames'] as List? ?? const []).join(', ')}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ],
+                  onChanged: (value) =>
+                      setState(() => _credentialId = value ?? ''),
+                ),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Wrap(
+                    spacing: 4,
+                    children: [
+                      TextButton.icon(
+                        onPressed: _credentialsLoading
+                            ? null
+                            : _createProjectCredential,
+                        icon: const Icon(Icons.key_outlined, size: 16),
+                        label: const Text('新建共享凭据'),
+                      ),
+                      if (_credentialId.isNotEmpty &&
+                          _projectCredentials.any(
+                            (credential) => credential['id'] == _credentialId,
+                          )) ...[
+                        TextButton.icon(
+                          onPressed: _credentialsLoading
+                              ? null
+                              : _editProjectCredential,
+                          icon: const Icon(Icons.edit_outlined, size: 16),
+                          label: const Text('编辑凭据'),
+                        ),
+                        TextButton.icon(
+                          onPressed: _credentialsLoading
+                              ? null
+                              : _deleteProjectCredential,
+                          icon: const Icon(Icons.delete_outline, size: 16),
+                          label: const Text('删除凭据'),
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
               ] else if (_type != 'HEARTBEAT') ...[
                 TextFormField(
@@ -6583,9 +7048,9 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   void _submit() {
     if (!_formKey.currentState!.validate()) return;
     if (_type == 'HTTP' && _method == 'POST' && !_allowPostNoSideEffects) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('使用 POST 前请确认目标端点无副作用')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('使用 POST 前请确认目标端点无副作用')));
       return;
     }
     final selectedResource = widget.resources.firstWhere(
@@ -6652,6 +7117,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         target: _target.text.trim(),
         method: _method,
         allowPostNoSideEffects: _allowPostNoSideEffects,
+        credentialId: _credentialId,
         port:
             _type == 'TCP' ||
                 _type == 'TLS' ||
@@ -6759,7 +7225,9 @@ class _MonitorDialogState extends State<_MonitorDialog> {
           }.contains(normalizedName) ||
           normalizedName.startsWith('proxy-') ||
           value.length > 4096 ||
-          value.codeUnits.any((code) => code < 32 || (code >= 127 && code <= 159)) ||
+          value.codeUnits.any(
+            (code) => code < 32 || (code >= 127 && code <= 159),
+          ) ||
           !seenNames.add(normalizedName)) {
         return null;
       }

@@ -51,7 +51,7 @@ class MonitorResource {
         val monitors = mutableListOf<MonitorResponse>()
         dataSource.connection.use { connection ->
             connection.prepareStatement(
-                """SELECT m.id, m.resource_id, r.name AS resource_name, m.name, m.type, m.config::text AS config,
+                """SELECT m.id, m.resource_id, m.credential_id, r.name AS resource_name, m.name, m.type, m.config::text AS config,
                     m.interval_seconds, m.timeout_seconds, m.failure_threshold, m.recovery_threshold,
                     m.critical, m.enabled, m.reminder_interval_minutes, m.current_state, m.version, m.last_result_at, m.next_run_at
                     FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id
@@ -86,6 +86,15 @@ class MonitorResource {
             !secretEncryption.isConfigured()) {
             return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置请求头凭据加密密钥")
         }
+        if (request.credentialId?.isNotBlank() == true && !secretEncryption.isConfigured()) {
+            return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置请求头凭据解密密钥")
+        }
+        if (!credentialBelongsToResource(request.credentialId, resourceId)) {
+            return error(Response.Status.BAD_REQUEST, "CREDENTIAL_PROJECT_MISMATCH", "只能引用同一项目中的有效 HTTP 凭据")
+        }
+        if (requestedType == "HTTP" && !credentialAllowsTarget(request.credentialId, request.targetUrl)) {
+            return error(Response.Status.BAD_REQUEST, "CREDENTIAL_ORIGIN_FORBIDDEN", "请求目标不在共享凭据的授权源站范围内")
+        }
         val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔、阈值和重复提醒")
         val resourceType = resourceType(resourceId)
         if ((definition.type == "HEARTBEAT") != (resourceType == "HEARTBEAT")) {
@@ -104,8 +113,8 @@ class MonitorResource {
             try {
                 connection.prepareStatement(
                     """INSERT INTO monitor(id, resource_id, name, type, config, interval_seconds, timeout_seconds,
-                        failure_threshold, recovery_threshold, critical, enabled, reminder_interval_minutes, next_run_at)
-                        VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, ?, now())""",
+                        failure_threshold, recovery_threshold, critical, enabled, reminder_interval_minutes, next_run_at, credential_id)
+                        VALUES (?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?, ?, ?, now(), ?)""",
                 ).use { statement ->
                     statement.setObject(1, id)
                     statement.setObject(2, resourceId)
@@ -119,6 +128,7 @@ class MonitorResource {
                     statement.setBoolean(10, definition.critical)
                     statement.setBoolean(11, definition.enabled)
                     statement.setInt(12, definition.reminderIntervalMinutes)
+                    statement.setObject(13, definition.credentialId)
                     statement.executeUpdate()
                 }
                 if (heartbeatToken != null) {
@@ -180,6 +190,7 @@ class MonitorResource {
         if (requestedType in DATABASE_TYPES && requestedResourceType != "DATABASE") {
             return error(Response.Status.BAD_REQUEST, "DATABASE_RESOURCE_REQUIRED", "数据库检查必须绑定到 DATABASE 资源")
         }
+        val currentConfig = loadMonitorConfig(id)
         if (requestedType in DATABASE_TYPES && !secretEncryption.isConfigured()) {
             return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置数据库凭据加密密钥")
         }
@@ -187,7 +198,16 @@ class MonitorResource {
             !secretEncryption.isConfigured()) {
             return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置请求头凭据加密密钥")
         }
-        val currentConfig = loadMonitorConfig(id)
+        val requestedCredentialId = if (requestedType == "HTTP") requestedCredentialId(request, currentConfig) else null
+        if (requestedCredentialId != null && !secretEncryption.isConfigured()) {
+            return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置请求头凭据解密密钥")
+        }
+        if (!credentialBelongsToResource(requestedCredentialId, requestedResource)) {
+            return error(Response.Status.BAD_REQUEST, "CREDENTIAL_PROJECT_MISMATCH", "只能引用同一项目中的有效 HTTP 凭据")
+        }
+        if (requestedType == "HTTP" && !credentialAllowsTarget(requestedCredentialId, request.targetUrl ?: current.targetUrl)) {
+            return error(Response.Status.BAD_REQUEST, "CREDENTIAL_ORIGIN_FORBIDDEN", "请求目标不在共享凭据的授权源站范围内")
+        }
         val definition = validate(
             request.copy(
                 reminderIntervalMinutes = request.reminderIntervalMinutes ?: current.reminderIntervalMinutes,
@@ -200,7 +220,7 @@ class MonitorResource {
             connection.prepareStatement(
                 """UPDATE monitor SET resource_id = ?, name = ?, type = ?, config = CAST(? AS jsonb), interval_seconds = ?,
                     timeout_seconds = ?, failure_threshold = ?, recovery_threshold = ?, critical = ?, enabled = ?,
-                    reminder_interval_minutes = ?, version = version + 1, next_run_at = now(), updated_at = now()
+                    reminder_interval_minutes = ?, credential_id = ?, version = version + 1, next_run_at = now(), updated_at = now()
                     WHERE id = ? AND version = ? AND deleted_at IS NULL""",
             ).use { statement ->
                 statement.setObject(1, requestedResource)
@@ -214,8 +234,9 @@ class MonitorResource {
                 statement.setBoolean(9, definition.critical)
                 statement.setBoolean(10, definition.enabled)
                 statement.setInt(11, definition.reminderIntervalMinutes)
-                statement.setObject(12, id)
-                statement.setInt(13, request.version)
+                statement.setObject(12, definition.credentialId)
+                statement.setObject(13, id)
+                statement.setInt(14, request.version)
                 statement.executeUpdate()
             }
         }
@@ -289,6 +310,12 @@ class MonitorResource {
         val host = request.targetHost?.trim().orEmpty()
         val method = request.method?.trim()?.uppercase() ?: "GET"
         val allowPostNoSideEffects = request.allowPostNoSideEffects == true
+        val credentialIdText = if (type == "HTTP") {
+            if (request.credentialId != null) request.credentialId.trim().takeIf(String::isNotEmpty)
+            else existingConfig?.path("credentialId")?.takeUnless { it.isMissingNode || it.isNull }?.asText()?.takeIf(String::isNotEmpty)
+        } else request.credentialId?.trim()?.takeIf(String::isNotEmpty)
+        val credentialId = credentialIdText?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+        if ((credentialIdText != null && credentialId == null) || (type != "HTTP" && credentialId != null)) return null
         val interval = request.intervalSeconds ?: if (type == "TLS") 21600 else 60
         val timeout = request.timeoutSeconds ?: when (type) { "DNS" -> 5; "HEARTBEAT", "METRIC_THRESHOLD" -> 1; else -> 10 }
         val heartbeatGraceSeconds = request.heartbeatGraceSeconds ?: DEFAULT_HEARTBEAT_GRACE_SECONDS
@@ -345,8 +372,10 @@ class MonitorResource {
                     expectedCodes.any { it !in 100..599 } || (contains?.length ?: 0) > 500 || !jsonAssertionValid) return null
                 mapOf(
                     "url" to uri.normalize().toASCIIString(),
+                    "resourceId" to request.resourceId,
                     "method" to method,
                     "allowPostNoSideEffects" to allowPostNoSideEffects,
+                    "credentialId" to credentialId?.toString(),
                     "expectedStatusCodes" to expectedCodes,
                     "textContains" to contains,
                     "jsonPath" to jsonPath,
@@ -419,12 +448,13 @@ class MonitorResource {
         return ValidatedDefinition(
             type, name, config, interval, timeout, failures, recoveries,
             request.critical != false, request.enabled != false, reminderInterval, heartbeatGraceSeconds,
+            credentialId,
         )
     }
 
     private fun findMonitor(id: UUID, userId: UUID): MonitorResponse? = dataSource.connection.use { connection ->
         connection.prepareStatement(
-            """SELECT m.id, m.resource_id, r.name AS resource_name, m.name, m.type, m.config::text AS config,
+            """SELECT m.id, m.resource_id, m.credential_id, r.name AS resource_name, m.name, m.type, m.config::text AS config,
                 m.interval_seconds, m.timeout_seconds, m.failure_threshold, m.recovery_threshold,
                 m.critical, m.enabled, m.reminder_interval_minutes, m.current_state, m.version, m.last_result_at, m.next_run_at
                 FROM monitor m JOIN monitored_resource r ON r.id = m.resource_id
@@ -493,6 +523,44 @@ class MonitorResource {
     private fun metricResourceType(metricName: String?): String =
         if (metricName in MetricCatalog.databaseMetricNames) "DATABASE" else "HOST"
 
+    private fun requestedCredentialId(
+        request: MonitorRequest,
+        existingConfig: com.fasterxml.jackson.databind.JsonNode?,
+    ): String? = if (request.credentialId != null) {
+        request.credentialId.trim().takeIf(String::isNotEmpty)
+    } else {
+        existingConfig?.path("credentialId")?.takeUnless { it.isMissingNode || it.isNull }?.asText()?.takeIf(String::isNotEmpty)
+    }
+
+    private fun credentialBelongsToResource(credentialIdText: String?, resourceId: UUID): Boolean {
+        if (credentialIdText.isNullOrBlank()) return true
+        val credentialId = runCatching { UUID.fromString(credentialIdText) }.getOrNull() ?: return false
+        return dataSource.connection.use { connection ->
+            connection.prepareStatement(
+                "SELECT 1 FROM project_credential c JOIN monitored_resource r ON r.project_id = c.project_id WHERE c.id = ? AND r.id = ? AND r.deleted_at IS NULL",
+            ).use { statement ->
+                statement.setObject(1, credentialId)
+                statement.setObject(2, resourceId)
+                statement.executeQuery().use { it.next() }
+            }
+        }
+    }
+
+    private fun credentialAllowsTarget(credentialIdText: String?, targetUrl: String?): Boolean {
+        if (credentialIdText.isNullOrBlank()) return true
+        val credentialId = runCatching { UUID.fromString(credentialIdText) }.getOrNull() ?: return false
+        val targetOrigin = ProjectCredentialOrigins.fromUrl(targetUrl) ?: return false
+        val allowedOriginsJson = dataSource.connection.use { connection ->
+            connection.prepareStatement("SELECT allowed_origins::text FROM project_credential WHERE id = ?").use { statement ->
+                statement.setObject(1, credentialId)
+                statement.executeQuery().use { rows -> if (rows.next()) rows.getString(1) else null }
+            }
+        } ?: return false
+        val allowedOrigins = runCatching { objectMapper.readTree(allowedOriginsJson) }.getOrNull()
+            ?.takeIf { it.isArray }?.map { it.asText() } ?: return false
+        return targetOrigin in allowedOrigins
+    }
+
     private fun encryptedRequestHeaders(config: com.fasterxml.jackson.databind.JsonNode?): Map<String, String> {
         val headers = config?.path("requestHeadersEncrypted") ?: return emptyMap()
         if (!headers.isObject) return emptyMap()
@@ -506,6 +574,7 @@ class MonitorResource {
         return MonitorResponse(
             id = getObject("id").toString(),
             resourceId = getObject("resource_id").toString(),
+            credentialId = getObject("credential_id")?.toString(),
             resourceName = getString("resource_name"),
             name = getString("name"),
             type = type,
@@ -574,6 +643,7 @@ class MonitorResource {
         val enabled: Boolean,
         val reminderIntervalMinutes: Int,
         val heartbeatGraceSeconds: Int,
+        val credentialId: UUID?,
     )
 
     companion object {
