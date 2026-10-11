@@ -82,6 +82,10 @@ class MonitorResource {
         if (requestedType in DATABASE_TYPES && !secretEncryption.isConfigured()) {
             return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置数据库凭据加密密钥")
         }
+        if (requestedType == "HTTP" && request.requestHeaders?.values?.any(String::isNotEmpty) == true &&
+            !secretEncryption.isConfigured()) {
+            return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置请求头凭据加密密钥")
+        }
         val definition = validate(request) ?: return error(Response.Status.BAD_REQUEST, "INVALID_MONITOR", "请检查监控名称、URL、请求方法、间隔、阈值和重复提醒")
         val resourceType = resourceType(resourceId)
         if ((definition.type == "HEARTBEAT") != (resourceType == "HEARTBEAT")) {
@@ -178,6 +182,10 @@ class MonitorResource {
         }
         if (requestedType in DATABASE_TYPES && !secretEncryption.isConfigured()) {
             return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置数据库凭据加密密钥")
+        }
+        if (requestedType == "HTTP" && request.requestHeaders?.values?.any(String::isNotEmpty) == true &&
+            !secretEncryption.isConfigured()) {
+            return error(Response.Status.SERVICE_UNAVAILABLE, "SECRET_ENCRYPTION_UNAVAILABLE", "尚未配置请求头凭据加密密钥")
         }
         val currentConfig = loadMonitorConfig(id)
         val definition = validate(
@@ -324,6 +332,11 @@ class MonitorResource {
         val config: Map<String, Any?> = when (type) {
             "HTTP" -> {
                 val uri = runCatching { URI(targetUrl) }.getOrNull()
+                val encryptedHeaders = HttpRequestHeaderConfig.encrypt(
+                    request.requestHeaders,
+                    encryptedRequestHeaders(existingConfig),
+                    secretEncryption,
+                ) ?: return null
                 if (uri == null || uri.scheme.lowercase() !in setOf("http", "https") || uri.host.isNullOrBlank() ||
                     uri.userInfo != null || uri.fragment != null || (uri.port != -1 && uri.port !in 1..65535) ||
                     method !in setOf("GET", "HEAD") || expectedCodes.isEmpty() || expectedCodes.size > 100 ||
@@ -335,6 +348,7 @@ class MonitorResource {
                     "textContains" to contains,
                     "jsonPath" to jsonPath,
                     "jsonExpectedValue" to jsonExpectedValue,
+                    "requestHeadersEncrypted" to encryptedHeaders,
                 )
             }
             "TCP" -> {
@@ -421,7 +435,7 @@ class MonitorResource {
     }
 
     private fun runCheck(monitor: MonitorResponse): CheckResponse {
-        val config = if (monitor.type in DATABASE_TYPES) {
+        val config = if (monitor.type in DATABASE_TYPES || monitor.type == "HTTP") {
             loadMonitorConfig(UUID.fromString(monitor.id)) ?: objectMapper.createObjectNode()
         } else {
             objectMapper.valueToTree(monitor.toCheckConfig())
@@ -476,6 +490,12 @@ class MonitorResource {
     private fun metricResourceType(metricName: String?): String =
         if (metricName in MetricCatalog.databaseMetricNames) "DATABASE" else "HOST"
 
+    private fun encryptedRequestHeaders(config: com.fasterxml.jackson.databind.JsonNode?): Map<String, String> {
+        val headers = config?.path("requestHeadersEncrypted") ?: return emptyMap()
+        if (!headers.isObject) return emptyMap()
+        return headers.fieldNames().asSequence().associateWith { headers.path(it).asText() }
+    }
+
     private fun ResultSet.toMonitor(): MonitorResponse {
         val config = objectMapper.readTree(getString("config"))
         val type = getString("type")
@@ -502,6 +522,7 @@ class MonitorResource {
             textContains = config.path("textContains").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             jsonPath = config.path("jsonPath").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             jsonExpectedValue = config.path("jsonExpectedValue").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            requestHeaders = HttpRequestHeaderConfig.visibleNames(encryptedRequestHeaders(config)),
             critical = getBoolean("critical"),
             enabled = getBoolean("enabled"),
             reminderIntervalMinutes = getInt("reminder_interval_minutes"),

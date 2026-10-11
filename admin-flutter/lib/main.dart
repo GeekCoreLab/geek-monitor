@@ -91,6 +91,7 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
         colorScheme: colorScheme,
         scaffoldBackgroundColor: _canvas,
         fontFamily: 'Roboto',
+        fontFamilyFallback: const ['NotoSansSC'],
         textTheme: ThemeData.light().textTheme.apply(
           bodyColor: _ink,
           displayColor: _ink,
@@ -5588,6 +5589,7 @@ class _MonitorDraft {
     required this.textContains,
     required this.jsonPath,
     required this.jsonExpectedValue,
+    required this.requestHeaders,
     required this.critical,
     required this.enabled,
   });
@@ -5623,6 +5625,7 @@ class _MonitorDraft {
   final String? textContains;
   final String? jsonPath;
   final String? jsonExpectedValue;
+  final Map<String, String> requestHeaders;
   final bool critical;
   final bool enabled;
 
@@ -5663,6 +5666,7 @@ class _MonitorDraft {
       'textContains': textContains,
       'jsonPath': jsonPath,
       'jsonExpectedValue': jsonExpectedValue,
+      'requestHeaders': requestHeaders,
     },
     if (type == 'TCP') ...{'targetHost': target, 'port': port},
     if (type == 'DNS') ...{
@@ -5781,6 +5785,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   late final _jsonExpectedValue = TextEditingController(
     text: widget.existing?['jsonExpectedValue'] as String? ?? '',
   );
+  late final _requestHeaders = TextEditingController(
+    text: (widget.existing?['requestHeaders'] as Map? ?? const {})
+        .keys
+        .map((name) => '$name: ')
+        .join('\n'),
+  );
   late bool _critical = widget.existing?['critical'] as bool? ?? true;
   late bool _enabled = widget.existing?['enabled'] as bool? ?? true;
   late bool _databaseTls =
@@ -5820,6 +5830,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     _contains.dispose();
     _jsonPath.dispose();
     _jsonExpectedValue.dispose();
+    _requestHeaders.dispose();
     super.dispose();
   }
 
@@ -6087,6 +6098,22 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     helperText: '路径和期望值需同时填写；与正文包含同时设置时，两项都必须匹配。',
                   ),
                   validator: (_) => _validateJsonAssertion(),
+                ),
+                const SizedBox(height: 11),
+                TextFormField(
+                  controller: _requestHeaders,
+                  maxLength: 16384,
+                  minLines: 3,
+                  maxLines: 6,
+                  decoration: const InputDecoration(
+                    labelText: '自定义请求头（可选）',
+                    hintText: 'Accept-Language: zh-CN\nAuthorization: Bearer …',
+                    helperText: '每行填写 Name: value。值会加密保存且读取时隐藏；编辑时留空保留原值，删除整行可移除。',
+                    alignLabelWithHint: true,
+                  ),
+                  validator: (_) => _parseRequestHeaders() == null
+                      ? '请求头格式无效、重复或超过限制'
+                      : null,
                 ),
               ] else if (_type != 'HEARTBEAT') ...[
                 TextFormField(
@@ -6647,6 +6674,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         jsonExpectedValue: _jsonExpectedValue.text.trim().isEmpty
             ? null
             : _jsonExpectedValue.text.trim(),
+        requestHeaders: _parseRequestHeaders()!,
         critical: _critical,
         enabled: _enabled,
       ),
@@ -6670,6 +6698,42 @@ class _MonitorDialogState extends State<_MonitorDialog> {
       return '期望值必须是有效的 JSON 字面量，例如 true、200 或 "ok"';
     }
     return null;
+  }
+
+  Map<String, String>? _parseRequestHeaders() {
+    final headers = <String, String>{};
+    final seenNames = <String>{};
+    for (final line in _requestHeaders.text.split('\n')) {
+      if (line.trim().isEmpty) continue;
+      final separator = line.indexOf(':');
+      if (separator <= 0) return null;
+      final name = line.substring(0, separator).trim();
+      final value = line.substring(separator + 1).trim();
+      final normalizedName = name.toLowerCase();
+      if (name.length > 128 ||
+          !RegExp(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$").hasMatch(name) ||
+          const {
+            'host',
+            'content-length',
+            'transfer-encoding',
+            'connection',
+            'keep-alive',
+            'proxy-authenticate',
+            'proxy-authorization',
+            'proxy-connection',
+            'te',
+            'trailer',
+            'upgrade',
+          }.contains(normalizedName) ||
+          normalizedName.startsWith('proxy-') ||
+          value.length > 4096 ||
+          value.codeUnits.any((code) => code < 32 || (code >= 127 && code <= 159)) ||
+          !seenNames.add(normalizedName)) {
+        return null;
+      }
+      headers[normalizedName] = value;
+    }
+    return headers;
   }
 }
 

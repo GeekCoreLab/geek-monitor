@@ -3,6 +3,14 @@ package com.geekcorelab.monitor
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import com.geekcorelab.security.SecretEncryptionService
+import com.sun.net.httpserver.HttpServer
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.util.Base64
+import java.util.concurrent.atomic.AtomicReference
 
 class HttpCheckServiceTargetPolicyTest {
     @Test
@@ -66,6 +74,54 @@ class HttpCheckServiceTargetPolicyTest {
 
         assertEquals("UNKNOWN", result.status)
         assertEquals("CHECK_CONFIG_INVALID", result.errorCode)
+    }
+
+    @Test
+    fun `HTTP check decrypts configured headers and evaluates JSON response`() {
+        val targetAddress = NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .firstOrNull { it.isSiteLocalAddress && !it.isLoopbackAddress }
+        assumeTrue(targetAddress != null, "No private IPv4 interface is available for the local HTTP smoke test")
+
+        val authorization = AtomicReference<String?>()
+        val customHeader = AtomicReference<String?>()
+        val server = HttpServer.create(InetSocketAddress("0.0.0.0", 0), 0)
+        server.createContext("/") { exchange ->
+            authorization.set(exchange.requestHeaders.getFirst("Authorization"))
+            customHeader.set(exchange.requestHeaders.getFirst("X-Monitor-Test"))
+            val response = """{"ready":true,"count":2}""".toByteArray()
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
+        }
+        server.start()
+        try {
+            val encryption = SecretEncryptionService().apply {
+                keyBase64 = Base64.getEncoder().encodeToString(ByteArray(32) { (it + 1).toByte() })
+            }
+            val encryptedHeaders = mapOf(
+                "authorization" to encryption.encrypt("Bearer synthetic-test-token"),
+                "x-monitor-test" to encryption.encrypt("smoke"),
+            )
+            val checker = service(allowPrivateTargets = true).apply { secretEncryption = encryption }
+
+            val result = checker.execute(
+                targetUrl = "http://${targetAddress!!.hostAddress}:${server.address.port}/",
+                method = "GET",
+                timeoutSeconds = 3,
+                expectedStatusCodes = setOf(200),
+                textContains = null,
+                jsonPath = "/ready",
+                jsonExpectedValue = "true",
+                encryptedRequestHeaders = encryptedHeaders,
+            )
+
+            assertEquals("UP", result.status)
+            assertEquals("Bearer synthetic-test-token", authorization.get())
+            assertEquals("smoke", customHeader.get())
+        } finally {
+            server.stop(0)
+        }
     }
 
     private fun service(

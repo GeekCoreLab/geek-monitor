@@ -1,6 +1,7 @@
 package com.geekcorelab.monitor
 
 import com.geekcorelab.api.CheckResponse
+import com.geekcorelab.security.SecretEncryptionService
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
@@ -25,6 +26,8 @@ data class TargetResolution(val addresses: List<InetAddress>, val errorCode: Str
 
 @ApplicationScoped
 class HttpCheckService {
+    @Inject lateinit var secretEncryption: SecretEncryptionService
+
     @Inject @field:ConfigProperty(name = "geek-monitor.network.allow-private-targets", defaultValue = "false")
     var allowPrivateTargets: Boolean = false
 
@@ -108,6 +111,7 @@ class HttpCheckService {
         textContains: String?,
         jsonPath: String? = null,
         jsonExpectedValue: String? = null,
+        encryptedRequestHeaders: Map<String, String> = emptyMap(),
     ): CheckResponse {
         val startedNanos = System.nanoTime()
         val checkedAt = Instant.now()
@@ -115,6 +119,11 @@ class HttpCheckService {
         val normalizedJsonExpectedValue = jsonExpectedValue?.takeIf(String::isNotBlank)
         if (!JsonPointerAssertions.isValidConfiguration(normalizedJsonPath, normalizedJsonExpectedValue)) {
             return unknown(startedNanos, checkedAt, "CHECK_CONFIG_INVALID", "JSON 路径断言配置无效")
+        }
+        val requestHeaders = try {
+            encryptedRequestHeaders.mapValues { (_, encryptedValue) -> secretEncryption.decrypt(encryptedValue) }
+        } catch (_: Exception) {
+            return unknown(startedNanos, checkedAt, "CREDENTIAL_DECRYPTION_FAILED", "请求头凭据无法解密")
         }
         val deadlineNanos = startedNanos + TimeUnit.SECONDS.toNanos(timeoutSeconds.toLong())
         val allowedNetworks = parseAllowedNetworks()
@@ -152,6 +161,7 @@ class HttpCheckService {
                     .method(method, null)
                     .header("User-Agent", "GeekMonitor/1.0")
                     .header("Accept", "*/*")
+                    .apply { requestHeaders.forEach { (name, value) -> header(name, value) } }
                     .build()
             } catch (exception: Exception) {
                 return unknown(startedNanos, checkedAt, "TARGET_INVALID", "目标地址格式无效")

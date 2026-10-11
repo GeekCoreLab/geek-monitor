@@ -20,6 +20,7 @@ data class MonitorRequest(
     val textContains: String? = null,
     val jsonPath: String? = null,
     val jsonExpectedValue: String? = null,
+    val requestHeaders: Map<String, String>? = null,
     val critical: Boolean? = true,
     val enabled: Boolean? = true,
     val reminderIntervalMinutes: Int? = null,
@@ -81,6 +82,7 @@ data class MonitorResponse(
     val redisDatabase: Int? = null,
     val jsonPath: String? = null,
     val jsonExpectedValue: String? = null,
+    val requestHeaders: Map<String, String> = emptyMap(),
 )
 
 data class CheckResponse(
