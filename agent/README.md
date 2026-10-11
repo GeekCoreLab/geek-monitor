@@ -2,6 +2,14 @@
 
 The Agent is a small Linux-only Go program that collects CPU usage, load, memory, swap, disk space/inodes, and network throughput. It uses only the Go standard library and makes outbound requests to Geek Monitor; the center never connects back to the host.
 
+## One-command installation
+
+In the Admin console, add a resource with type **HOST**, open **Agent 节点**, and choose **注册主机 Agent**. The console creates a one-time token and displays a copyable install command. Run that command on the target Linux host, then enter the token when the installer prompts; input is hidden and the token is not embedded in shell history.
+
+The command downloads `install-agent.sh` from the latest GitHub Release. The script downloads the matching Linux amd64 or arm64 binary and `SHA256SUMS`, verifies the binary, creates a restricted `geek-monitor` service account, registers the node, and enables its systemd service. It removes the one-time token after registration and refuses to overwrite an existing Agent state file.
+
+Agent releases are published by pushing a `agent-vX.Y.Z` tag. GitHub Actions runs the Agent tests and attaches `install-agent.sh`, `geek-monitor-agent-linux-amd64`, `geek-monitor-agent-linux-arm64`, and `SHA256SUMS` to the Release. The Admin command always resolves the latest Release.
+
 ## Build
 
 Use Go 1.24 or newer:
@@ -34,11 +42,11 @@ The collector reads Linux `/proc` data and filesystem statistics. It needs no ro
      -enrollment-token-file /etc/geek-monitor/enrollment.token
    ```
 
-   After the console shows the node online, stop the foreground process and remove the consumed token file. The Agent stores its long-lived credential in `agent.json` with mode `0600` inside a directory restricted to mode `0700`.
+   After the console shows the node online, stop the foreground process before starting the systemd service. The Agent removes the consumed token file after successful registration and stores its long-lived credential in `agent.json` with mode `0600` inside a directory restricted to mode `0700`.
 
 ## systemd
 
-After the first enrollment and token removal, use this unit as `/etc/systemd/system/geek-monitor-agent.service`:
+After the first enrollment, use this unit as `/etc/systemd/system/geek-monitor-agent.service`:
 
 ```ini
 [Unit]

@@ -4,11 +4,64 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 )
+
+func TestLoadOrRegisterRemovesEnrollmentTokenAfterSuccess(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "state", "agent.json")
+	tokenPath := filepath.Join(t.TempDir(), "enrollment.token")
+	if err := os.WriteFile(tokenPath, []byte("token-once\n"), 0600); err != nil {
+		t.Fatalf("write enrollment token: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/agents/register" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var request struct {
+			EnrollmentToken string `json:"enrollmentToken"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode enrollment request: %v", err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		if request.EnrollmentToken != "token-once" {
+			t.Errorf("unexpected enrollment token %q", request.EnrollmentToken)
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agentId":       "agent-test",
+			"resourceId":    "resource-test",
+			"credential":    "credential-test",
+			"configVersion": 1,
+		})
+	}))
+	defer server.Close()
+
+	config, err := loadOrRegister(server.URL, configPath, tokenPath)
+	if err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+	if config.AgentID != "agent-test" {
+		t.Fatalf("unexpected registered agent: %+v", config)
+	}
+	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
+		t.Fatalf("consumed enrollment token remains on disk: stat err=%v", err)
+	}
+	stateInfo, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat saved state: %v", err)
+	}
+	if stateInfo.Mode().Perm() != 0600 {
+		t.Fatalf("agent state permissions = %o, want 600", stateInfo.Mode().Perm())
+	}
+}
 
 func TestDeliverQueuedRetriesInOrderAndKeepsFailedBatch(t *testing.T) {
 	var received []int64

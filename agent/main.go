@@ -24,8 +24,9 @@ import (
 	"time"
 )
 
+var agentVersion = "0.1.0"
+
 const (
-	agentVersion  = "0.1.0"
 	maxQueueBytes = 64 << 20
 	maxQueueAge   = 7 * 24 * time.Hour
 	maxBatchBytes = 1 << 20
@@ -196,6 +197,9 @@ func loadOrRegister(serverURL, configPath, enrollmentFile string) (*agentConfig,
 	}
 	if err := saveConfig(configPath, config); err != nil {
 		return nil, fmt.Errorf("save agent state: %w", err)
+	}
+	if err := os.Remove(enrollmentFile); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "warning: remove consumed enrollment token file: %v\n", err)
 	}
 	return config, nil
 }

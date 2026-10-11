@@ -69,7 +69,7 @@ openssl rand -base64 32
 - 总览显示资源状态、监控项和活跃故障。
 - 检查历史弹窗显示最近执行记录，以及 24 小时、7 天、30 天和 180 天的可用率、数据覆盖率、UP/DOWN/UNKNOWN 时长和维护/暂停剔除统计。
 - 系统设置页展示数据库与迁移状态、数据保留策略、最近本机备份状态及脱敏审计日志；备份与空库恢复脚本见部署手册。
-- HOST 资源支持 Linux Agent 一次性注册、节点在线/离线状态、凭据吊销和 CPU/内存/磁盘等可信指标曲线；Agent 离线队列按顺序补传。安装方式见 [Agent 指南](agent/README.md)。
+- HOST 资源支持 Linux Agent 一次性注册、GitHub Release 安装命令、节点在线/离线状态、凭据吊销和 CPU/内存/磁盘等可信指标曲线；Agent 离线队列按顺序补传。安装方式见 [Agent 指南](agent/README.md)。
 - DATABASE 资源支持 PostgreSQL、MySQL 和 Redis 只读可用性检查、连接数/上限/利用率曲线，以及指标阈值告警；统计权限不足时不会误判数据库不可用。
 - 心跳任务和 HOST/DATABASE 指标阈值可在控制台配置。
 

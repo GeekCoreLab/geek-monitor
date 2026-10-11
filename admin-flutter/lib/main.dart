@@ -17,6 +17,8 @@ const _red = Color(0xFFB42318);
 const _canvas = Color(0xFFF4F6F9);
 const _showDevCredentials =
     kDebugMode || bool.fromEnvironment('GEEK_MONITOR_DEV_CREDENTIALS');
+const _agentInstallScriptUrl =
+    'https://github.com/skyhhjmk/geek-monitor/releases/latest/download/install-agent.sh';
 
 class GeekMonitorApp extends StatefulWidget {
   const GeekMonitorApp({super.key});
@@ -1181,54 +1183,16 @@ class _DashboardShellState extends State<_DashboardShell> {
       final enrollment = await widget.api.createAgentEnrollment(resourceId);
       if (!mounted) return;
       final token = enrollment['token'] as String;
+      final resourceName =
+          hosts.firstWhere((item) => item['id'] == resourceId)['name']
+              as String? ??
+          '主机';
       showDialog<void>(
         context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('一次性 Agent 注册令牌'),
-          content: SizedBox(
-            width: 480,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  '令牌仅显示这一次，15 分钟后过期。请通过安全方式传到目标主机。',
-                  style: TextStyle(fontSize: 12, height: 1.5),
-                ),
-                const SizedBox(height: 12),
-                SelectableText(
-                  token,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '绑定资源：${hosts.firstWhere((item) => item['id'] == resourceId)['name']}',
-                  style: const TextStyle(color: _muted, fontSize: 11),
-                ),
-                Text(
-                  '过期时间：${_dateTime(enrollment['expiresAt'] as String?)}',
-                  style: const TextStyle(color: _muted, fontSize: 11),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton.icon(
-              onPressed: () async {
-                await Clipboard.setData(ClipboardData(text: token));
-                if (dialogContext.mounted) {
-                  Navigator.pop(dialogContext);
-                  _notice('注册令牌已复制，请安全保存');
-                }
-              },
-              icon: const Icon(Icons.copy_rounded, size: 17),
-              label: const Text('复制并关闭'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('关闭'),
-            ),
-          ],
+        builder: (_) => _AgentEnrollmentDialog(
+          token: token,
+          resourceName: resourceName,
+          expiresAt: enrollment['expiresAt'] as String?,
         ),
       );
     } catch (error) {
@@ -2727,6 +2691,170 @@ class _AgentResourceDialogState extends State<_AgentResourceDialog> {
     ],
   );
 }
+
+class _AgentEnrollmentDialog extends StatefulWidget {
+  const _AgentEnrollmentDialog({
+    required this.token,
+    required this.resourceName,
+    required this.expiresAt,
+  });
+
+  final String token;
+  final String resourceName;
+  final String? expiresAt;
+
+  @override
+  State<_AgentEnrollmentDialog> createState() => _AgentEnrollmentDialogState();
+}
+
+class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
+  late final TextEditingController _serverController = TextEditingController(
+    text: Uri.base.origin,
+  );
+
+  String? get _serverUrl {
+    final value = _serverController.text.trim();
+    final uri = Uri.tryParse(value);
+    final authorityIsSafe =
+        uri != null &&
+        (RegExp(r'^[A-Za-z0-9.-]+(:[0-9]{1,5})?$').hasMatch(uri.authority) ||
+            RegExp(r'^\[[0-9A-Fa-f:]+\](:[0-9]{1,5})?$').hasMatch(
+              uri.authority,
+            ));
+    final pathIsSafe =
+        uri != null && RegExp(r'^(/[A-Za-z0-9._/-]*)?$').hasMatch(uri.path);
+    if (uri == null ||
+        uri.host.isEmpty ||
+        uri.userInfo.isNotEmpty ||
+        uri.hasQuery ||
+        uri.hasFragment ||
+        !authorityIsSafe ||
+        !pathIsSafe ||
+        (uri.scheme != 'https' &&
+            !(uri.scheme == 'http' &&
+                const {'localhost', '127.0.0.1', '::1'}.contains(uri.host)))) {
+      return null;
+    }
+    final path = uri.path.replaceFirst(RegExp(r'/+$'), '');
+    final normalized = uri.replace(path: path).toString();
+    return normalized.endsWith('/')
+        ? normalized.substring(0, normalized.length - 1)
+        : normalized;
+  }
+
+  String get _installCommand =>
+      'curl -fsSL $_agentInstallScriptUrl | sudo bash -s -- --server '
+      '${_shellQuote(_serverUrl!)}';
+
+  @override
+  void dispose() {
+    _serverController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _copy(String value, String message) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final serverUrl = _serverUrl;
+    return AlertDialog(
+      title: const Text('安装 Linux Agent'),
+      content: SizedBox(
+        width: 560,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '绑定资源：${widget.resourceName}',
+                style: const TextStyle(color: _muted, fontSize: 11),
+              ),
+              Text(
+                '注册令牌 15 分钟后过期：${_dateTime(widget.expiresAt)}',
+                style: const TextStyle(color: _muted, fontSize: 11),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: _serverController,
+                onChanged: (_) => setState(() {}),
+                decoration: const InputDecoration(
+                  labelText: '监控中心地址',
+                  hintText: 'https://monitor.example.com',
+                  helperText: '目标主机必须能访问此地址；生产环境请使用 HTTPS。',
+                ),
+                keyboardType: TextInputType.url,
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                '在目标 Linux 主机执行以下命令。命令不含注册令牌；运行时会在终端隐藏提示输入。',
+                style: TextStyle(fontSize: 12, height: 1.5),
+              ),
+              const SizedBox(height: 8),
+              if (serverUrl == null)
+                const Text(
+                  '请输入 HTTPS 地址；HTTP 仅允许 localhost、127.0.0.1 或 ::1。',
+                  style: TextStyle(color: _red, fontSize: 11),
+                )
+              else
+                SelectableText(
+                  _installCommand,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    height: 1.5,
+                  ),
+                ),
+              const SizedBox(height: 8),
+              const Text(
+                '安装脚本从 GitHub 最新 Release 下载 Linux amd64/arm64 二进制并校验 SHA-256，然后创建受限系统账号和 systemd 服务。',
+                style: TextStyle(color: _muted, fontSize: 11, height: 1.45),
+              ),
+              const Divider(height: 24),
+              const Text(
+                '一次性注册令牌（请安全传到目标主机）',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 6),
+              SelectableText(
+                widget.token,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton.icon(
+          onPressed: serverUrl == null
+              ? null
+              : () => _copy(_installCommand, '安装命令已复制'),
+          icon: const Icon(Icons.terminal_rounded, size: 17),
+          label: const Text('复制安装命令'),
+        ),
+        TextButton.icon(
+          onPressed: () => _copy(widget.token, '注册令牌已复制，请安全传递'),
+          icon: const Icon(Icons.key_rounded, size: 17),
+          label: const Text('复制令牌'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('关闭'),
+        ),
+      ],
+    );
+  }
+}
+
+// The accepted server URL is restricted to characters that are safe inside quotes.
+String _shellQuote(String value) =>
+    String.fromCharCode(39) + value + String.fromCharCode(39);
 
 class _MetricsDialog extends StatefulWidget {
   const _MetricsDialog({
