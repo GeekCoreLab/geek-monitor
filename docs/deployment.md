@@ -10,7 +10,7 @@ openssl rand -base64 32
 chmod 600 .env
 ```
 
-将随机生成的 32 字节 Base64 值写入 `.env` 的 `GEEK_MONITOR_ENCRYPTION_KEY`，同时替换 PostgreSQL 密码。`.env` 已由 Git 忽略，不要提交或放进数据库备份。生产通知需要填入 SMTP 参数；默认 `.invalid` 主机不会发送邮件。
+将随机生成的 32 字节 Base64 值写入 `.env` 的 `GEEK_MONITOR_ENCRYPTION_KEY`，同时替换 PostgreSQL 密码。`.env` 已由 Git 忽略，不要提交或放进数据库备份。容器部署的 SMTP 配置也写在这个项目根目录的 `.env` 文件中；变量名见 `.env.example`。默认 `.invalid` 主机不会发送邮件。
 
 构建 Flutter Web 与 Quarkus 应用，再启动 PostgreSQL 和应用：
 
@@ -20,6 +20,29 @@ podman compose up -d --build
 ```
 
 容器将应用绑定到 `127.0.0.1:8080`，PostgreSQL 只发布到本机 `127.0.0.1:55432`；对公网提供服务时，在前面配置带 TLS 的反向代理并限制数据库端口访问。应用启动时执行 Flyway 迁移。首次打开站点后使用安装页创建管理员和默认项目；生产构建不会预填开发测试账号。
+
+## SMTP 配置
+
+SMTP 是服务端环境配置，不在管理页面中设置。若尚未创建 `.env`，从模板创建并限制文件权限：
+
+```sh
+if [ ! -f .env ]; then cp .env.example .env; fi
+chmod 600 .env
+```
+
+编辑 `.env` 中的 `SMTP_HOST`、`SMTP_PORT`、`SMTP_USERNAME`、`SMTP_PASSWORD`、`SMTP_FROM` 和 `SMTP_START_TLS`。通常使用端口 `587` 和 `REQUIRED`；请以 SMTP 服务商给出的主机名、认证方式和发件人地址为准。Compose 会把这些值传给应用并启用真实邮件发送；修改后执行 `podman compose up -d --no-deps app`（或 `docker compose up -d --no-deps app`）让应用容器载入新配置。
+
+直接运行 `./gradlew quarkusDev` 时，Quarkus 不会自动加载 `.env`，而且开发配置默认启用邮件模拟器。要在本地开发模式投递真实邮件，可在项目根目录执行：
+
+```sh
+set -a
+. ./.env
+set +a
+DB_URL=jdbc:postgresql://localhost:55433/geek_monitor \
+QUARKUS_HTTP_PORT=18082 QUARKUS_MAILER_MOCK=false ./gradlew quarkusDev
+```
+
+修改 SMTP 参数后需要重启正在运行的开发服务；不要把 `.env` 内容或 SMTP 密码提交到 Git。
 
 平台存活和就绪探针分别为 `/q/health/live` 与 `/q/health/ready`。就绪探针包含 PostgreSQL 数据源状态。反向代理可以将就绪探针用于摘除暂不可用的应用实例。
 

@@ -51,7 +51,7 @@ openssl rand -base64 32
 
 将结果注入 `GEEK_MONITOR_ENCRYPTION_KEY`。密钥不应写入仓库或数据库备份；丢失密钥后，已加密的 Webhook 配置无法解密。开发模式使用仅供本地的固定密钥。
 
-邮件使用 Quarkus Mailer 和 SMTP，可配置以下环境变量：`SMTP_HOST`、`SMTP_PORT`、`SMTP_USERNAME`、`SMTP_PASSWORD`、`SMTP_FROM` 和 `SMTP_START_TLS`。生产默认要求 STARTTLS，`SMTP_HOST` 未配置时会指向保留的 `.invalid` 域名，避免静默发送。开发模式使用 Mailer 模拟器，不会发出真实邮件；生产可设置 `SMTP_MOCK=false`（默认值）并配置真实 SMTP 服务。
+邮件使用 Quarkus Mailer 和 SMTP，配置入口是服务端环境变量，不在管理页面中。容器部署时，复制 `.env.example` 为 `.env` 并填写 `SMTP_HOST`、`SMTP_PORT`、`SMTP_USERNAME`、`SMTP_PASSWORD`、`SMTP_FROM` 和 `SMTP_START_TLS`；本地 Gradle 开发时需在启动 `./gradlew quarkusDev` 的终端导出这些变量，Quarkus 不会自动读取 `.env`。开发模式默认使用邮件模拟器；要在本地实际投递，还需设置 `QUARKUS_MAILER_MOCK=false` 并重启服务。生产默认要求 STARTTLS，未配置主机时会指向保留的 `.invalid` 域名，避免静默发送。具体步骤见[部署手册](docs/deployment.md#smtp-配置)。
 
 首次安装状态保存在数据库中。重新部署不会重置管理员或项目；重置操作需按备份与恢复流程直接管理数据库。
 
