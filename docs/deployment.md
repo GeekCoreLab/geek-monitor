@@ -38,6 +38,7 @@ chmod 600 .env
 set -a
 . ./.env
 set +a
+unset GEEK_MONITOR_ENCRYPTION_KEY
 DB_URL=jdbc:postgresql://localhost:55433/geek_monitor \
 QUARKUS_HTTP_PORT=18082 QUARKUS_MAILER_MOCK=false ./gradlew quarkusDev
 ```
