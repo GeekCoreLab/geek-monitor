@@ -30,6 +30,9 @@ class MetricRetentionScheduler {
                 deleteExpiredCheckExecutions(connection, now)
                 deleteExpiredAvailabilityRollups(connection, now)
                 deleteExpiredAgentBatches(connection, now)
+                deleteExpiredNotificationOutbox(connection, now)
+                deleteExpiredResolvedIncidents(connection, now)
+                deleteExpiredAuditEntries(connection, now)
                 connection.commit()
             } catch (exception: Exception) {
                 connection.rollback()
@@ -167,6 +170,48 @@ class MetricRetentionScheduler {
                ) DELETE FROM check_execution execution USING expired WHERE execution.id = expired.id""",
         ).use { statement ->
             statement.setTimestamp(1, Timestamp.from(now.minusSeconds(CHECK_EXECUTION_RETENTION_SECONDS)))
+            statement.setInt(2, DELETE_BATCH_SIZE)
+            statement.executeUpdate()
+        }
+    }
+
+    private fun deleteExpiredNotificationOutbox(connection: Connection, now: Instant) {
+        connection.prepareStatement(
+            """WITH expired AS (
+                   SELECT id FROM notification_outbox
+                   WHERE created_at < ? AND status IN ('DELIVERED', 'FAILED', 'CANCELLED')
+                   ORDER BY created_at LIMIT ?
+               ) DELETE FROM notification_outbox outbox USING expired WHERE outbox.id = expired.id""",
+        ).use { statement ->
+            statement.setTimestamp(1, Timestamp.from(now.minusSeconds(EVENT_RETENTION_SECONDS)))
+            statement.setInt(2, DELETE_BATCH_SIZE)
+            statement.executeUpdate()
+        }
+    }
+
+    private fun deleteExpiredResolvedIncidents(connection: Connection, now: Instant) {
+        connection.prepareStatement(
+            """WITH expired AS (
+                   SELECT id FROM incident
+                   WHERE status = 'RESOLVED' AND resolved_at < ?
+                   ORDER BY resolved_at LIMIT ?
+               ) DELETE FROM incident incident USING expired WHERE incident.id = expired.id""",
+        ).use { statement ->
+            statement.setTimestamp(1, Timestamp.from(now.minusSeconds(EVENT_RETENTION_SECONDS)))
+            statement.setInt(2, DELETE_BATCH_SIZE)
+            statement.executeUpdate()
+        }
+    }
+
+    private fun deleteExpiredAuditEntries(connection: Connection, now: Instant) {
+        connection.prepareStatement(
+            """WITH expired AS (
+                   SELECT id FROM audit_log
+                   WHERE created_at < ?
+                   ORDER BY created_at LIMIT ?
+               ) DELETE FROM audit_log audit USING expired WHERE audit.id = expired.id""",
+        ).use { statement ->
+            statement.setTimestamp(1, Timestamp.from(now.minusSeconds(EVENT_RETENTION_SECONDS)))
             statement.setInt(2, DELETE_BATCH_SIZE)
             statement.executeUpdate()
         }
@@ -501,6 +546,7 @@ class MetricRetentionScheduler {
         private const val HOURLY_ROLLUP_RETENTION_SECONDS = 180 * 24 * 60 * 60L
         private const val CHECK_EXECUTION_RETENTION_SECONDS = 7 * 24 * 60 * 60L
         private const val AGENT_BATCH_RETENTION_SECONDS = 30 * 24 * 60 * 60L
+        private const val EVENT_RETENTION_SECONDS = 180 * 24 * 60 * 60L
         private const val DELETE_BATCH_SIZE = 10_000
         private const val AVAILABILITY_FINALIZATION_DELAY_SECONDS = 300L
         private const val AVAILABILITY_BUCKET_BATCH_SIZE = 24
