@@ -11,6 +11,8 @@ void main() {
 const _ink = Color(0xFF182433);
 const _muted = Color(0xFF6F7C8C);
 const _blue = Color(0xFF315CA8);
+const _green = Color(0xFF16805D);
+const _amber = Color(0xFFAD6800);
 const _red = Color(0xFFB42318);
 const _canvas = Color(0xFFF4F6F9);
 const _showDevCredentials =
@@ -791,6 +793,7 @@ enum _Section {
   projects,
   members,
   agents,
+  settings,
 }
 
 class _DashboardShell extends StatefulWidget {
@@ -1379,6 +1382,10 @@ class _DashboardShellState extends State<_DashboardShell> {
         onCreateEnrollment: _createAgentEnrollment,
         onRevoke: _revokeAgent,
       ),
+      _Section.settings => _SystemSettingsPage(
+        api: widget.api,
+        isAdmin: widget.user['role'] == 'ADMIN',
+      ),
     };
   }
 
@@ -1489,6 +1496,12 @@ class _SideNavigation extends StatelessWidget {
           label: 'Agent 节点',
           selected: section == _Section.agents,
           onTap: () => onSelect(_Section.agents),
+        ),
+        _NavItem(
+          icon: Icons.settings_outlined,
+          label: '系统设置与审计',
+          selected: section == _Section.settings,
+          onTap: () => onSelect(_Section.settings),
         ),
         const Spacer(),
         Container(
@@ -1672,34 +1685,93 @@ class _BottomNavigation extends StatelessWidget {
   final _Section section;
   final ValueChanged<_Section> onSelect;
 
+  static const _primarySections = [
+    _Section.overview,
+    _Section.resources,
+    _Section.monitors,
+    _Section.incidents,
+    _Section.notifications,
+  ];
+
+  static const _moreSections = [
+    (_Section.projects, '项目管理', Icons.folder_outlined),
+    (_Section.members, '成员与角色', Icons.group_outlined),
+    (_Section.agents, 'Agent 节点', Icons.memory_outlined),
+    (_Section.settings, '系统设置与审计', Icons.settings_outlined),
+  ];
+
+  void _showMore(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(20, 18, 20, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '更多功能',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+              ),
+            ),
+            for (final item in _moreSections)
+              ListTile(
+                leading: Icon(item.$3),
+                title: Text(item.$2),
+                selected: section == item.$1,
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  onSelect(item.$1);
+                },
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
-  Widget build(BuildContext context) => NavigationBar(
-    selectedIndex: section.index,
-    labelBehavior: NavigationDestinationLabelBehavior.onlyShowSelected,
-    onDestinationSelected: (index) => onSelect(_Section.values[index]),
-    destinations: const [
-      NavigationDestination(
-        icon: Icon(Icons.space_dashboard_outlined),
-        label: '总览',
-      ),
-      NavigationDestination(icon: Icon(Icons.dns_outlined), label: '资源'),
-      NavigationDestination(
-        icon: Icon(Icons.monitor_heart_outlined),
-        label: '检查',
-      ),
-      NavigationDestination(
-        icon: Icon(Icons.warning_amber_rounded),
-        label: '故障',
-      ),
-      NavigationDestination(
-        icon: Icon(Icons.notifications_outlined),
-        label: '通知',
-      ),
-      NavigationDestination(icon: Icon(Icons.folder_outlined), label: '项目'),
-      NavigationDestination(icon: Icon(Icons.group_outlined), label: '成员'),
-      NavigationDestination(icon: Icon(Icons.memory_outlined), label: 'Agent'),
-    ],
-  );
+  Widget build(BuildContext context) {
+    final primaryIndex = _primarySections.indexOf(section);
+    return NavigationBar(
+      selectedIndex: primaryIndex < 0 ? _primarySections.length : primaryIndex,
+      labelBehavior: NavigationDestinationLabelBehavior.onlyShowSelected,
+      onDestinationSelected: (index) {
+        if (index == _primarySections.length) {
+          _showMore(context);
+        } else {
+          onSelect(_primarySections[index]);
+        }
+      },
+      destinations: const [
+        NavigationDestination(
+          icon: Icon(Icons.space_dashboard_outlined),
+          label: '总览',
+        ),
+        NavigationDestination(icon: Icon(Icons.dns_outlined), label: '资源'),
+        NavigationDestination(
+          icon: Icon(Icons.monitor_heart_outlined),
+          label: '检查',
+        ),
+        NavigationDestination(
+          icon: Icon(Icons.warning_amber_rounded),
+          label: '故障',
+        ),
+        NavigationDestination(
+          icon: Icon(Icons.notifications_outlined),
+          label: '通知',
+        ),
+        NavigationDestination(
+          icon: Icon(Icons.more_horiz_rounded),
+          label: '更多',
+        ),
+      ],
+    );
+  }
 }
 
 class _OverviewPage extends StatelessWidget {
@@ -3376,6 +3448,444 @@ class _ProjectMemberDialogState extends State<_ProjectMemberDialog> {
     ],
   );
 }
+
+class _SystemSettingsPage extends StatefulWidget {
+  const _SystemSettingsPage({required this.api, required this.isAdmin});
+
+  final ApiClient api;
+  final bool isAdmin;
+
+  @override
+  State<_SystemSettingsPage> createState() => _SystemSettingsPageState();
+}
+
+class _SystemSettingsPageState extends State<_SystemSettingsPage> {
+  Map<String, dynamic>? _status;
+  List<Map<String, dynamic>> _auditEntries = [];
+  Map<String, dynamic>? _nextCursor;
+  String? _error;
+  String? _moreError;
+  bool _loading = false;
+  bool _loadingMore = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.isAdmin) _reload();
+  }
+
+  Future<void> _reload() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+      _moreError = null;
+    });
+    try {
+      final values = await Future.wait<Object>([
+        widget.api.systemStatus(),
+        widget.api.auditLog(),
+      ]);
+      final page = Map<String, dynamic>.from(values[1] as Map);
+      if (!mounted) return;
+      setState(() {
+        _status = Map<String, dynamic>.from(values[0] as Map);
+        _auditEntries = List<Map<String, dynamic>>.from(
+          (page['items'] as List).map(
+            (item) => Map<String, dynamic>.from(item as Map),
+          ),
+        );
+        _nextCursor = page['next'] is Map
+            ? Map<String, dynamic>.from(page['next'] as Map)
+            : null;
+      });
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _loadMore() async {
+    final cursor = _nextCursor;
+    if (cursor == null || _loadingMore) return;
+    setState(() {
+      _loadingMore = true;
+      _moreError = null;
+    });
+    try {
+      final page = await widget.api.auditLog(
+        beforeCreatedAt: cursor['createdAt'] as String,
+        beforeId: cursor['id'] as String,
+      );
+      final entries = List<Map<String, dynamic>>.from(
+        (page['items'] as List).map(
+          (item) => Map<String, dynamic>.from(item as Map),
+        ),
+      );
+      if (!mounted) return;
+      setState(() {
+        _auditEntries = [..._auditEntries, ...entries];
+        _nextCursor = page['next'] is Map
+            ? Map<String, dynamic>.from(page['next'] as Map)
+            : null;
+      });
+    } catch (error) {
+      if (mounted) setState(() => _moreError = error.toString());
+    } finally {
+      if (mounted) setState(() => _loadingMore = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _PageScroll(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _PageHeading(
+            eyebrow: 'SYSTEM',
+            title: '系统设置与审计',
+            subtitle: '查看数据库状态、数据保留策略、最近备份和管理操作记录。',
+            actions: [
+              if (widget.isAdmin)
+                OutlinedButton.icon(
+                  onPressed: _loading ? null : _reload,
+                  icon: const Icon(Icons.refresh_rounded),
+                  label: const Text('刷新状态'),
+                ),
+            ],
+          ),
+          if (!widget.isAdmin)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(28),
+                child: _EmptyState(
+                  icon: Icons.lock_outline_rounded,
+                  title: '需要系统管理员权限',
+                  subtitle: '系统状态和审计记录仅对管理员开放。',
+                ),
+              ),
+            )
+          else if (_loading && _status == null)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(28),
+                child: Center(child: CircularProgressIndicator()),
+              ),
+            )
+          else if (_error != null && _status == null)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: _EmptyState(
+                  icon: Icons.cloud_off_outlined,
+                  title: '无法读取系统状态',
+                  subtitle: _error!,
+                ),
+              ),
+            )
+          else if (_status != null) ...[
+            _systemOverviewCard(_status!),
+            const SizedBox(height: 14),
+            _retentionCard(_status!['retentionPolicies'] as List? ?? const []),
+            const SizedBox(height: 14),
+            _auditCard(),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _systemOverviewCard(Map<String, dynamic> status) {
+    final databaseBytes = status['databaseSizeBytes'] as num? ?? 0;
+    final version = status['schemaVersion'] as String? ?? '未知';
+    final backup = Map<String, dynamic>.from(status['backup'] as Map);
+    final backupState = backup['status'] as String? ?? 'NOT_RECORDED';
+    final (backupLabel, backupColor) = switch (backupState) {
+      'CURRENT' => ('24 小时内有备份记录', _green),
+      'OVERDUE' => ('超过 24 小时未记录备份', _red),
+      _ => ('尚无备份记录', _amber),
+    };
+    final backupDetails = switch (backupState) {
+      'CURRENT' || 'OVERDUE' => [
+        backup['filename'] as String? ?? '',
+        _formatBytes(backup['sizeBytes'] as num? ?? 0),
+        _formatSystemTime(backup['completedAt'] as String? ?? ''),
+      ].where((part) => part.isNotEmpty).join(' · '),
+      _ => '运行 scripts/backup-postgres.sh 并完成归档校验后会更新这里。',
+    };
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.storage_outlined, color: _blue),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text(
+                    '平台状态',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: _green.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Text(
+                    '数据库连接正常',
+                    style: TextStyle(
+                      color: _green,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 28,
+              runSpacing: 12,
+              children: [
+                _SystemValue(
+                  label: '数据库大小',
+                  value: _formatBytes(databaseBytes),
+                ),
+                _SystemValue(label: '数据库迁移版本', value: 'V$version'),
+                _SystemValue(
+                  label: '状态更新时间',
+                  value: _formatSystemTime(
+                    status['generatedAt'] as String? ?? '',
+                  ),
+                ),
+              ],
+            ),
+            const Divider(height: 30),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.backup_outlined, color: backupColor),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        backupLabel,
+                        style: TextStyle(
+                          color: backupColor,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        backupDetails,
+                        style: const TextStyle(color: _muted, fontSize: 12),
+                      ),
+                      if (backup['sha256'] is String) ...[
+                        const SizedBox(height: 3),
+                        SelectableText(
+                          'SHA-256 ${backup['sha256']}',
+                          style: const TextStyle(
+                            color: _muted,
+                            fontSize: 11,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 5),
+                      const Text(
+                        '状态来自本机备份脚本记录，不代表异机副本或恢复演练已验证。',
+                        style: TextStyle(color: _muted, fontSize: 11),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _retentionCard(List policies) => Card(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(18, 17, 18, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '数据保留策略',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          for (final item in policies)
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: Text(item['label'] as String? ?? '数据'),
+              trailing: Text(
+                '${item['retentionDays'] ?? '—'} 天',
+                style: const TextStyle(
+                  color: _blue,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+        ],
+      ),
+    ),
+  );
+
+  Widget _auditCard() => Card(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(18, 17, 18, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  '操作审计',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+              ),
+              Text(
+                '${_auditEntries.length} 条',
+                style: const TextStyle(color: _muted, fontSize: 12),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (_auditEntries.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 18),
+              child: _EmptyState(
+                icon: Icons.receipt_long_outlined,
+                title: '暂无操作记录',
+                subtitle: '项目成员、通知、Agent 和故障确认等管理操作会显示在这里。',
+              ),
+            )
+          else
+            for (final entry in _auditEntries) ...[
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.receipt_long_outlined, color: _blue),
+                title: Text(
+                  _auditActionLabel(entry['action'] as String? ?? ''),
+                ),
+                subtitle: Text(
+                  [
+                    entry['actorEmail'] as String? ?? '系统',
+                    '${entry['subjectType'] ?? '对象'} ${entry['subjectId'] ?? ''}'
+                        .trim(),
+                    _auditSummary(entry['summary']),
+                    _formatSystemTime(entry['createdAt'] as String? ?? ''),
+                  ].where((value) => value.isNotEmpty).join(' · '),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const Divider(height: 1),
+            ],
+          if (_moreError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: Text(
+                _moreError!,
+                style: const TextStyle(color: _red, fontSize: 12),
+              ),
+            ),
+          if (_nextCursor != null)
+            Align(
+              alignment: Alignment.center,
+              child: TextButton.icon(
+                onPressed: _loadingMore ? null : _loadMore,
+                icon: _loadingMore
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.expand_more_rounded),
+                label: const Text('加载更早记录'),
+              ),
+            ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _SystemValue extends StatelessWidget {
+  const _SystemValue({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(label, style: const TextStyle(color: _muted, fontSize: 11)),
+      const SizedBox(height: 3),
+      Text(
+        value,
+        style: const TextStyle(color: _ink, fontWeight: FontWeight.w600),
+      ),
+    ],
+  );
+}
+
+String _formatBytes(num value) {
+  if (value < 1024) return '${value.toInt()} B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  var scaled = value / 1024;
+  var unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit++;
+  }
+  return '${scaled.toStringAsFixed(1)} ${units[unit]}';
+}
+
+String _formatSystemTime(String value) => value
+    .replaceFirst('T', ' ')
+    .replaceFirst(RegExp(r'\.\d+'), '')
+    .replaceFirst('Z', ' UTC');
+
+String _auditSummary(dynamic value) {
+  if (value is! Map || value.isEmpty) return '';
+  return value.entries.map((entry) => '${entry.key}: ${entry.value}').join('，');
+}
+
+String _auditActionLabel(String action) => switch (action) {
+  'project.member_added' => '添加项目成员',
+  'project.member_role_updated' => '更新成员角色',
+  'project.member_removed' => '移除项目成员',
+  'incident.acknowledged' => '确认故障',
+  'notification_channel.created' => '创建通知渠道',
+  'notification_channel.updated' => '更新通知渠道',
+  'notification_channel.deleted' => '删除通知渠道',
+  'notification_channel.test_requested' => '发送测试通知',
+  'agent.enrollment.created' => '签发 Agent 注册令牌',
+  'agent.registered' => '注册 Agent',
+  'agent.revoked' => '吊销 Agent 凭据',
+  'heartbeat.token.rotated' => '轮换心跳任务令牌',
+  'installation.completed' => '完成系统初始化',
+  _ => action,
+};
 
 class _ProjectsPage extends StatelessWidget {
   const _ProjectsPage({

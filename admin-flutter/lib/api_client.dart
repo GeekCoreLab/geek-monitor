@@ -81,6 +81,26 @@ class ApiClient {
   Future<List<Map<String, dynamic>>> projects() async =>
       _asMapList(await _send('GET', '/api/v1/projects'));
 
+  Future<Map<String, dynamic>> systemStatus() async =>
+      (await _send('GET', '/api/v1/system/status')) as Map<String, dynamic>;
+
+  Future<Map<String, dynamic>> auditLog({
+    int limit = 50,
+    String? beforeCreatedAt,
+    String? beforeId,
+  }) async {
+    final query = <String, String>{'limit': '$limit'};
+    if (beforeCreatedAt != null && beforeId != null) {
+      query['beforeCreatedAt'] = beforeCreatedAt;
+      query['beforeId'] = beforeId;
+    }
+    return (await _send(
+          'GET',
+          '/api/v1/audit-log?${Uri(queryParameters: query).query}',
+        ))
+        as Map<String, dynamic>;
+  }
+
   Future<Map<String, dynamic>> createProject({
     required String name,
     required String description,

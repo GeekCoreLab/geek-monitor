@@ -541,16 +541,16 @@ class MetricRetentionScheduler {
         private const val HOUR_SECONDS = 3600L
         private const val RAW_BATCH_SECONDS = 1800L
         private const val ROLLUP_BATCH_SECONDS = 43200L
-        private const val RAW_METRIC_RETENTION_SECONDS = 3 * 24 * 60 * 60L
-        private const val FIVE_MINUTE_ROLLUP_RETENTION_SECONDS = 30 * 24 * 60 * 60L
-        private const val HOURLY_ROLLUP_RETENTION_SECONDS = 180 * 24 * 60 * 60L
-        private const val CHECK_EXECUTION_RETENTION_SECONDS = 7 * 24 * 60 * 60L
-        private const val AGENT_BATCH_RETENTION_SECONDS = 30 * 24 * 60 * 60L
-        private const val EVENT_RETENTION_SECONDS = 180 * 24 * 60 * 60L
+        private const val RAW_METRIC_RETENTION_SECONDS = RetentionPolicyCatalog.RAW_METRIC_DAYS * RetentionPolicyCatalog.DAY_SECONDS
+        private const val FIVE_MINUTE_ROLLUP_RETENTION_SECONDS = RetentionPolicyCatalog.FIVE_MINUTE_ROLLUP_DAYS * RetentionPolicyCatalog.DAY_SECONDS
+        private const val HOURLY_ROLLUP_RETENTION_SECONDS = RetentionPolicyCatalog.HOURLY_ROLLUP_DAYS * RetentionPolicyCatalog.DAY_SECONDS
+        private const val CHECK_EXECUTION_RETENTION_SECONDS = RetentionPolicyCatalog.CHECK_EXECUTION_DAYS * RetentionPolicyCatalog.DAY_SECONDS
+        private const val AGENT_BATCH_RETENTION_SECONDS = RetentionPolicyCatalog.AGENT_BATCH_DAYS * RetentionPolicyCatalog.DAY_SECONDS
+        private const val EVENT_RETENTION_SECONDS = RetentionPolicyCatalog.EVENT_DAYS * RetentionPolicyCatalog.DAY_SECONDS
         private const val DELETE_BATCH_SIZE = 10_000
         private const val AVAILABILITY_FINALIZATION_DELAY_SECONDS = 300L
         private const val AVAILABILITY_BUCKET_BATCH_SIZE = 24
-        private const val AVAILABILITY_RETENTION_SECONDS = 180 * 24 * 60 * 60L
+        private const val AVAILABILITY_RETENTION_SECONDS = RetentionPolicyCatalog.AVAILABILITY_DAYS * RetentionPolicyCatalog.DAY_SECONDS
         private const val MAX_MONITOR_INTERVAL_SECONDS = 24 * 60 * 60L
     }
 }

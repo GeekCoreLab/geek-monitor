@@ -32,3 +32,22 @@ mv -- "$temporary_checksum" "$checksum_file"
 trap - EXIT
 
 printf 'Backup created: %s\nChecksum: %s\n' "$backup_file" "$checksum_file"
+backup_filename=$(basename -- "$backup_file")
+backup_size_bytes=$(stat --format='%s' -- "$backup_file")
+backup_sha256=$(<"$checksum_file")
+backup_status_table=$(psql --no-psqlrc --quiet --tuples-only --no-align --set=ON_ERROR_STOP=1 \
+	--dbname="$PGDATABASE" --command="SELECT to_regclass('public.backup_status') IS NOT NULL" | tr -d '[:space:]')
+if [[ "$backup_status_table" == "t" ]]; then
+	psql --no-psqlrc --quiet --set=ON_ERROR_STOP=1 \
+		--set="backup_filename=$backup_filename" \
+		--set="backup_size_bytes=$backup_size_bytes" \
+		--set="backup_sha256=$backup_sha256" \
+		--dbname="$PGDATABASE" <<'SQL'
+INSERT INTO backup_status(id, filename, size_bytes, sha256, completed_at)
+VALUES (1, :'backup_filename', :backup_size_bytes, :'backup_sha256', now())
+ON CONFLICT (id) DO UPDATE SET filename = EXCLUDED.filename, size_bytes = EXCLUDED.size_bytes,
+	sha256 = EXCLUDED.sha256, completed_at = EXCLUDED.completed_at;
+SQL
+else
+	printf 'Backup status was not recorded; apply Geek Monitor migration V22 to enable status reporting.\n' >&2
+fi
