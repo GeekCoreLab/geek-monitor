@@ -142,11 +142,16 @@ class ApiClient {
   }) async {
     final to = DateTime.now().toUtc();
     final from = to.subtract(Duration(days: rangeDays));
+    final stepSeconds = rangeDays <= 3
+        ? 60
+        : rangeDays <= 7
+        ? 300
+        : 3600;
     final query = Uri(
       queryParameters: {
         'from': from.toIso8601String(),
         'to': to.toIso8601String(),
-        'stepSeconds': '60',
+        'stepSeconds': '$stepSeconds',
       },
     ).query;
     return (await _send(

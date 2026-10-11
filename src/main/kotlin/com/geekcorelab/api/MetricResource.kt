@@ -132,6 +132,6 @@ class MetricResource {
         private const val FIVE_MINUTE_ROLLUP_SECONDS = 300
         private const val HOURLY_ROLLUP_SECONDS = 3600
         private const val MAX_BUCKETS = 5000
-        private const val MAX_RESPONSE_BUCKETS = 20000
+        private const val MAX_RESPONSE_BUCKETS = 250_000
     }
 }

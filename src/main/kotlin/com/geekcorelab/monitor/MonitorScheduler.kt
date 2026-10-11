@@ -29,16 +29,16 @@ class MonitorScheduler {
 
     private val threadNumber = AtomicInteger()
     private val executor = ThreadPoolExecutor(
-        4,
-        4,
+        16,
+        16,
         0L,
         TimeUnit.MILLISECONDS,
-        ArrayBlockingQueue(100),
+        ArrayBlockingQueue(500),
         ThreadFactory { task -> Thread(task, "geek-monitor-check-${threadNumber.incrementAndGet()}").apply { isDaemon = true } },
         ThreadPoolExecutor.AbortPolicy(),
     )
 
-    @Scheduled(every = "2s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
+    @Scheduled(every = "1s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
     fun dispatchDueChecks() {
         val capacity = executor.queue.remainingCapacity().coerceAtMost(MAX_CLAIM_PER_TICK)
         if (capacity <= 0) return
@@ -74,7 +74,7 @@ class MonitorScheduler {
             }
             tasks.forEach { task ->
                 connection.prepareStatement(
-                    "INSERT INTO check_execution(id, monitor_id, scheduled_at, started_at, result_status, interval_seconds) VALUES (?, ?, ?, now(), 'RUNNING', ?)",
+                    "INSERT INTO check_execution(id, monitor_id, scheduled_at, result_status, interval_seconds) VALUES (?, ?, ?, 'RUNNING', ?)",
                 ).use { statement ->
                     statement.setObject(1, task.executionId)
                     statement.setObject(2, task.id)
@@ -116,6 +116,7 @@ class MonitorScheduler {
 
     private fun execute(task: CheckTask) {
         val result = try {
+            markExecutionStarted(task.executionId)
             val config = objectMapper.readTree(task.config)
             if (task.type == "HEARTBEAT" && config is ObjectNode) {
                 config.put("monitorId", task.id.toString())
@@ -130,6 +131,15 @@ class MonitorScheduler {
             CheckResponse("UNKNOWN", null, "CHECKER_ERROR", "检查器发生内部错误", 0, Instant.now().toString())
         }
         persistResult(task, result)
+    }
+
+    private fun markExecutionStarted(executionId: UUID) {
+        dataSource.connection.use { connection ->
+            connection.prepareStatement("UPDATE check_execution SET started_at = now() WHERE id = ? AND result_status = 'RUNNING'").use { statement ->
+                statement.setObject(1, executionId)
+                statement.executeUpdate()
+            }
+        }
     }
 
     private fun persistResult(task: CheckTask, result: CheckResponse) {
@@ -702,7 +712,7 @@ class MonitorScheduler {
     )
 
     companion object {
-        private const val MAX_CLAIM_PER_TICK = 20
+        private const val MAX_CLAIM_PER_TICK = 500
         private val DATABASE_MONITOR_TYPES = setOf("POSTGRESQL", "MYSQL", "REDIS")
     }
 }
