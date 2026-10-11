@@ -93,9 +93,9 @@ class SystemResource {
                 if (beforeCreatedAt != null && beforeId != null) {
                     statement.setTimestamp(1, Timestamp.from(beforeCreatedAt))
                     statement.setObject(2, beforeId)
-                    statement.setInt(3, limit)
+                    statement.setInt(3, limit + 1)
                 } else {
-                    statement.setInt(1, limit)
+                    statement.setInt(1, limit + 1)
                 }
                 statement.executeQuery().use { rows ->
                     while (rows.next()) {
@@ -112,8 +112,7 @@ class SystemResource {
                 }
             }
         }
-        val next = entries.lastOrNull()?.takeIf { entries.size == limit }?.let { AuditLogCursor(it.createdAt, it.id) }
-        return Response.ok(AuditLogPageResponse(entries, next)).build()
+        return Response.ok(auditLogPage(entries, limit)).build()
     }
 
     private fun sanitizeSummary(node: JsonNode): JsonNode = when {

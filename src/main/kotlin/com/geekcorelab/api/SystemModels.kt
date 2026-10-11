@@ -32,3 +32,11 @@ data class AuditLogEntry(
 )
 
 data class AuditLogPageResponse(val items: List<AuditLogEntry>, val next: AuditLogCursor?)
+
+internal fun auditLogPage(entries: List<AuditLogEntry>, limit: Int): AuditLogPageResponse {
+    require(limit > 0)
+    val hasMore = entries.size > limit
+    val page = entries.take(limit)
+    val next = page.lastOrNull()?.takeIf { hasMore }?.let { AuditLogCursor(it.createdAt, it.id) }
+    return AuditLogPageResponse(page, next)
+}
