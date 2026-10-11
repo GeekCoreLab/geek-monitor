@@ -1182,6 +1182,8 @@ class _DashboardShellState extends State<_DashboardShell> {
     try {
       final enrollment = await widget.api.createAgentEnrollment(resourceId);
       if (!mounted) return;
+      await _reload();
+      if (!mounted) return;
       final token = enrollment['token'] as String;
       final resourceName =
           hosts.firstWhere((item) => item['id'] == resourceId)['name']
@@ -2481,7 +2483,7 @@ class _AgentsPage extends StatelessWidget {
                   children: [
                     const Expanded(
                       child: Text(
-                        '已注册节点',
+                        '节点列表',
                         style: TextStyle(
                           fontSize: 14,
                           fontWeight: FontWeight.w700,
@@ -2528,6 +2530,12 @@ class _AgentsPage extends StatelessWidget {
                       ],
                       rows: agents.map((agent) {
                         final status = agent['status'] as String? ?? 'OFFLINE';
+                        final lastActivity = switch (status) {
+                          'WAITING_INSTALL' =>
+                            '令牌有效至 ${_dateTime(agent['expiresAt'] as String?)}',
+                          'INSTALL_EXPIRED' => '令牌已过期，可重新签发',
+                          _ => _dateTime(agent['lastSeenAt'] as String?),
+                        };
                         return DataRow(
                           cells: [
                             DataCell(
@@ -2541,13 +2549,13 @@ class _AgentsPage extends StatelessWidget {
                             ),
                             DataCell(
                               Text(
-                                agent['hostname'] as String? ?? '',
+                                agent['hostname'] as String? ?? '—',
                                 style: const TextStyle(fontSize: 12),
                               ),
                             ),
                             DataCell(
                               Text(
-                                agent['operatingSystem'] as String? ?? '',
+                                agent['operatingSystem'] as String? ?? '—',
                                 style: const TextStyle(
                                   fontSize: 11,
                                   color: _muted,
@@ -2556,7 +2564,7 @@ class _AgentsPage extends StatelessWidget {
                             ),
                             DataCell(
                               Text(
-                                agent['agentVersion'] as String? ?? '',
+                                agent['agentVersion'] as String? ?? '—',
                                 style: const TextStyle(
                                   fontSize: 11,
                                   color: _muted,
@@ -2566,7 +2574,7 @@ class _AgentsPage extends StatelessWidget {
                             DataCell(_AgentStatusTag(status: status)),
                             DataCell(
                               Text(
-                                _dateTime(agent['lastSeenAt'] as String?),
+                                lastActivity,
                                 style: const TextStyle(
                                   fontSize: 10,
                                   color: _muted,
@@ -2574,7 +2582,7 @@ class _AgentsPage extends StatelessWidget {
                               ),
                             ),
                             DataCell(
-                              isAdmin && status != 'REVOKED'
+                              isAdmin && (status == 'ONLINE' || status == 'OFFLINE')
                                   ? IconButton(
                                       tooltip: '吊销凭据',
                                       onPressed: () => onRevoke(agent),
@@ -2609,11 +2617,15 @@ class _AgentStatusTag extends StatelessWidget {
     final color = switch (status) {
       'ONLINE' => const Color(0xFF2C8B66),
       'REVOKED' => const Color(0xFF963F38),
+      'INSTALL_EXPIRED' => const Color(0xFF963F38),
+      'WAITING_INSTALL' => const Color(0xFFAA7514),
       _ => const Color(0xFF7B8794),
     };
     final label = switch (status) {
-      'ONLINE' => '在线',
+      'ONLINE' => '正常',
       'REVOKED' => '已吊销',
+      'WAITING_INSTALL' => '等待安装',
+      'INSTALL_EXPIRED' => '令牌已过期',
       _ => '离线',
     };
     return Container(

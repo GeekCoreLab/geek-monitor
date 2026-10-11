@@ -4,7 +4,7 @@ The Agent is a small Linux-only Go program that collects CPU usage, load, memory
 
 ## One-command installation
 
-In the Admin console, add a resource with type **HOST**, open **Agent 节点**, and choose **注册主机 Agent**. The console creates a one-time token and displays a copyable install command. Run that command on the target Linux host, then enter the token when the installer prompts; input is hidden and the token is not embedded in shell history.
+In the Admin console, add a resource with type **HOST**, open **Agent 节点**, and choose **注册主机 Agent**. After issuing a one-time token, the node appears in the list as **等待安装** and the console displays a copyable install command. Run that command on the target Linux host, then enter the token when the installer prompts; input is hidden and the token is not embedded in shell history. Once registration succeeds, that pending row is replaced by the Agent's normal online status. Expired tokens stay visible as **令牌已过期** until a new token is issued.
 
 The command downloads `install-agent.sh` from the latest GitHub Release. The script downloads the matching Linux amd64 or arm64 binary and `SHA256SUMS`, verifies the binary, creates a restricted `geek-monitor` service account, registers the node, and enables its systemd service. It removes the one-time token after registration and refuses to overwrite an existing Agent state file.
 
