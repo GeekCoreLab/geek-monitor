@@ -1,8 +1,11 @@
 import 'dart:convert';
 
-import 'package:http/browser_client.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'src/http_client_factory_stub.dart'
+    if (dart.library.js_interop) 'src/http_client_factory_web.dart'
+    as http_client_factory;
 
 class ApiException implements Exception {
   const ApiException(this.message, {this.statusCode});
@@ -20,7 +23,7 @@ class ApiClient {
   static const _emailKey = 'geek-monitor.last-email';
   static const _configuredBaseUrl = String.fromEnvironment('API_BASE_URL');
 
-  final BrowserClient _client = BrowserClient()..withCredentials = true;
+  final http.Client _client = http_client_factory.createHttpClient();
 
   Uri get _baseUri => Uri.parse(
     _configuredBaseUrl.isEmpty ? Uri.base.origin : _configuredBaseUrl,

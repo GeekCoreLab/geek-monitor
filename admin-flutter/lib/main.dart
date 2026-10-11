@@ -7,7 +7,7 @@ import 'package:flutter/services.dart';
 import 'api_client.dart';
 
 void main() {
-  runApp(const GeekMonitorApp());
+  runApp(GeekMonitorApp());
 }
 
 const _ink = Color(0xFF182433);
@@ -23,14 +23,16 @@ const _agentInstallScriptUrl =
     'https://github.com/skyhhjmk/geek-monitor/releases/latest/download/install-agent.sh';
 
 class GeekMonitorApp extends StatefulWidget {
-  const GeekMonitorApp({super.key});
+  GeekMonitorApp({super.key, ApiClient? api}) : api = api ?? ApiClient();
+
+  final ApiClient api;
 
   @override
   State<GeekMonitorApp> createState() => _GeekMonitorAppState();
 }
 
 class _GeekMonitorAppState extends State<GeekMonitorApp> {
-  final _api = ApiClient();
+  ApiClient get _api => widget.api;
   _GateState _gate = _GateState.loading;
   Map<String, dynamic>? _user;
   String? _startupError;
