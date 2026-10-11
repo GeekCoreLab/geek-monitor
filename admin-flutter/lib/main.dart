@@ -789,6 +789,7 @@ enum _Section {
   incidents,
   notifications,
   projects,
+  members,
   agents,
 }
 
@@ -1362,7 +1363,14 @@ class _DashboardShellState extends State<_DashboardShell> {
       ),
       _Section.projects => _ProjectsPage(
         projects: _projects,
+        canCreate: widget.user['role'] == 'ADMIN',
         onCreate: _createProject,
+      ),
+      _Section.members => _ProjectMembersPage(
+        api: widget.api,
+        projects: _projects,
+        userId: widget.user['id'] as String? ?? '',
+        canManage: widget.user['role'] == 'ADMIN',
       ),
       _Section.agents => _AgentsPage(
         agents: _agents,
@@ -1469,6 +1477,12 @@ class _SideNavigation extends StatelessWidget {
           label: '项目管理',
           selected: section == _Section.projects,
           onTap: () => onSelect(_Section.projects),
+        ),
+        _NavItem(
+          icon: Icons.group_outlined,
+          label: '成员与角色',
+          selected: section == _Section.members,
+          onTap: () => onSelect(_Section.members),
         ),
         _NavItem(
           icon: Icons.memory_outlined,
@@ -1632,10 +1646,11 @@ class _TopBar extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 2),
-            Text(
-              user['role'] == 'ADMIN' ? '系统管理员' : '成员',
-              style: const TextStyle(fontSize: 10, color: _muted),
-            ),
+            Text(switch (user['role']) {
+              'ADMIN' => '系统管理员',
+              'READ_ONLY' => '只读成员',
+              _ => '运维人员',
+            }, style: const TextStyle(fontSize: 10, color: _muted)),
           ],
         ),
         if (MediaQuery.sizeOf(context).width < 940) ...[
@@ -1681,6 +1696,7 @@ class _BottomNavigation extends StatelessWidget {
         label: '通知',
       ),
       NavigationDestination(icon: Icon(Icons.folder_outlined), label: '项目'),
+      NavigationDestination(icon: Icon(Icons.group_outlined), label: '成员'),
       NavigationDestination(icon: Icon(Icons.memory_outlined), label: 'Agent'),
     ],
   );
@@ -2959,10 +2975,417 @@ String _metricName(String value) => switch (value) {
   _ => value,
 };
 
+class _ProjectMembersPage extends StatefulWidget {
+  const _ProjectMembersPage({
+    required this.api,
+    required this.projects,
+    required this.userId,
+    required this.canManage,
+  });
+
+  final ApiClient api;
+  final List<Map<String, dynamic>> projects;
+  final String userId;
+  final bool canManage;
+
+  @override
+  State<_ProjectMembersPage> createState() => _ProjectMembersPageState();
+}
+
+class _ProjectMembersPageState extends State<_ProjectMembersPage> {
+  String? _projectId;
+  List<Map<String, dynamic>> _members = [];
+  bool _loading = false;
+
+  List<Map<String, dynamic>> get _adminProjects => widget.projects
+      .where((project) => project['membershipRole'] == 'ADMIN')
+      .toList();
+
+  @override
+  void initState() {
+    super.initState();
+    final projects = _adminProjects;
+    if (projects.isNotEmpty) {
+      _projectId = projects.first['id'] as String;
+      _loadMembers();
+    }
+  }
+
+  Future<void> _loadMembers() async {
+    final projectId = _projectId;
+    if (projectId == null || !widget.canManage) return;
+    setState(() => _loading = true);
+    try {
+      final members = await widget.api.projectMembers(projectId);
+      if (mounted && projectId == _projectId) {
+        setState(() => _members = members);
+      }
+    } catch (error) {
+      if (mounted) _showNotice(error.toString(), isError: true);
+    } finally {
+      if (mounted && projectId == _projectId) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  Future<void> _addMember() async {
+    final projectId = _projectId;
+    if (projectId == null) return;
+    final draft = await showDialog<_ProjectMemberDraft>(
+      context: context,
+      builder: (_) => const _ProjectMemberDialog(),
+    );
+    if (draft == null) return;
+    try {
+      await widget.api.addProjectMember(
+        projectId: projectId,
+        email: draft.email,
+        password: draft.password,
+        role: draft.role,
+      );
+      await _loadMembers();
+      if (mounted) _showNotice('成员已添加');
+    } catch (error) {
+      if (mounted) _showNotice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _changeRole(Map<String, dynamic> member, String role) async {
+    final projectId = _projectId;
+    if (projectId == null || role == member['role']) return;
+    try {
+      await widget.api.updateProjectMemberRole(
+        projectId: projectId,
+        memberId: member['id'] as String,
+        role: role,
+      );
+      await _loadMembers();
+      if (mounted) _showNotice('账号角色已更新');
+    } catch (error) {
+      if (mounted) _showNotice(error.toString(), isError: true);
+      await _loadMembers();
+    }
+  }
+
+  Future<void> _removeMember(Map<String, dynamic> member) async {
+    final projectId = _projectId;
+    if (projectId == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('移除项目成员？'),
+        content: Text('移除 ${member['email']} 后，该账号将无法访问此项目。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('移除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.api.removeProjectMember(
+        projectId: projectId,
+        memberId: member['id'] as String,
+      );
+      await _loadMembers();
+      if (mounted) _showNotice('成员已从项目移除');
+    } catch (error) {
+      if (mounted) _showNotice(error.toString(), isError: true);
+    }
+  }
+
+  void _showNotice(String message, {bool isError = false}) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: isError ? _red : const Color(0xFF263B52),
+        ),
+      );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final projects = _adminProjects;
+    return _PageScroll(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _PageHeading(
+            eyebrow: 'PROJECT ACCESS',
+            title: '成员与角色',
+            subtitle: '为项目授权成员，并管理其运维权限。',
+            actions: [
+              if (widget.canManage && projects.isNotEmpty)
+                FilledButton.icon(
+                  onPressed: _addMember,
+                  icon: const Icon(Icons.person_add_alt_1_rounded),
+                  label: const Text('添加成员'),
+                ),
+            ],
+          ),
+          if (!widget.canManage || projects.isEmpty)
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(28),
+                child: _EmptyState(
+                  icon: Icons.group_outlined,
+                  title: '没有可管理的项目',
+                  subtitle: '只有项目管理员可以查看和修改成员权限。',
+                ),
+              ),
+            )
+          else ...[
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    DropdownButtonFormField<String>(
+                      initialValue: _projectId,
+                      decoration: const InputDecoration(labelText: '项目'),
+                      items: projects
+                          .map(
+                            (project) => DropdownMenuItem(
+                              value: project['id'] as String,
+                              child: Text(project['name'] as String? ?? '项目'),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (value) {
+                        if (value == null) return;
+                        setState(() {
+                          _projectId = value;
+                          _members = [];
+                        });
+                        _loadMembers();
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      '账号角色会同步到该账号加入的所有项目；项目成员关系决定其可访问范围。',
+                      style: TextStyle(color: _muted, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            Card(
+              child: _loading
+                  ? const Padding(
+                      padding: EdgeInsets.all(28),
+                      child: Center(child: CircularProgressIndicator()),
+                    )
+                  : _members.isEmpty
+                  ? const Padding(
+                      padding: EdgeInsets.all(24),
+                      child: _EmptyState(
+                        icon: Icons.group_outlined,
+                        title: '项目还没有其他成员',
+                        subtitle: '添加成员后，他们可使用自己的账号登录。',
+                      ),
+                    )
+                  : Column(
+                      children: _members.map((member) {
+                        final memberId = member['id'] as String;
+                        final isSelf = memberId == widget.userId;
+                        final createdAt = member['createdAt'] as String? ?? '';
+                        return Column(
+                          children: [
+                            ListTile(
+                              leading: CircleAvatar(
+                                backgroundColor: const Color(0xFFEAF0FA),
+                                child: Icon(
+                                  Icons.person_outline_rounded,
+                                  color: _blue,
+                                ),
+                              ),
+                              title: Text(member['email'] as String? ?? ''),
+                              subtitle: Text(
+                                createdAt.isEmpty
+                                    ? '账号创建时间未知'
+                                    : '账号创建于 ${createdAt.replaceFirst('T', ' ').split('.').first}',
+                              ),
+                              trailing: Wrap(
+                                crossAxisAlignment: WrapCrossAlignment.center,
+                                spacing: 4,
+                                children: [
+                                  DropdownButton<String>(
+                                    value:
+                                        member['role'] as String? ?? 'OPERATOR',
+                                    items: const [
+                                      DropdownMenuItem(
+                                        value: 'ADMIN',
+                                        child: Text('管理员'),
+                                      ),
+                                      DropdownMenuItem(
+                                        value: 'OPERATOR',
+                                        child: Text('运维人员'),
+                                      ),
+                                      DropdownMenuItem(
+                                        value: 'READ_ONLY',
+                                        child: Text('只读成员'),
+                                      ),
+                                    ],
+                                    onChanged: isSelf || !widget.canManage
+                                        ? null
+                                        : (value) {
+                                            if (value != null) {
+                                              _changeRole(member, value);
+                                            }
+                                          },
+                                  ),
+                                  IconButton(
+                                    tooltip: isSelf ? '当前账号' : '从项目移除',
+                                    onPressed: isSelf || !widget.canManage
+                                        ? null
+                                        : () => _removeMember(member),
+                                    icon: Icon(
+                                      isSelf
+                                          ? Icons.verified_user_outlined
+                                          : Icons.person_remove_alt_1_rounded,
+                                      color: isSelf ? _muted : _red,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const Divider(height: 1),
+                          ],
+                        );
+                      }).toList(),
+                    ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ProjectMemberDraft {
+  const _ProjectMemberDraft(this.email, this.password, this.role);
+  final String email;
+  final String password;
+  final String role;
+}
+
+class _ProjectMemberDialog extends StatefulWidget {
+  const _ProjectMemberDialog();
+
+  @override
+  State<_ProjectMemberDialog> createState() => _ProjectMemberDialogState();
+}
+
+class _ProjectMemberDialogState extends State<_ProjectMemberDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _email = TextEditingController();
+  final _password = TextEditingController();
+  String _role = 'OPERATOR';
+
+  @override
+  void dispose() {
+    _email.dispose();
+    _password.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('添加项目成员'),
+    content: SizedBox(
+      width: 460,
+      child: Form(
+        key: _formKey,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextFormField(
+              controller: _email,
+              decoration: const InputDecoration(labelText: '邮箱'),
+              keyboardType: TextInputType.emailAddress,
+              validator: (value) {
+                final email = value?.trim() ?? '';
+                return email.contains('@') && email.contains('.')
+                    ? null
+                    : '请输入有效邮箱';
+              },
+            ),
+            TextFormField(
+              controller: _password,
+              decoration: const InputDecoration(
+                labelText: '初始密码',
+                hintText: '新账号必填，已有账号留空',
+              ),
+              obscureText: true,
+              validator: (value) {
+                final password = value ?? '';
+                return password.isEmpty || password.length >= 12
+                    ? null
+                    : '密码至少需要 12 个字符';
+              },
+            ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: _role,
+              decoration: const InputDecoration(labelText: '账号角色'),
+              items: const [
+                DropdownMenuItem(value: 'ADMIN', child: Text('管理员')),
+                DropdownMenuItem(value: 'OPERATOR', child: Text('运维人员')),
+                DropdownMenuItem(value: 'READ_ONLY', child: Text('只读成员')),
+              ],
+              onChanged: (value) {
+                if (value != null) setState(() => _role = value);
+              },
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              '角色应用于该账号的所有项目。已有账号请选择其当前角色；新账号首次登录后可正常修改密码。',
+              style: TextStyle(color: _muted, fontSize: 12, height: 1.45),
+            ),
+          ],
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(
+        onPressed: () {
+          if (!_formKey.currentState!.validate()) return;
+          Navigator.pop(
+            context,
+            _ProjectMemberDraft(_email.text.trim(), _password.text, _role),
+          );
+        },
+        child: const Text('添加'),
+      ),
+    ],
+  );
+}
+
 class _ProjectsPage extends StatelessWidget {
-  const _ProjectsPage({required this.projects, required this.onCreate});
+  const _ProjectsPage({
+    required this.projects,
+    required this.canCreate,
+    required this.onCreate,
+  });
 
   final List<Map<String, dynamic>> projects;
+  final bool canCreate;
   final VoidCallback onCreate;
 
   @override
@@ -2974,13 +3397,15 @@ class _ProjectsPage extends StatelessWidget {
           eyebrow: 'PROJECTS',
           title: '项目管理',
           subtitle: '用项目组织环境、资源和团队权限。',
-          actions: [
-            FilledButton.icon(
-              onPressed: onCreate,
-              icon: const Icon(Icons.add_rounded),
-              label: const Text('创建项目'),
-            ),
-          ],
+          actions: canCreate
+              ? [
+                  FilledButton.icon(
+                    onPressed: onCreate,
+                    icon: const Icon(Icons.add_rounded),
+                    label: const Text('创建项目'),
+                  ),
+                ]
+              : const [],
         ),
         if (projects.isEmpty)
           const Card(

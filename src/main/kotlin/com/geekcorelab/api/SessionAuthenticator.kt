@@ -44,6 +44,16 @@ class SessionAuthenticator {
         }
     }
 
+    fun canManageProject(userId: UUID, projectId: UUID): Boolean = dataSource.connection.use { connection ->
+        connection.prepareStatement(
+            "SELECT 1 FROM project_membership WHERE project_id = ? AND user_id = ? AND role = 'ADMIN'",
+        ).use { statement ->
+            statement.setObject(1, projectId)
+            statement.setObject(2, userId)
+            statement.executeQuery().use { it.next() }
+        }
+    }
+
     fun canAccessResource(userId: UUID, resourceId: UUID): Boolean = dataSource.connection.use { connection ->
         connection.prepareStatement(
             "SELECT 1 FROM monitored_resource r JOIN project_membership pm ON pm.project_id = r.project_id WHERE r.id = ? AND r.deleted_at IS NULL AND pm.user_id = ?",

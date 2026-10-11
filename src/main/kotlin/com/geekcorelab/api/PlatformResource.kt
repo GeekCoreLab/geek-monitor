@@ -166,11 +166,11 @@ class PlatformResource {
     @GET
     @Path("/projects")
     fun listProjects(@Context headers: HttpHeaders): Response {
-        val user = requireAdmin(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
         val projects = mutableListOf<ProjectResponse>()
         dataSource.connection.use { connection ->
             connection.prepareStatement(
-                "SELECT p.id, p.name, p.description, p.created_at FROM project p JOIN project_membership pm ON pm.project_id = p.id WHERE pm.user_id = ? ORDER BY p.created_at",
+                "SELECT p.id, p.name, p.description, p.created_at, pm.role AS membership_role FROM project p JOIN project_membership pm ON pm.project_id = p.id WHERE pm.user_id = ? ORDER BY p.created_at",
             ).use { statement ->
                 statement.setObject(1, user.id)
                 statement.executeQuery().use { result -> while (result.next()) projects += result.toProject() }
@@ -182,7 +182,8 @@ class PlatformResource {
     @POST
     @Path("/projects")
     fun createProject(request: ProjectRequest, @Context headers: HttpHeaders): Response {
-        val user = requireAdmin(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        if (user.role != "ADMIN") return error(Response.Status.FORBIDDEN, "ADMIN_REQUIRED", "只有系统管理员可以创建项目")
         val name = request.name?.trim().orEmpty()
         val description = request.description?.trim().orEmpty()
         if (name.isBlank() || name.length > 120 || description.length > 1000) return error(Response.Status.BAD_REQUEST, "INVALID_PROJECT", "请检查项目名称和说明")
@@ -238,6 +239,7 @@ class PlatformResource {
     @Path("/resources")
     fun createResource(request: ResourceRequest, @Context headers: HttpHeaders): Response {
         val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        if (user.role == "READ_ONLY") return error(Response.Status.FORBIDDEN, "READ_ONLY", "只读成员不能创建资源")
         val projectId = request.projectId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
         val name = request.name?.trim().orEmpty()
         val type = request.type?.trim()?.uppercase().orEmpty()
@@ -303,6 +305,7 @@ class PlatformResource {
     @Path("/resources/{id}")
     fun deleteResource(@PathParam("id") idText: String, @Context headers: HttpHeaders): Response {
         val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        if (user.role == "READ_ONLY") return error(Response.Status.FORBIDDEN, "READ_ONLY", "只读成员不能删除资源")
         val id = runCatching { UUID.fromString(idText) }.getOrNull() ?: return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "资源编号无效")
         val updated = dataSource.connection.use { connection ->
             connection.prepareStatement(
@@ -325,8 +328,6 @@ class PlatformResource {
             statement.executeQuery().use { result -> if (result.next()) result.toResource() else null }
         }
     }
-
-    private fun requireAdmin(headers: HttpHeaders): AuthenticatedUser? = authenticator.currentUser(headers)?.takeIf { it.role == "ADMIN" }
 
     private fun bearer(headers: HttpHeaders): String? = headers.getHeaderString(HttpHeaders.AUTHORIZATION)
         ?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }
@@ -358,7 +359,10 @@ class PlatformResource {
     }
 
     private fun error(status: Response.Status, code: String, message: String) = Response.status(status).entity(ErrorResponse(code, message)).build()
-    private fun ResultSet.toProject() = ProjectResponse(getObject("id").toString(), getString("name"), getString("description"), getTimestamp("created_at").toInstant().toString())
+    private fun ResultSet.toProject() = ProjectResponse(
+        getObject("id").toString(), getString("name"), getString("description"),
+        getTimestamp("created_at").toInstant().toString(), getString("membership_role"),
+    )
     private fun ResultSet.toResource(): ResourceResponse = ResourceResponse(
         getObject("id").toString(), getObject("project_id").toString(), getString("project_name"), getString("name"), getString("type"),
         getString("environment"), objectMapper.readValue(getString("tags"), objectMapper.typeFactory.constructCollectionType(List::class.java, String::class.java)) as List<String>,

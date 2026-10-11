@@ -6,7 +6,16 @@ data class LoginRequest(val email: String?, val password: String?)
 data class SessionResponse(val expiresAt: String, val user: UserResponse)
 data class UserResponse(val id: String, val email: String, val role: String)
 data class ProjectRequest(val name: String?, val description: String? = "")
-data class ProjectResponse(val id: String, val name: String, val description: String, val createdAt: String)
+data class ProjectResponse(
+    val id: String,
+    val name: String,
+    val description: String,
+    val createdAt: String,
+    val membershipRole: String = "ADMIN",
+)
+data class ProjectMemberRequest(val email: String?, val password: String? = null, val role: String? = null)
+data class ProjectMemberRoleRequest(val role: String?)
+data class ProjectMemberResponse(val id: String, val email: String, val role: String, val createdAt: String)
 data class ResourceRequest(
     val projectId: String?,
     val name: String?,

@@ -92,6 +92,49 @@ class ApiClient {
           ))
           as Map<String, dynamic>;
 
+  Future<List<Map<String, dynamic>>> projectMembers(String projectId) async =>
+      _asMapList(
+        await _send(
+          'GET',
+          '/api/v1/projects/${Uri.encodeComponent(projectId)}/members',
+        ),
+      );
+
+  Future<Map<String, dynamic>> addProjectMember({
+    required String projectId,
+    required String email,
+    required String password,
+    required String role,
+  }) async =>
+      (await _send(
+            'POST',
+            '/api/v1/projects/${Uri.encodeComponent(projectId)}/members',
+            body: {'email': email, 'password': password, 'role': role},
+          ))
+          as Map<String, dynamic>;
+
+  Future<Map<String, dynamic>> updateProjectMemberRole({
+    required String projectId,
+    required String memberId,
+    required String role,
+  }) async =>
+      (await _send(
+            'PATCH',
+            '/api/v1/projects/${Uri.encodeComponent(projectId)}/members/${Uri.encodeComponent(memberId)}',
+            body: {'role': role},
+          ))
+          as Map<String, dynamic>;
+
+  Future<void> removeProjectMember({
+    required String projectId,
+    required String memberId,
+  }) async {
+    await _send(
+      'DELETE',
+      '/api/v1/projects/${Uri.encodeComponent(projectId)}/members/${Uri.encodeComponent(memberId)}',
+    );
+  }
+
   Future<List<Map<String, dynamic>>> resources({String? projectId}) async {
     final query = projectId == null
         ? ''
