@@ -6,11 +6,11 @@ import jakarta.inject.Inject
 import java.sql.Connection
 import java.sql.Timestamp
 import java.sql.ResultSet
-import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 import javax.sql.DataSource
-import kotlin.math.roundToInt
+
+private typealias TimeSpan = AvailabilitySpan
 
 @ApplicationScoped
 class MetricRetentionScheduler {
@@ -355,51 +355,18 @@ class MetricRetentionScheduler {
                 span.start.isBefore(monitor.monitorDeletedAt ?: bucketEnd) &&
                     span.start.isBefore(monitor.resourceDeletedAt ?: bucketEnd)
             }
-            val monitored = merge(monitoringWindows.mapNotNull { clip(it, monitor, bucket, bucketEnd) })
+            val monitored = mergeAvailabilitySpans(monitoringWindows.mapNotNull { clip(it, monitor, bucket, bucketEnd) })
             if (monitored.isEmpty()) return@forEach
-            val excluded = intersect(merge(exclusions[monitor.id].orEmpty()), monitored)
-            val excludedUnion = merge(excluded)
-            val pauses = merge(pausePeriods[monitor.id].orEmpty())
-            var up = 0.0
-            var degraded = 0.0
-            var down = 0.0
+            val excluded = intersectAvailabilitySpans(mergeAvailabilitySpans(exclusions[monitor.id].orEmpty()), monitored)
+            val pauses = mergeAvailabilitySpans(pausePeriods[monitor.id].orEmpty())
             val runs = executions[monitor.id].orEmpty().sortedBy(AvailabilityExecution::scheduledAt)
-            runs.forEachIndexed { index, execution ->
-                val activeWindow = monitoringWindows.firstOrNull {
-                    !execution.scheduledAt.isBefore(it.start) && execution.scheduledAt.isBefore(it.end)
-                }
-                if (activeWindow == null) return@forEachIndexed
-                val pauseWindow = pauses
-                    .firstOrNull { !execution.scheduledAt.isBefore(it.start) && execution.scheduledAt.isBefore(it.end) }
-                if (pauseWindow != null) return@forEachIndexed
-                val intervalEnd = execution.scheduledAt.plusSeconds(execution.intervalSeconds.toLong())
-                val nextAt = runs.getOrNull(index + 1)?.scheduledAt?.takeIf { it.isBefore(activeWindow.end) }
-                val nextPauseAt = pauses
-                    .asSequence()
-                    .map(TimeSpan::start)
-                    .filter { it.isAfter(execution.scheduledAt) && it.isBefore(activeWindow.end) }
-                    .minOrNull()
-                // A result can carry forward for one interval, but cannot cross a disabled or paused period.
-                val end = minOf(intervalEnd, nextAt ?: intervalEnd, nextPauseAt ?: intervalEnd, activeWindow.end)
-                if (!end.isAfter(execution.scheduledAt)) return@forEachIndexed
-                val slot = TimeSpan(execution.scheduledAt, end)
-                val inBucket = intersect(listOf(slot), monitored)
-                val included = subtract(inBucket, excludedUnion)
-                val seconds = durationSeconds(included)
-                when (execution.status) {
-                    "UP" -> up += seconds
-                    "DEGRADED" -> { up += seconds; degraded += seconds }
-                    "DOWN" -> down += seconds
-                }
-            }
-
-            val scheduledSeconds = durationSeconds(monitored).toInt().coerceIn(0, HOUR_SECONDS.toInt())
-            val excludedSeconds = durationSeconds(excluded).roundToInt().coerceIn(0, scheduledSeconds)
-            val eligibleSeconds = (scheduledSeconds - excludedSeconds).coerceAtLeast(0)
-            val upSeconds = up.roundToInt().coerceIn(0, eligibleSeconds)
-            val downSeconds = down.roundToInt().coerceIn(0, eligibleSeconds - upSeconds)
-            val unknownSeconds = eligibleSeconds - upSeconds - downSeconds
-            val degradedSeconds = degraded.roundToInt().coerceIn(0, upSeconds)
+            val totals = calculateAvailabilityBucketTotals(
+                activePeriods = monitoringWindows,
+                monitored = monitored,
+                excluded = excluded,
+                pauses = pauses,
+                executions = runs,
+            )
 
             connection.prepareStatement(
                 """INSERT INTO availability_rollup(monitor_id, bucket_at, scheduled_seconds, up_seconds, degraded_seconds,
@@ -415,12 +382,12 @@ class MetricRetentionScheduler {
             ).use { statement ->
                 statement.setObject(1, monitor.id)
                 statement.setTimestamp(2, Timestamp.from(bucket))
-                statement.setInt(3, scheduledSeconds)
-                statement.setInt(4, upSeconds)
-                statement.setInt(5, degradedSeconds)
-                statement.setInt(6, downSeconds)
-                statement.setInt(7, unknownSeconds)
-                statement.setInt(8, excludedSeconds)
+                statement.setInt(3, totals.scheduledSeconds)
+                statement.setInt(4, totals.upSeconds)
+                statement.setInt(5, totals.degradedSeconds)
+                statement.setInt(6, totals.downSeconds)
+                statement.setInt(7, totals.unknownSeconds)
+                statement.setInt(8, totals.excludedSeconds)
                 statement.executeUpdate()
             }
         }
@@ -434,51 +401,6 @@ class MetricRetentionScheduler {
 
     private fun clip(span: TimeSpan, bucket: Instant, bucketEnd: Instant): TimeSpan? =
         TimeSpan(maxOf(span.start, bucket), minOf(span.end, bucketEnd)).takeIf { it.end.isAfter(it.start) }
-
-    private fun merge(spans: List<TimeSpan>): List<TimeSpan> {
-        if (spans.isEmpty()) return emptyList()
-        val sorted = spans.filter { it.end.isAfter(it.start) }.sortedBy(TimeSpan::start)
-        if (sorted.isEmpty()) return emptyList()
-        val merged = mutableListOf(sorted.first())
-        sorted.drop(1).forEach { span ->
-            val previous = merged.last()
-            if (!span.start.isAfter(previous.end)) {
-                merged[merged.lastIndex] = TimeSpan(previous.start, maxOf(previous.end, span.end))
-            } else merged += span
-        }
-        return merged
-    }
-
-    private fun intersect(left: List<TimeSpan>, right: List<TimeSpan>): List<TimeSpan> = buildList {
-        left.forEach { a ->
-            right.forEach { b ->
-                val start = maxOf(a.start, b.start)
-                val end = minOf(a.end, b.end)
-                if (end.isAfter(start)) add(TimeSpan(start, end))
-            }
-        }
-    }
-
-    private fun subtract(source: List<TimeSpan>, exclusions: List<TimeSpan>): List<TimeSpan> {
-        val cuts = merge(exclusions)
-        return buildList {
-            source.forEach { span ->
-                var cursor = span.start
-                cuts.filter { it.end.isAfter(span.start) && it.start.isBefore(span.end) }.forEach { cut ->
-                    val cutStart = maxOf(cut.start, span.start)
-                    val cutEnd = minOf(cut.end, span.end)
-                    if (cutStart.isAfter(cursor)) add(TimeSpan(cursor, cutStart))
-                    if (cutEnd.isAfter(cursor)) cursor = cutEnd
-                }
-                if (span.end.isAfter(cursor)) add(TimeSpan(cursor, span.end))
-            }
-        }
-    }
-
-    private fun durationSeconds(spans: List<TimeSpan>): Double = spans.sumOf { span ->
-        val duration = Duration.between(span.start, span.end)
-        duration.seconds.toDouble() + duration.nano / 1_000_000_000.0
-    }
 
     private fun ResultSet.toAvailabilityMonitor() = AvailabilityMonitor(
         id = getObject("id", UUID::class.java),
@@ -505,9 +427,6 @@ class MetricRetentionScheduler {
         val resourceCreatedAt: Instant,
         val resourceDeletedAt: Instant?,
     )
-
-    private data class AvailabilityExecution(val scheduledAt: Instant, val intervalSeconds: Int, val status: String)
-    private data class TimeSpan(val start: Instant, val end: Instant)
 
     private fun deleteExpiredAvailabilityRollups(connection: Connection, now: Instant) {
         connection.prepareStatement(
