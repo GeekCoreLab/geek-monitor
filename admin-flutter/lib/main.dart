@@ -5563,6 +5563,7 @@ class _MonitorDraft {
     required this.name,
     required this.target,
     required this.method,
+    required this.allowPostNoSideEffects,
     required this.port,
     required this.recordType,
     required this.resolver,
@@ -5599,6 +5600,7 @@ class _MonitorDraft {
   final String name;
   final String target;
   final String method;
+  final bool allowPostNoSideEffects;
   final int? port;
   final String? recordType;
   final String? resolver;
@@ -5662,6 +5664,7 @@ class _MonitorDraft {
     if (type == 'HTTP') ...{
       'targetUrl': target,
       'method': method,
+      'allowPostNoSideEffects': method == 'POST' && allowPostNoSideEffects,
       'expectedStatusCodes': expectedStatusCodes,
       'textContains': textContains,
       'jsonPath': jsonPath,
@@ -5703,6 +5706,8 @@ class _MonitorDialogState extends State<_MonitorDialog> {
           )['id']
           as String);
   late String _method = widget.existing?['method'] as String? ?? 'GET';
+  late bool _allowPostNoSideEffects =
+      widget.existing?['allowPostNoSideEffects'] as bool? ?? false;
   late String _recordType = widget.existing?['recordType'] as String? ?? 'A';
   late String _metricName =
       widget.existing?['metricName'] as String? ?? 'cpu_usage_percent';
@@ -6047,6 +6052,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                         items: const [
                           DropdownMenuItem(value: 'GET', child: Text('GET')),
                           DropdownMenuItem(value: 'HEAD', child: Text('HEAD')),
+                          DropdownMenuItem(value: 'POST', child: Text('POST')),
                         ],
                         onChanged: (value) {
                           if (value != null) setState(() => _method = value);
@@ -6068,6 +6074,25 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     ),
                   ],
                 ),
+                if (_method == 'POST') ...[
+                  const SizedBox(height: 6),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: _allowPostNoSideEffects,
+                    onChanged: (value) => setState(
+                      () => _allowPostNoSideEffects = value ?? false,
+                    ),
+                    title: const Text(
+                      '我确认此 URL 是无副作用的检查端点',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                    subtitle: const Text(
+                      '请求不会携带正文，但 POST 仍可能触发服务器写操作。未确认时不能保存。',
+                      style: TextStyle(fontSize: 10),
+                    ),
+                    controlAffinity: ListTileControlAffinity.leading,
+                  ),
+                ],
                 const SizedBox(height: 11),
                 TextFormField(
                   controller: _contains,
@@ -6557,6 +6582,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
 
   void _submit() {
     if (!_formKey.currentState!.validate()) return;
+    if (_type == 'HTTP' && _method == 'POST' && !_allowPostNoSideEffects) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('使用 POST 前请确认目标端点无副作用')),
+      );
+      return;
+    }
     final selectedResource = widget.resources.firstWhere(
       (resource) => resource['id'] == _resourceId,
       orElse: () => const <String, dynamic>{},
@@ -6620,6 +6651,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         name: _name.text.trim(),
         target: _target.text.trim(),
         method: _method,
+        allowPostNoSideEffects: _allowPostNoSideEffects,
         port:
             _type == 'TCP' ||
                 _type == 'TLS' ||

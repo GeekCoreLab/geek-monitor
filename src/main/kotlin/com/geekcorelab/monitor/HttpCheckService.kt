@@ -111,12 +111,18 @@ class HttpCheckService {
         textContains: String?,
         jsonPath: String? = null,
         jsonExpectedValue: String? = null,
+        allowPostNoSideEffects: Boolean = false,
         encryptedRequestHeaders: Map<String, String> = emptyMap(),
     ): CheckResponse {
         val startedNanos = System.nanoTime()
         val checkedAt = Instant.now()
         val normalizedJsonPath = jsonPath?.takeIf(String::isNotBlank)
         val normalizedJsonExpectedValue = jsonExpectedValue?.takeIf(String::isNotBlank)
+        val normalizedMethod = method.trim().uppercase()
+        if (normalizedMethod !in setOf("GET", "HEAD", "POST") ||
+            (normalizedMethod == "POST") != allowPostNoSideEffects) {
+            return unknown(startedNanos, checkedAt, "CHECK_CONFIG_INVALID", "HTTP 请求方法配置无效")
+        }
         if (!JsonPointerAssertions.isValidConfiguration(normalizedJsonPath, normalizedJsonExpectedValue)) {
             return unknown(startedNanos, checkedAt, "CHECK_CONFIG_INVALID", "JSON 路径断言配置无效")
         }
@@ -136,6 +142,7 @@ class HttpCheckService {
             return unknown(startedNanos, checkedAt, "TARGET_BLOCKED", "目标地址解析到未授权的地址")
         }
         val visited = mutableSetOf<String>()
+        var headersForCurrentOrigin = requestHeaders
 
         for (redirectCount in 0..MAX_REDIRECTS) {
             if (!visited.add(uri.toASCIIString())) {
@@ -158,10 +165,10 @@ class HttpCheckService {
             val request = try {
                 Request.Builder()
                     .url(uri.toASCIIString())
-                    .method(method, null)
+                    .method(normalizedMethod, if (normalizedMethod == "POST") ByteArray(0).toRequestBody(null) else null)
                     .header("User-Agent", "GeekMonitor/1.0")
                     .header("Accept", "*/*")
-                    .apply { requestHeaders.forEach { (name, value) -> header(name, value) } }
+                    .apply { headersForCurrentOrigin.forEach { (name, value) -> header(name, value) } }
                     .build()
             } catch (exception: Exception) {
                 return unknown(startedNanos, checkedAt, "TARGET_INVALID", "目标地址格式无效")
@@ -169,7 +176,7 @@ class HttpCheckService {
 
             try {
                 client.newCall(request).execute().use { response ->
-                    if (response.code in 300..399 && response.header("Location") != null) {
+                    if (normalizedMethod != "POST" && response.code in 300..399 && response.header("Location") != null) {
                         if (redirectCount == MAX_REDIRECTS) {
                             return failure(startedNanos, checkedAt, "TOO_MANY_REDIRECTS", "重定向次数超过 5 次", response.code)
                         }
@@ -184,6 +191,7 @@ class HttpCheckService {
                         if (uri.scheme == "https" && redirected.scheme != "https") {
                             return unknown(startedNanos, checkedAt, "REDIRECT_DOWNGRADE", "HTTPS 检查不允许重定向到 HTTP", response.code)
                         }
+                        if (!sameOrigin(uri, redirected)) headersForCurrentOrigin = emptyMap()
                         uri = redirected
                         return@use
                     }
@@ -227,6 +235,17 @@ class HttpCheckService {
         require(uri.userInfo == null && uri.fragment == null)
         require(uri.port == -1 || uri.port in 1..65535)
         return uri.normalize()
+    }
+
+    private fun sameOrigin(left: URI, right: URI): Boolean =
+        left.scheme.equals(right.scheme, ignoreCase = true) &&
+            left.host.equals(right.host, ignoreCase = true) &&
+            effectivePort(left) == effectivePort(right)
+
+    private fun effectivePort(uri: URI): Int = when {
+        uri.port != -1 -> uri.port
+        uri.scheme.equals("https", ignoreCase = true) -> 443
+        else -> 80
     }
 
     private fun hasBlockedIpLiteral(host: String, allowedNetworks: List<IpNetwork>): Boolean {

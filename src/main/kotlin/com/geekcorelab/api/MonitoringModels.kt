@@ -12,6 +12,7 @@ data class MonitorRequest(
     val expectedRecordValue: String? = null,
     val minimumValidityDays: Int? = null,
     val method: String? = "GET",
+    val allowPostNoSideEffects: Boolean? = false,
     val intervalSeconds: Int? = 60,
     val timeoutSeconds: Int? = 10,
     val failureThreshold: Int? = 3,
@@ -83,6 +84,7 @@ data class MonitorResponse(
     val jsonPath: String? = null,
     val jsonExpectedValue: String? = null,
     val requestHeaders: Map<String, String> = emptyMap(),
+    val allowPostNoSideEffects: Boolean = false,
 )
 
 data class CheckResponse(

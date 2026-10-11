@@ -48,6 +48,7 @@ class ProtocolCheckService {
             config.path("textContains").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             config.path("jsonPath").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             config.path("jsonExpectedValue").takeUnless { it.isMissingNode || it.isNull }?.asText(),
+            config.path("allowPostNoSideEffects").asBoolean(false),
             config.path("requestHeadersEncrypted").let { headers ->
                 if (headers.isObject) headers.fieldNames().asSequence().associateWith { headers.path(it).asText() }
                 else emptyMap()

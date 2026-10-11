@@ -10,6 +10,7 @@ import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class HttpCheckServiceTargetPolicyTest {
@@ -121,6 +122,123 @@ class HttpCheckServiceTargetPolicyTest {
             assertEquals("smoke", customHeader.get())
         } finally {
             server.stop(0)
+        }
+    }
+
+    @Test
+    fun `POST requires explicit no-side-effect confirmation and sends an empty body`() {
+        val targetAddress = NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .firstOrNull { it.isSiteLocalAddress && !it.isLoopbackAddress }
+        assumeTrue(targetAddress != null, "No private IPv4 interface is available for the local HTTP smoke test")
+
+        val requestCount = AtomicInteger()
+        val method = AtomicReference<String?>()
+        val bodySize = AtomicInteger(-1)
+        val server = HttpServer.create(InetSocketAddress("0.0.0.0", 0), 0)
+        server.createContext("/") { exchange ->
+            requestCount.incrementAndGet()
+            method.set(exchange.requestMethod)
+            bodySize.set(exchange.requestBody.use { it.readAllBytes().size })
+            if (exchange.requestURI.path == "/redirect") {
+                exchange.responseHeaders.add("Location", "/")
+                exchange.sendResponseHeaders(302, -1)
+                exchange.close()
+                return@createContext
+            }
+            val response = "ready".toByteArray()
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
+        }
+        server.start()
+        try {
+            val checker = service(allowPrivateTargets = true)
+            val url = "http://${targetAddress!!.hostAddress}:${server.address.port}/"
+            val refused = checker.execute(url, "POST", 3, setOf(200), null)
+
+            assertEquals("UNKNOWN", refused.status)
+            assertEquals("CHECK_CONFIG_INVALID", refused.errorCode)
+            assertEquals(0, requestCount.get())
+
+            val accepted = checker.execute(
+                targetUrl = url,
+                method = "POST",
+                timeoutSeconds = 3,
+                expectedStatusCodes = setOf(200),
+                textContains = "ready",
+                allowPostNoSideEffects = true,
+            )
+
+            assertEquals("UP", accepted.status)
+            assertEquals(1, requestCount.get())
+            assertEquals("POST", method.get())
+            assertEquals(0, bodySize.get())
+
+            val redirect = checker.execute(
+                targetUrl = "$url/redirect",
+                method = "POST",
+                timeoutSeconds = 3,
+                expectedStatusCodes = setOf(302),
+                textContains = null,
+                allowPostNoSideEffects = true,
+            )
+            assertEquals("UP", redirect.status)
+            assertEquals(2, requestCount.get())
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `encrypted request headers are dropped across origins`() {
+        val targetAddress = NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .firstOrNull { it.isSiteLocalAddress && !it.isLoopbackAddress }
+        assumeTrue(targetAddress != null, "No private IPv4 interface is available for the local HTTP smoke test")
+
+        val forwardedAuthorization = AtomicReference<String?>()
+        val destination = HttpServer.create(InetSocketAddress("0.0.0.0", 0), 0)
+        destination.createContext("/") { exchange ->
+            forwardedAuthorization.set(exchange.requestHeaders.getFirst("Authorization"))
+            val response = "ready".toByteArray()
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
+        }
+        destination.start()
+
+        val redirect = HttpServer.create(InetSocketAddress("0.0.0.0", 0), 0)
+        redirect.createContext("/") { exchange ->
+            exchange.responseHeaders.add(
+                "Location",
+                "http://${targetAddress!!.hostAddress}:${destination.address.port}/",
+            )
+            exchange.sendResponseHeaders(302, -1)
+            exchange.close()
+        }
+        redirect.start()
+        try {
+            val encryption = SecretEncryptionService().apply {
+                keyBase64 = Base64.getEncoder().encodeToString(ByteArray(32) { (it + 1).toByte() })
+            }
+            val checker = service(allowPrivateTargets = true).apply { secretEncryption = encryption }
+            val result = checker.execute(
+                targetUrl = "http://${targetAddress!!.hostAddress}:${redirect.address.port}/",
+                method = "GET",
+                timeoutSeconds = 3,
+                expectedStatusCodes = setOf(200),
+                textContains = "ready",
+                encryptedRequestHeaders = mapOf(
+                    "authorization" to encryption.encrypt("Bearer synthetic-test-token"),
+                ),
+            )
+
+            assertEquals("UP", result.status)
+            assertEquals(null, forwardedAuthorization.get())
+        } finally {
+            redirect.stop(0)
+            destination.stop(0)
         }
     }
 

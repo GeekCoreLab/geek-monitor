@@ -288,6 +288,7 @@ class MonitorResource {
         val targetUrl = request.targetUrl?.trim().orEmpty()
         val host = request.targetHost?.trim().orEmpty()
         val method = request.method?.trim()?.uppercase() ?: "GET"
+        val allowPostNoSideEffects = request.allowPostNoSideEffects == true
         val interval = request.intervalSeconds ?: if (type == "TLS") 21600 else 60
         val timeout = request.timeoutSeconds ?: when (type) { "DNS" -> 5; "HEARTBEAT", "METRIC_THRESHOLD" -> 1; else -> 10 }
         val heartbeatGraceSeconds = request.heartbeatGraceSeconds ?: DEFAULT_HEARTBEAT_GRACE_SECONDS
@@ -339,11 +340,13 @@ class MonitorResource {
                 ) ?: return null
                 if (uri == null || uri.scheme.lowercase() !in setOf("http", "https") || uri.host.isNullOrBlank() ||
                     uri.userInfo != null || uri.fragment != null || (uri.port != -1 && uri.port !in 1..65535) ||
-                    method !in setOf("GET", "HEAD") || expectedCodes.isEmpty() || expectedCodes.size > 100 ||
+                    method !in setOf("GET", "HEAD", "POST") ||
+                    (method == "POST") != allowPostNoSideEffects || expectedCodes.isEmpty() || expectedCodes.size > 100 ||
                     expectedCodes.any { it !in 100..599 } || (contains?.length ?: 0) > 500 || !jsonAssertionValid) return null
                 mapOf(
                     "url" to uri.normalize().toASCIIString(),
                     "method" to method,
+                    "allowPostNoSideEffects" to allowPostNoSideEffects,
                     "expectedStatusCodes" to expectedCodes,
                     "textContains" to contains,
                     "jsonPath" to jsonPath,
@@ -514,6 +517,7 @@ class MonitorResource {
             expectedRecordValue = config.path("expectedValue").takeUnless { it.isMissingNode || it.isNull }?.asText(),
             minimumValidityDays = config.path("minimumValidityDays").takeUnless { it.isMissingNode || it.isNull }?.asInt(),
             method = config.path("method").asText("GET"),
+            allowPostNoSideEffects = config.path("allowPostNoSideEffects").asBoolean(false),
             intervalSeconds = getInt("interval_seconds"),
             timeoutSeconds = getInt("timeout_seconds"),
             failureThreshold = getInt("failure_threshold"),
