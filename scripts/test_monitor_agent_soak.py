@@ -34,6 +34,20 @@ class RunnerDetectionTests(unittest.TestCase):
     def test_monitor_checks_duration_after_a_seen_runner_exits(self) -> None:
         self.assertIsNone(MONITOR.missing_runner_problem(runner_count=0, runner_seen=True, once=False))
 
+    def test_attached_cohort_mode_is_explicitly_allowed_without_runner(self) -> None:
+        self.assertIsNone(MONITOR.missing_runner_problem(
+            runner_count=0, runner_seen=False, once=False, observe_existing_agent_cohort=True,
+        ))
+
+
+class AgentIdentityTests(unittest.TestCase):
+    def test_fingerprint_is_order_independent_and_detects_process_replacement(self) -> None:
+        first = {12: {"start_ticks": 100}, 21: {"start_ticks": 200}}
+        reordered = {21: {"start_ticks": 200}, 12: {"start_ticks": 100}}
+        replacement = {12: {"start_ticks": 101}, 21: {"start_ticks": 200}}
+        self.assertEqual(MONITOR.agent_identity_fingerprint(first), MONITOR.agent_identity_fingerprint(reordered))
+        self.assertNotEqual(MONITOR.agent_identity_fingerprint(first), MONITOR.agent_identity_fingerprint(replacement))
+
 
 if __name__ == "__main__":
     unittest.main()

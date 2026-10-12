@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -90,10 +91,22 @@ def suspend_gap_seconds(
     return max(0.0, (current_boottime - previous_boottime) - (current_monotonic - previous_monotonic))
 
 
-def missing_runner_problem(runner_count: int, runner_seen: bool, once: bool) -> str | None:
-    if runner_count > 0 or (runner_seen and not once):
+def missing_runner_problem(
+    runner_count: int,
+    runner_seen: bool,
+    once: bool,
+    observe_existing_agent_cohort: bool = False,
+) -> str | None:
+    if runner_count > 0 or observe_existing_agent_cohort or (runner_seen and not once):
         return None
     return "Agent soak runner process was not detected"
+
+
+def agent_identity_fingerprint(processes: dict[int, dict[str, int]]) -> str:
+    identity = ",".join(
+        f"{pid}:{metrics['start_ticks']}" for pid, metrics in sorted(processes.items())
+    )
+    return hashlib.sha256(identity.encode("ascii")).hexdigest()
 
 
 def agent_process_metrics() -> tuple[dict[int, dict[str, int]], float]:
@@ -114,9 +127,11 @@ def agent_process_metrics() -> tuple[dict[int, dict[str, int]], float]:
         try:
             fields_after_comm = stat[stat.rfind(")") + 1 :].split()
             cpu_ticks = int(fields_after_comm[11]) + int(fields_after_comm[12])
+            start_ticks = int(fields_after_comm[19])
             processes[int(command_line.parent.name)] = {
                 "rss_kib": int(rss_line.split()[1]),
                 "cpu_ticks": cpu_ticks,
+                "start_ticks": start_ticks,
             }
         except (IndexError, ValueError):
             continue
@@ -187,6 +202,8 @@ def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -
         "runner_processes": runner_count,
         "runner_elapsed_seconds": round(runner_elapsed, 1) if runner_elapsed is not None else None,
         "agent_processes": process_count,
+        "agent_process_identity_sha256": agent_identity_fingerprint(agent_processes),
+        "observation_mode": "attached-agent-cohort" if args.observe_existing_agent_cohort else "runner",
         "agent_rss_mib": round(rss_kib / 1024, 2),
         "agent_rss_mib_per_agent_average": round(sum(rss_mib_per_agent) / process_count, 2) if process_count else 0,
         "agent_rss_mib_per_agent_p95": round(sorted(rss_mib_per_agent)[math.ceil(len(rss_mib_per_agent) * 0.95) - 1], 2) if process_count else 0,
@@ -200,9 +217,10 @@ def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -
     }
 
     problems = []
-    if runner_count and process_count != args.expected_agents:
+    workload_observed = runner_count > 0 or args.observe_existing_agent_cohort
+    if workload_observed and process_count != args.expected_agents:
         problems.append(f"Agent processes={process_count}/{args.expected_agents}")
-    if runner_count and int(database["online_agents"]) != args.expected_agents:
+    if workload_observed and int(database["online_agents"]) != args.expected_agents:
         problems.append(f"online Agents={database['online_agents']}/{args.expected_agents}")
     if int(database["agents"]) != args.expected_agents:
         problems.append(f"database Agents={database['agents']}/{args.expected_agents}")
@@ -227,6 +245,10 @@ def main() -> int:
     parser.add_argument("--minimum-free-gib", type=float, default=20)
     parser.add_argument("--maximum-agent-rss-mib", type=float, default=50)
     parser.add_argument("--maximum-agent-average-cpu-percent", type=float, default=1)
+    parser.add_argument(
+        "--observe-existing-agent-cohort", action="store_true",
+        help="start a fresh observation of already-running Agents without their original controller",
+    )
     parser.add_argument("--log-file", type=Path, default=Path("/tmp/geek-monitor-agent-soak-metrics.jsonl"))
     parser.add_argument("--once", action="store_true", help="record and verify one checkpoint")
     args = parser.parse_args()
@@ -259,6 +281,8 @@ def main() -> int:
     previous_agent_cpu_sample_monotonic: float | None = None
     previous_loop_monotonic: float | None = None
     previous_loop_boottime: float | None = None
+    agent_identity_baseline: str | None = None
+    first_snapshot = True
     boottime_clock = getattr(time, "CLOCK_BOOTTIME", None)
     problem_count = previous_problem_count
     clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
@@ -268,7 +292,8 @@ def main() -> int:
             loop_boottime = time.clock_gettime(boottime_clock) if boottime_clock is not None else None
             elapsed = loop_monotonic - started
             try:
-                record = snapshot(args, elapsed, detailed=args.once)
+                record = snapshot(args, elapsed, detailed=args.once or first_snapshot)
+                first_snapshot = False
                 runner_count = int(record["runner_processes"])
                 if runner_count:
                     runner_seen = True
@@ -278,9 +303,18 @@ def main() -> int:
                     )
                     record["runner_max_observed_elapsed_seconds"] = round(runner_max_elapsed_seconds, 1)
                 else:
-                    runner_problem = missing_runner_problem(runner_count, runner_seen, args.once)
+                    runner_problem = missing_runner_problem(
+                        runner_count, runner_seen, args.once, args.observe_existing_agent_cohort,
+                    )
                     if runner_problem:
                         record["problems"].append(runner_problem)
+                if int(record.get("agent_processes", 0)) == args.expected_agents:
+                    identity = str(record["agent_process_identity_sha256"])
+                    if agent_identity_baseline is None:
+                        agent_identity_baseline = identity
+                        record["agent_cohort_baseline_established"] = True
+                    elif identity != agent_identity_baseline:
+                        record["problems"].append("Agent process cohort changed during observation")
                 if runner_seen and not runner_count and not args.once:
                     record = snapshot(args, elapsed, detailed=True)
                     record["runner_max_observed_elapsed_seconds"] = round(runner_max_elapsed_seconds, 1)
@@ -295,6 +329,21 @@ def main() -> int:
                     "elapsed_seconds": round(elapsed, 1),
                     "problems": [f"snapshot failed: {type(exception).__name__}: {exception}"],
                 }
+            if not args.once and time.monotonic() >= deadline and not record.get("database", {}).get("detailed"):
+                previous_problems = list(record.get("problems", []))
+                try:
+                    final_record = snapshot(args, elapsed, detailed=True)
+                except Exception as exception:
+                    final_record = {
+                        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "elapsed_seconds": round(elapsed, 1),
+                        "problems": [f"final snapshot failed: {type(exception).__name__}: {exception}"],
+                    }
+                final_record["problems"] = previous_problems + final_record.get("problems", [])
+                record = final_record
+                if agent_identity_baseline is not None and record.get("agent_process_identity_sha256") != agent_identity_baseline:
+                    record["problems"].append("Agent process cohort changed before final checkpoint")
+                record["observation_completed"] = True
             if previous_loop_monotonic is not None and previous_loop_boottime is not None and loop_boottime is not None:
                 suspend_gap = suspend_gap_seconds(
                     previous_loop_monotonic,
@@ -307,6 +356,7 @@ def main() -> int:
                     record["problems"].append(f"host suspended for approximately {suspend_gap:.1f}s")
             previous_loop_monotonic = loop_monotonic
             previous_loop_boottime = loop_boottime
+            workload_observed = bool(record.get("runner_processes")) or args.observe_existing_agent_cohort
             current_agent_cpu_ticks = record.pop("_agent_cpu_ticks_by_pid", None)
             current_agent_cpu_sample_monotonic = record.pop("_agent_cpu_sample_monotonic", None)
             if current_agent_cpu_ticks is not None and current_agent_cpu_sample_monotonic is not None:
@@ -328,18 +378,18 @@ def main() -> int:
                         record["agent_cpu_percent_per_core_average"] = round(average_cpu, 4)
                         record["agent_cpu_percent_per_core_p95"] = round(p95_cpu, 4)
                         record["agent_cpu_percent_per_core_max"] = round(max(cpu_percentages), 4)
-                        if record.get("runner_processes") and len(cpu_percentages) != args.expected_agents:
+                        if workload_observed and len(cpu_percentages) != args.expected_agents:
                             record["problems"].append(
                                 f"CPU measured Agents={len(cpu_percentages)}/{args.expected_agents}"
                             )
-                        if record.get("runner_processes") and average_cpu >= args.maximum_agent_average_cpu_percent:
+                        if workload_observed and average_cpu >= args.maximum_agent_average_cpu_percent:
                             record["problems"].append(
                                 f"average Agent CPU={average_cpu:.4f}% per core reaches/exceeds "
                                 f"{args.maximum_agent_average_cpu_percent}%"
                             )
                 previous_agent_cpu_ticks = current_agent_cpu_ticks
                 previous_agent_cpu_sample_monotonic = current_agent_cpu_sample_monotonic
-            if record.get("runner_processes") and record.get("agent_rss_mib_per_agent_max", 0) >= args.maximum_agent_rss_mib:
+            if workload_observed and record.get("agent_rss_mib_per_agent_max", 0) >= args.maximum_agent_rss_mib:
                 record["problems"].append(
                     f"max Agent RSS={record['agent_rss_mib_per_agent_max']} MiB reaches/exceeds "
                     f"{args.maximum_agent_rss_mib} MiB"
