@@ -52,7 +52,7 @@ jobs:
         run: python3 scripts/test_monitor_agent_soak.py
 
       - name: Validate integration script syntax
-        run: python3 -m py_compile scripts/e2e-agent-metric-threshold.py scripts/e2e-scheduler-capacity.py scripts/e2e-database-space-pressure.py scripts/e2e-database-outage.py
+        run: python3 -m py_compile scripts/e2e-agent-metric-threshold.py scripts/e2e-scheduler-capacity.py scripts/e2e-database-space-pressure.py scripts/e2e-database-outage.py scripts/e2e-heartbeat-lifecycle.py
 
   agent:
     runs-on: ubuntu-latest
