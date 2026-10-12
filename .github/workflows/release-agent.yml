@@ -48,6 +48,10 @@ jobs:
               geek-monitor-agent-linux-arm64 install-agent.sh >SHA256SUMS
           )
 
+      - name: Verify release assets
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
