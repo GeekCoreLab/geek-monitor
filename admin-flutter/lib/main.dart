@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -73,7 +74,11 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
   }
 
   Future<void> _logout() async {
-    await _api.logout();
+    try {
+      await _api.logout();
+    } on ApiException catch (error) {
+      if (error.statusCode != 401) rethrow;
+    }
     if (!mounted) return;
     setState(() => _gate = _GateState.login);
   }
@@ -827,11 +832,36 @@ class _DashboardShellState extends State<_DashboardShell> {
   List<Map<String, dynamic>> _agents = [];
   bool _loading = true;
   String? _loadError;
+  StreamSubscription<StatusStreamEvent>? _statusSubscription;
+  Timer? _statusRefreshTimer;
 
   @override
   void initState() {
     super.initState();
     _reload();
+    _statusSubscription = widget.api.statusEvents().listen(
+      (_) => _scheduleStatusRefresh(),
+      onError: (Object error) {
+        if (error is ApiException && error.statusCode == 401) {
+          unawaited(widget.onLogout());
+        }
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _statusRefreshTimer?.cancel();
+    _statusSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _scheduleStatusRefresh() {
+    if (!mounted) return;
+    _statusRefreshTimer?.cancel();
+    _statusRefreshTimer = Timer(const Duration(milliseconds: 350), () {
+      if (mounted) unawaited(_reload());
+    });
   }
 
   Future<void> _reload() async {
