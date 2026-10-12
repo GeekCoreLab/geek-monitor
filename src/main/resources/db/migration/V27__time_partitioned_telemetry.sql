@@ -96,14 +96,17 @@ ALTER TABLE check_execution RENAME TO check_execution_v26;
 CREATE TABLE check_execution_partitioned (
     LIKE check_execution_v26 INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING CONSTRAINTS
 ) PARTITION BY RANGE (scheduled_at);
+SELECT create_monthly_time_partitions(
+    'check_execution_partitioned'::REGCLASS, 'check_execution', 'check_execution_v26'::REGCLASS, 'scheduled_at'
+);
+INSERT INTO check_execution_partitioned SELECT * FROM check_execution_v26;
+INSERT INTO check_execution_identity_registry(id, scheduled_at)
+    SELECT id, scheduled_at FROM check_execution_partitioned;
 ALTER TABLE check_execution_partitioned ADD CONSTRAINT check_execution_partitioned_pkey PRIMARY KEY (id, scheduled_at);
 ALTER TABLE check_execution_partitioned ADD CONSTRAINT check_execution_partitioned_monitor_fkey
     FOREIGN KEY (monitor_id) REFERENCES monitor(id);
 ALTER TABLE check_execution_partitioned ADD CONSTRAINT check_execution_partitioned_identity_fkey
     FOREIGN KEY (id) REFERENCES check_execution_identity_registry(id) ON DELETE CASCADE;
-SELECT create_monthly_time_partitions(
-    'check_execution_partitioned'::REGCLASS, 'check_execution', 'check_execution_v26'::REGCLASS, 'scheduled_at'
-);
 CREATE TRIGGER check_execution_identity_insert
     BEFORE INSERT ON check_execution_partitioned
     FOR EACH ROW EXECUTE FUNCTION register_check_execution_identity();
@@ -113,7 +116,6 @@ CREATE TRIGGER check_execution_identity_delete
 CREATE TRIGGER check_execution_identity_update_guard
     BEFORE UPDATE OF id, scheduled_at ON check_execution_partitioned
     FOR EACH ROW EXECUTE FUNCTION guard_check_execution_identity_update();
-INSERT INTO check_execution_partitioned SELECT * FROM check_execution_v26;
 DROP TABLE check_execution_v26;
 ALTER TABLE check_execution_partitioned RENAME TO check_execution;
 CREATE INDEX check_execution_monitor_time_partitioned_idx ON check_execution (monitor_id, scheduled_at DESC);
@@ -126,15 +128,6 @@ ALTER TABLE metric_sample RENAME TO metric_sample_v26;
 CREATE TABLE metric_sample_partitioned (
     LIKE metric_sample_v26 INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING CONSTRAINTS
 ) PARTITION BY RANGE (sampled_at);
-ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_pkey PRIMARY KEY (id, sampled_at);
-ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_batch_metric_key
-    UNIQUE (batch_id, metric_name, labels, sampled_at);
-ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_batch_fkey
-    FOREIGN KEY (batch_id) REFERENCES agent_batch(id) ON DELETE CASCADE;
-ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_agent_fkey
-    FOREIGN KEY (agent_id) REFERENCES agent(id);
-ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_resource_fkey
-    FOREIGN KEY (resource_id) REFERENCES monitored_resource(id);
 SELECT create_monthly_time_partitions(
     'metric_sample_partitioned'::REGCLASS, 'metric_sample', 'metric_sample_v26'::REGCLASS, 'sampled_at'
 );
@@ -144,6 +137,15 @@ SELECT setval(
     COALESCE((SELECT max(id) FROM metric_sample_partitioned), 1),
     EXISTS (SELECT 1 FROM metric_sample_partitioned)
 );
+ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_pkey PRIMARY KEY (id, sampled_at);
+ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_batch_metric_key
+    UNIQUE (batch_id, metric_name, labels, sampled_at);
+ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_batch_fkey
+    FOREIGN KEY (batch_id) REFERENCES agent_batch(id) ON DELETE CASCADE;
+ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_agent_fkey
+    FOREIGN KEY (agent_id) REFERENCES agent(id);
+ALTER TABLE metric_sample_partitioned ADD CONSTRAINT metric_sample_partitioned_resource_fkey
+    FOREIGN KEY (resource_id) REFERENCES monitored_resource(id);
 DROP TABLE metric_sample_v26;
 ALTER TABLE metric_sample_partitioned RENAME TO metric_sample;
 CREATE INDEX metric_sample_resource_series_partitioned_idx
@@ -154,14 +156,6 @@ ALTER TABLE database_metric_sample RENAME TO database_metric_sample_v26;
 CREATE TABLE database_metric_sample_partitioned (
     LIKE database_metric_sample_v26 INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING CONSTRAINTS
 ) PARTITION BY RANGE (sampled_at);
-ALTER TABLE database_metric_sample_partitioned ADD CONSTRAINT database_metric_sample_partitioned_pkey
-    PRIMARY KEY (id, sampled_at);
-ALTER TABLE database_metric_sample_partitioned ADD CONSTRAINT database_metric_sample_partitioned_series_key
-    UNIQUE (monitor_id, metric_name, labels, sampled_at);
-ALTER TABLE database_metric_sample_partitioned ADD CONSTRAINT database_metric_sample_partitioned_monitor_fkey
-    FOREIGN KEY (monitor_id) REFERENCES monitor(id);
-ALTER TABLE database_metric_sample_partitioned ADD CONSTRAINT database_metric_sample_partitioned_resource_fkey
-    FOREIGN KEY (resource_id) REFERENCES monitored_resource(id);
 SELECT create_monthly_time_partitions(
     'database_metric_sample_partitioned'::REGCLASS, 'database_metric_sample',
     'database_metric_sample_v26'::REGCLASS, 'sampled_at'
@@ -172,6 +166,14 @@ SELECT setval(
     COALESCE((SELECT max(id) FROM database_metric_sample_partitioned), 1),
     EXISTS (SELECT 1 FROM database_metric_sample_partitioned)
 );
+ALTER TABLE database_metric_sample_partitioned ADD CONSTRAINT database_metric_sample_partitioned_pkey
+    PRIMARY KEY (id, sampled_at);
+ALTER TABLE database_metric_sample_partitioned ADD CONSTRAINT database_metric_sample_partitioned_series_key
+    UNIQUE (monitor_id, metric_name, labels, sampled_at);
+ALTER TABLE database_metric_sample_partitioned ADD CONSTRAINT database_metric_sample_partitioned_monitor_fkey
+    FOREIGN KEY (monitor_id) REFERENCES monitor(id);
+ALTER TABLE database_metric_sample_partitioned ADD CONSTRAINT database_metric_sample_partitioned_resource_fkey
+    FOREIGN KEY (resource_id) REFERENCES monitored_resource(id);
 DROP TABLE database_metric_sample_v26;
 ALTER TABLE database_metric_sample_partitioned RENAME TO database_metric_sample;
 CREATE INDEX database_metric_sample_resource_series_partitioned_idx
@@ -182,11 +184,6 @@ ALTER TABLE metric_rollup RENAME TO metric_rollup_v26;
 CREATE TABLE metric_rollup_partitioned (
     LIKE metric_rollup_v26 INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING CONSTRAINTS
 ) PARTITION BY RANGE (bucket_at);
-ALTER TABLE metric_rollup_partitioned ADD CONSTRAINT metric_rollup_partitioned_pkey PRIMARY KEY (id, bucket_at);
-ALTER TABLE metric_rollup_partitioned ADD CONSTRAINT metric_rollup_partitioned_series_key
-    UNIQUE (resource_id, metric_name, labels, resolution_seconds, bucket_at);
-ALTER TABLE metric_rollup_partitioned ADD CONSTRAINT metric_rollup_partitioned_resource_fkey
-    FOREIGN KEY (resource_id) REFERENCES monitored_resource(id);
 SELECT create_monthly_time_partitions(
     'metric_rollup_partitioned'::REGCLASS, 'metric_rollup', 'metric_rollup_v26'::REGCLASS, 'bucket_at'
 );
@@ -196,6 +193,11 @@ SELECT setval(
     COALESCE((SELECT max(id) FROM metric_rollup_partitioned), 1),
     EXISTS (SELECT 1 FROM metric_rollup_partitioned)
 );
+ALTER TABLE metric_rollup_partitioned ADD CONSTRAINT metric_rollup_partitioned_pkey PRIMARY KEY (id, bucket_at);
+ALTER TABLE metric_rollup_partitioned ADD CONSTRAINT metric_rollup_partitioned_series_key
+    UNIQUE (resource_id, metric_name, labels, resolution_seconds, bucket_at);
+ALTER TABLE metric_rollup_partitioned ADD CONSTRAINT metric_rollup_partitioned_resource_fkey
+    FOREIGN KEY (resource_id) REFERENCES monitored_resource(id);
 DROP TABLE metric_rollup_v26;
 ALTER TABLE metric_rollup_partitioned RENAME TO metric_rollup;
 CREATE INDEX metric_rollup_series_partitioned_idx
@@ -206,15 +208,15 @@ ALTER TABLE availability_rollup RENAME TO availability_rollup_v26;
 CREATE TABLE availability_rollup_partitioned (
     LIKE availability_rollup_v26 INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING CONSTRAINTS
 ) PARTITION BY RANGE (bucket_at);
-ALTER TABLE availability_rollup_partitioned ADD CONSTRAINT availability_rollup_partitioned_pkey
-    PRIMARY KEY (monitor_id, bucket_at);
-ALTER TABLE availability_rollup_partitioned ADD CONSTRAINT availability_rollup_partitioned_monitor_fkey
-    FOREIGN KEY (monitor_id) REFERENCES monitor(id) ON DELETE CASCADE;
 SELECT create_monthly_time_partitions(
     'availability_rollup_partitioned'::REGCLASS, 'availability_rollup',
     'availability_rollup_v26'::REGCLASS, 'bucket_at'
 );
 INSERT INTO availability_rollup_partitioned SELECT * FROM availability_rollup_v26;
+ALTER TABLE availability_rollup_partitioned ADD CONSTRAINT availability_rollup_partitioned_pkey
+    PRIMARY KEY (monitor_id, bucket_at);
+ALTER TABLE availability_rollup_partitioned ADD CONSTRAINT availability_rollup_partitioned_monitor_fkey
+    FOREIGN KEY (monitor_id) REFERENCES monitor(id) ON DELETE CASCADE;
 DROP TABLE availability_rollup_v26;
 ALTER TABLE availability_rollup_partitioned RENAME TO availability_rollup;
 CREATE INDEX availability_rollup_retention_partitioned_idx ON availability_rollup (bucket_at);

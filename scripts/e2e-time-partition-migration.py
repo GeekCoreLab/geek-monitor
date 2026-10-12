@@ -130,6 +130,17 @@ def main() -> int:
     if parent_count != 5:
         raise RuntimeError(f"expected five partitioned tables, found {parent_count}")
 
+    validated_foreign_keys = int(psql([
+        "-c",
+        """SELECT count(*) FROM pg_constraint
+           WHERE contype = 'f' AND convalidated
+             AND conrelid IN ('check_execution'::regclass, 'metric_sample'::regclass,
+               'database_metric_sample'::regclass, 'metric_rollup'::regclass,
+               'availability_rollup'::regclass)""",
+    ], database_env))
+    if validated_foreign_keys != 9:
+        raise RuntimeError(f"expected nine validated telemetry foreign keys, found {validated_foreign_keys}")
+
     table_rows = {
         "check_execution": psql(["-c", "SELECT tableoid::regclass FROM check_execution WHERE id = '00000000-0000-0000-0000-000000000107'"], database_env),
         "metric_sample": psql(["-c", "SELECT tableoid::regclass FROM metric_sample WHERE metric_name = 'partition-migration-e2e'"], database_env),
@@ -183,6 +194,34 @@ def main() -> int:
     if next_metric_id != "2":
         raise RuntimeError(f"metric identity sequence was not advanced after migration: {next_metric_id}")
 
+    invalid_foreign_key = subprocess.run(
+        ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c",
+         "INSERT INTO metric_sample(batch_id,agent_id,resource_id,metric_name,labels,value,sampled_at,config_version,trusted) "
+         "VALUES ('00000000-0000-0000-0000-000000000105','00000000-0000-0000-0000-000000000109',"
+         "'00000000-0000-0000-0000-000000000102','partition-invalid-fk-e2e','{}',10,now(),1,true)"],
+        env=database_env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if invalid_foreign_key.returncode == 0 or "foreign key constraint" not in invalid_foreign_key.stderr:
+        raise RuntimeError("partitioned metric samples did not enforce the agent foreign key")
+
+    duplicate_metric = subprocess.run(
+        ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c",
+         "INSERT INTO metric_sample(batch_id,agent_id,resource_id,metric_name,labels,value,sampled_at,config_version,trusted) "
+         "SELECT batch_id,agent_id,resource_id,metric_name,labels,value,sampled_at,config_version,trusted "
+         "FROM metric_sample WHERE metric_name='partition-migration-e2e' LIMIT 1"],
+        env=database_env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if duplicate_metric.returncode == 0 or "unique constraint" not in duplicate_metric.stderr:
+        raise RuntimeError("partitioned metric samples did not enforce the batch-series unique constraint")
+
     psql([
         "-c",
         "DELETE FROM check_execution WHERE id = '00000000-0000-0000-0000-000000000107' "
@@ -195,6 +234,9 @@ def main() -> int:
         "migrations_applied": "V1-V27",
         "preserved_legacy_rows": counts,
         "partitioned_tables": parent_count,
+        "validated_foreign_keys": validated_foreign_keys,
+        "invalid_foreign_key_rejected": True,
+        "duplicate_metric_rejected": True,
         "legacy_month_partitions": table_rows,
         "two_day_query_pruned_default_and_old_months": True,
         "duplicate_check_execution_id_rejected": True,

@@ -153,8 +153,8 @@ def main() -> int:
     ], database_env, timeout_seconds=300)
     if post_rows != seeded_rows or post_route.endswith("_default"):
         raise RuntimeError(f"V27 did not preserve and route all samples: rows={post_rows}, route={post_route}")
-    if "Subplans Removed" not in query_plan and "metric_sample_" not in query_plan:
-        raise RuntimeError(f"24-hour query did not use a month partition: {query_plan}")
+    if "Subplans Removed:" not in query_plan or f"{post_route} " not in query_plan:
+        raise RuntimeError(f"24-hour query did not prune to its routed month partition: {query_plan}")
 
     print(json.dumps({
         "postgres_version": scalar("SHOW server_version", database_env),
