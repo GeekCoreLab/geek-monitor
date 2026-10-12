@@ -24,6 +24,12 @@
 
 这些结果使用一次性容器和本机合成客户端；日量时间压缩至约一小时，Agent 客户端生成器在容器配额之外，资源数字是最终快照而非峰值，也没有复刻目标物理机器。它证明该隔离容器配额下的完整 API 日量和 500 项调度用例通过，不证明真实 24 小时采集、物理目标硬件、磁盘耗尽或连续 7 天运行。复跑 500 项调度测试需要空白一次性应用、仅用于该测试的数据库，以及从应用容器可达的 `http://scheduler-probe/` HTTP 探针；脚本只接受回环应用 URL，并拒绝已初始化实例。
 
+## PostgreSQL 数据目录耗尽与恢复演练
+
+2026-10-12 在 PostgreSQL 17.11/JVM 隔离栈上把一次性数据库数据目录放入 512 MiB tmpfs，并将数据库容器限制为 2 GiB。脚本先确认数据库容器是指定 PostgreSQL 17 镜像、`PGDATA` 指向该 tmpfs，应用是回环地址上的空白实例，然后将 tmpfs 填至 100%。此时就绪 API 仍返回 `UP`，初始化写操作返回 HTTP 500；响应只包含通用错误 ID 和空 stack 字段，不泄露 `No space left on device` 或数据库异常细节。`install/status` 仍为未初始化，证明失败事务没有留下管理员/项目的部分状态。删除测试填充文件后，数据库可用空间恢复到 474,332 KiB，初始化返回 HTTP 201、管理员登录返回 HTTP 200，就绪状态恢复/保持 `UP`。
+
+复跑时预先启动名为 `geek-monitor-disk-pressure-db` 的 PostgreSQL 17 Alpine 容器，使用 `--memory 2g --tmpfs /var/lib/postgresql/data:rw,size=512m`，并在仅测试用途的网络中启动连到该库的空白 JVM 应用，绑定 `127.0.0.1:18091`；随后运行 `python3 scripts/e2e-database-space-pressure.py --base-url http://127.0.0.1:18091`。脚本拒绝非回环 URL、已初始化应用、非 PostgreSQL 17/非默认 `PGDATA`、未限定 tmpfs 或大于 2 GiB 的数据目录；无论测试结果如何，都会在 `finally` 中移除填充文件。演练使用临时 tmpfs，不触碰开发库、七天观察库或持久卷。它验证磁盘耗尽时事务回滚和空间恢复后的可用性，不代表目标硬件持续写入或生产磁盘故障矩阵。
+
 ## 7 天真实 Agent 试运行（进行中）
 
 2026-10-12 在隔离 PostgreSQL 17.11 数据库和当前源码构建的 JVM 镜像上启动 7 天试运行。100 个独立 Go Agent 进程各自使用一次性注册凭据和独立私有状态目录，以服务器下发的 30 秒采集间隔连续上传；入口仅绑定 `127.0.0.1:18084`。数据库使用临时卷 `geek-monitor-agent-soak-data`，与仍运行的开发环境数据库完全分离。试运行进程命令为 `taskset -c 0-3 python3 -u scripts/e2e-agent-processes.py --base-url http://127.0.0.1:18084 --agent-binary /tmp/geek-monitor-agent-soak --hosts 100 --duration-seconds 604800`。
