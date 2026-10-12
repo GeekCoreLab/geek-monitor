@@ -30,6 +30,12 @@
 
 复跑时预先启动名为 `geek-monitor-disk-pressure-db` 的 PostgreSQL 17 Alpine 容器，使用 `--memory 2g --tmpfs /var/lib/postgresql/data:rw,size=512m`，并在仅测试用途的网络中启动名为 `geek-monitor-disk-pressure-app` 的空白 JVM 应用，绑定 `127.0.0.1:18091`；随后运行 `python3 scripts/e2e-database-space-pressure.py --base-url http://127.0.0.1:18091`。脚本会确认两个容器运行在同一临时网络、应用准确连接 `db` 别名下的 `geek_monitor` 测试库、该库仍未初始化，且应用只绑定回环地址；同时拒绝非回环 URL、非 PostgreSQL 17/非默认 `PGDATA`、未限定 tmpfs 或大于 2 GiB 的数据目录。无论测试结果如何，都会在 `finally` 中移除填充文件。演练使用临时 tmpfs，不触碰开发库、七天观察库或持久卷。它验证磁盘耗尽时事务回滚和空间恢复后的可用性，不代表目标硬件持续写入或生产磁盘故障矩阵。
 
+## PostgreSQL 监控目标停机与恢复
+
+2026-10-12 在当前源码构建的 V27 JVM 镜像上，以内部 Podman 网络和两个一次性 PostgreSQL 17.11 实例运行 `scripts/e2e-database-outage.py`。独立服务库始终在线；调度器先将目标 PostgreSQL 判为 `UP`，停止目标容器后将数据库监控转为 `DOWN`，记录通用 `TIMEOUT` 分类并打开 `AVAILABILITY` 事件。以固定测试 IP 重启目标库后，监控恢复 `UP`，同一事件变为 `RESOLVED`，应用就绪保持 `UP`。该 E2E 覆盖真实定时调度和状态机，不模拟 SQL 异常或生产网络延迟。
+
+复跑命令为 `./gradlew build --no-daemon --console=plain`、`podman build --tag localhost/geek-monitor:db-outage-e2e --file src/main/docker/Dockerfile.jvm .`，然后执行 `python3 scripts/e2e-database-outage.py --app-image localhost/geek-monitor:db-outage-e2e --timeout 120`。脚本拒绝占用的回环端口，随机创建 `--internal` 网络、一次性 tmpfs 数据库和回环绑定的应用容器，确认 Flyway 为 V27、目标数据库 IP 在应用的精确允许 CIDR 内，退出时移除所有临时容器和网络；它不连接开发库、七天观察库或持久卷。
+
 ## 7 天真实 Agent 试运行（进行中）
 
 2026-10-12 在隔离 PostgreSQL 17.11 数据库和当前源码构建的 JVM 镜像上启动 7 天试运行。100 个独立 Go Agent 进程各自使用一次性注册凭据和独立私有状态目录，以服务器下发的 30 秒采集间隔连续上传；入口仅绑定 `127.0.0.1:18084`。数据库使用临时卷 `geek-monitor-agent-soak-data`，与仍运行的开发环境数据库完全分离。试运行进程命令为 `taskset -c 0-3 python3 -u scripts/e2e-agent-processes.py --base-url http://127.0.0.1:18084 --agent-binary /tmp/geek-monitor-agent-soak --hosts 100 --duration-seconds 604800`。
@@ -67,6 +73,8 @@
 2026-10-12 09:33:11 UTC 第二个 300 秒检查仍为 100/100 Agent 进程和节点在线，进程身份指纹未变，应用健康为 UP，休眠间隔 0 秒，问题数为 0。Agent 每核 CPU 平均/P95/最大值为 0.0035%/0.0067%/0.0067%，RSS 平均/P95/最大值为 6.79/7.92/9.42 MiB；数据库统计估算 77,300 个批次和 1,621,230 条原始样本。该单个窗口仅证明五分钟检查通过，七天观察仍在进行。
 
 2026-10-12 14:30:46 UTC 当前 v4 观察快照：持久 systemd 观察服务运行 11,418.4 秒、重启数 0，附着 Agent 进程组模式下未检测到 e2e runner；100 个 Agent 进程身份指纹稳定且全部在线，应用健康 UP，数据库估算 136,800 个批次和 2,878,068 条原始样本，累计问题数 0。Agent RSS 平均/P95/最大为 6.69/7.78/9.45 MiB，最近 300.5 秒每核 CPU 平均/P95/最大为 0.0051%/0.0067%/0.01%；应用/数据库容器末次内存快照约 746.7/236.7 MB，宿主机剩余 231.1 GiB。窗口从 11:20:28 UTC 起算，七天尚未结束；附着模式检查的是稳定的既有 Agent 进程组，不能证明独立物理主机分布。
+
+2026-10-12 15:11:45 UTC 只读精确 checkpoint：v4 服务从 11:20:28 UTC 起已运行约 3 小时 51 分，`NRestarts=0`；100/100 Agent 进程在线且持续上报，145,000 个批次全部可信，接受/存储可信样本均为 3,050,420（差值 0），未可信批次 0，累计问题数 0，应用健康 UP。Agent RSS 平均/P95/最大值为 6.73/7.91/9.38 MiB；应用/数据库容器内存快照约 768.4/237.5 MB，宿主剩余 215.2 GiB。此次单次检查不重置也不替代连续观察；七天目标为 2026-10-19 11:20 UTC，附着模式仍不能证明异机 Agent 分布或目标物理硬件容量。
 
 ## V26→V27 1,440 万样本迁移基准
 
