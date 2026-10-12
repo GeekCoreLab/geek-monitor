@@ -15,3 +15,11 @@
 完整日量指标已通过真实 HTTP 入口和逐批事务写入，但 24 小时样本时间被压缩至约 40 分钟墙钟时间；客户端模拟 100 组独立 Agent 凭据，没有运行 100 个 Go Agent 进程。数据库容器为 4 vCPU / 6 GiB，低于规划的 4 vCPU / 8 GiB 压测起点。结果支持每日目标写入量的本机基线，不证明真实 24 小时采集节奏、目标硬件、长期稳定性或 7 天试运行；通知风暴和磁盘不足故障也未覆盖，P4 仍未通过。
 
 真实 HTTP 日量压测可在只绑定回环地址的空白实例上运行 `python3 scripts/benchmark-agent-http.py --base-url http://127.0.0.1:18084 --hosts 100 --batches-per-host 2880 --concurrency 16`；脚本拒绝非回环 URL 和已初始化实例，会使用 `admin@biliwind.com` 完成测试初始化，并在批次写入后认证查询曲线 API。SQL 大样本存储校准使用 `psql -f scripts/benchmark-100-hosts.sql`。两个脚本都只应连接一次性 `geek_monitor_benchmark` 数据库，不要接入开发库、生产库或持久化卷。
+
+## 7 天真实 Agent 试运行（进行中）
+
+2026-10-12 在隔离 PostgreSQL 17.11 数据库和当前源码构建的 JVM 镜像上启动 7 天试运行。100 个独立 Go Agent 进程各自使用一次性注册凭据和独立私有状态目录，以服务器下发的 30 秒采集间隔连续上传；入口仅绑定 `127.0.0.1:18084`。数据库使用临时卷 `geek-monitor-agent-soak-data`，与仍运行的开发环境数据库完全分离。试运行进程命令为 `taskset -c 0-3 python3 -u scripts/e2e-agent-processes.py --base-url http://127.0.0.1:18084 --agent-binary /tmp/geek-monitor-agent-soak --hosts 100 --duration-seconds 604800`。
+
+启动数分钟后的检查中，100/100 Agent 均在 90 秒在线窗口内，已写入 900 个可信批次和 17,800 条可信样本；批次相邻采样间隔平均约 30.2 秒。100 个 Agent 总 RSS 约 1,172.6 MiB，P95 为 12.11 MiB；PostgreSQL 和 JVM 容器当时分别使用约 187 MiB 和 222 MiB。PostgreSQL 容器限制为 3 CPU / 4 GiB，JVM 限制为 1 CPU / 2 GiB；当前全部 Agent、数据库进程及 JVM 线程均限制在 CPU 0–3 上。开发服务 `127.0.0.1:18082` 及其数据库在同一检查时仍为 UP。
+
+该试运行尚未完成，以上是早期存活、节奏与资源检查，不是 7 天稳定性结论。rootless Podman 未提供 cpuset cgroup 控制器，因此以进程 affinity 将工作负载限制在 4 个 CPU 上；数据库与 JVM 分别设置内存上限，但没有整个宿主机级 8 GiB 聚合硬限制。本机进程也不是 100 台异机 Agent，故这次试运行仍不能单独证明异机网络或规划目标主机的完整容量验收。最终报告需核对全程进程状态、可信批次、指标保留/rollup、曲线查询、容器峰值资源和磁盘占用，并清理本次容器与临时卷。
