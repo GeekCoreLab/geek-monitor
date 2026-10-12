@@ -4,6 +4,7 @@ import io.quarkus.scheduler.Scheduled
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import java.sql.Connection
+import java.sql.SQLException
 import java.time.Instant
 import java.time.YearMonth
 import java.time.ZoneOffset
@@ -77,6 +78,10 @@ class TimePartitionMaintenance {
     private fun dropExpiredEmptyPartitions(connection: Connection, now: Instant): Int {
         var dropped = 0
         PARTITIONED_TABLES.forEach { table ->
+            if (!tryLockTableNowait(connection, table.name)) {
+                LOG.debugf("Skipping expired partition cleanup for %s because the parent table is busy", table.name)
+                return@forEach
+            }
             val partitionNames = connection.prepareStatement(
                 """SELECT child.relname
                    FROM pg_inherits inheritance
@@ -97,6 +102,10 @@ class TimePartitionMaintenance {
                 val month = runCatching { YearMonth.parse(suffix, MONTH_SUFFIX) }.getOrNull() ?: return@partition
                 val upperBound = month.plusMonths(1).atDay(1).atStartOfDay(ZoneOffset.UTC).toInstant()
                 if (upperBound.isAfter(now.minusSeconds(table.retentionSeconds))) return@partition
+                if (!tryLockPartitionNowait(connection, partitionName)) {
+                    LOG.debugf("Skipping expired partition cleanup for %s because the partition is busy", partitionName)
+                    return@partition
+                }
                 val empty = connection.createStatement().use { statement ->
                     statement.executeQuery("SELECT NOT EXISTS (SELECT 1 FROM public.${identifier(partitionName)} LIMIT 1)")
                         .use { rows -> rows.next() && rows.getBoolean(1) }
@@ -110,6 +119,33 @@ class TimePartitionMaintenance {
         return dropped
     }
 
+    /**
+     * Cleanup is opportunistic. Taking the parent lock before looking at a child keeps lock order
+     * consistent with queries routed through the partitioned table. NOWAIT plus a savepoint keeps
+     * a busy table from blocking startup or leaving the maintenance transaction aborted.
+     */
+    private fun tryLockTableNowait(connection: Connection, tableName: String): Boolean =
+        tryLockNowait(connection, "public.${identifier(tableName)}")
+
+    private fun tryLockPartitionNowait(connection: Connection, partitionName: String): Boolean =
+        tryLockNowait(connection, "public.${identifier(partitionName)}")
+
+    private fun tryLockNowait(connection: Connection, qualifiedName: String): Boolean {
+        val savepoint = connection.setSavepoint()
+        try {
+            connection.createStatement().use { statement ->
+                statement.execute("LOCK TABLE $qualifiedName IN ACCESS EXCLUSIVE MODE NOWAIT")
+            }
+            connection.releaseSavepoint(savepoint)
+            return true
+        } catch (exception: SQLException) {
+            connection.rollback(savepoint)
+            connection.releaseSavepoint(savepoint)
+            if (exception.sqlState == LOCK_NOT_AVAILABLE_SQLSTATE) return false
+            throw exception
+        }
+    }
+
     private fun identifier(value: String): String = "\"${value.replace("\"", "\"\"")}\""
 
     private data class PartitionedTable(val name: String, val retentionSeconds: Long)
@@ -119,6 +155,7 @@ class TimePartitionMaintenance {
         private val MONTH_SUFFIX: DateTimeFormatter = DateTimeFormatter.ofPattern("uuuuMM")
         private const val PARTITION_FUTURE_MONTHS = 3L
         private const val DAY_SECONDS = 86_400L
+        private const val LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
         private val PARTITIONED_TABLES = listOf(
             PartitionedTable("check_execution", 7 * DAY_SECONDS),
             PartitionedTable("metric_sample", 3 * DAY_SECONDS),

@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import select
 import socket
 import subprocess
 import tempfile
@@ -171,7 +172,15 @@ def application_environment(args, password: str, encryption_key: str) -> dict[st
     return environment
 
 
-def start_application(root: Path, jar: Path, args, password: str, encryption_key: str, log) -> subprocess.Popen:
+def start_application(
+    root: Path,
+    jar: Path,
+    args,
+    password: str,
+    encryption_key: str,
+    log,
+    readiness_timeout: float = 120,
+) -> subprocess.Popen:
     process = subprocess.Popen(
         ["java", "-jar", str(jar)],
         cwd=root,
@@ -191,7 +200,7 @@ def start_application(root: Path, jar: Path, args, password: str, encryption_key
             return False
 
     try:
-        wait_until("application readiness", 120, ready)
+        wait_until("application readiness", readiness_timeout, ready)
     except Exception:
         stop_application(process)
         raise
@@ -207,6 +216,50 @@ def stop_application(process: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def acquire_partition_parent_lock(database_env: dict[str, str]) -> subprocess.Popen:
+    process = subprocess.Popen(
+        ["psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
+        env=database_env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    process.stdin.write(
+        "BEGIN;\n"
+        "LOCK TABLE public.check_execution IN ACCESS SHARE MODE;\n"
+        "SELECT 'PARTITION_PARENT_LOCK_HELD';\n"
+    )
+    process.stdin.flush()
+    deadline = time.monotonic() + 10
+    marker = ""
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
+        if not ready:
+            break
+        marker = process.stdout.readline().strip()
+        if marker == "PARTITION_PARENT_LOCK_HELD":
+            break
+        if process.poll() is not None:
+            break
+    if marker != "PARTITION_PARENT_LOCK_HELD":
+        process.terminate()
+        process.wait(timeout=5)
+        raise RuntimeError(f"could not hold the test partition parent lock (marker={marker!r})")
+    return process
+
+
+def release_partition_parent_lock(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        raise RuntimeError("test partition parent lock exited before it was released")
+    assert process.stdin is not None
+    process.stdin.write("ROLLBACK;\n\\q\n")
+    process.stdin.flush()
+    process.wait(timeout=5)
 
 
 def main() -> int:
@@ -275,6 +328,7 @@ def main() -> int:
         thread.start()
 
     app_process: subprocess.Popen | None = None
+    partition_lock_process: subprocess.Popen | None = None
     encryption_key = base64.b64encode(os.urandom(32)).decode("ascii")
     with tempfile.TemporaryDirectory(prefix="geek-monitor-restart-e2e-") as log_directory:
         log_path = Path(log_directory) / "application.log"
@@ -367,7 +421,28 @@ def main() -> int:
                 "-f", "-",
             ], database_env, input_text=seed_sql)
 
+            psql(["-c", """
+                CREATE TABLE public.check_execution_200001 PARTITION OF public.check_execution
+                FOR VALUES FROM ('2000-01-01 00:00:00+00') TO ('2000-02-01 00:00:00+00')
+            """], database_env)
+            partition_lock_process = acquire_partition_parent_lock(database_env)
+
+            # Startup cleanup must skip a busy parent instead of waiting on an expired child DROP.
+            app_process = start_application(
+                root, jar, args, database_password, encryption_key, log, readiness_timeout=30,
+            )
+            if psql(["-c", "SELECT to_regclass('public.check_execution_200001') IS NOT NULL"], database_env) != "t":
+                raise RuntimeError("partition cleanup did not skip the expired partition while its parent was busy")
+            stop_application(app_process)
+            app_process = None
+            release_partition_parent_lock(partition_lock_process)
+            partition_lock_process = None
+
+            # Once the blocker is gone, a later startup should finish the deferred cleanup.
             app_process = start_application(root, jar, args, database_password, encryption_key, log)
+            if psql(["-c", "SELECT to_regclass('public.check_execution_200001') IS NULL"], database_env) != "t":
+                raise RuntimeError("expired empty partition was not removed after the parent became available")
+
             history_path = f"/api/v1/monitors/{quote(monitor_id)}/results?limit=100"
             interrupted = wait_until("interrupted execution to appear as UNKNOWN", args.timeout, lambda: next((
                 row for row in api.request("GET", history_path)[1]
@@ -396,7 +471,7 @@ def main() -> int:
             print(json.dumps({
                 "interrupted_check": {"status": interrupted["status"], "errorCode": interrupted["errorCode"]},
                 "notification": {"status": "DELIVERED", "httpStatus": 202, "attempts": 1, "webhookRequests": len(matching)},
-                "application_restarts": 1,
+                "application_restarts": 2,
                 "external_services_contacted": False,
             }, ensure_ascii=False, separators=(",", ":")))
             return 0
@@ -408,6 +483,11 @@ def main() -> int:
         finally:
             if app_process is not None:
                 stop_application(app_process)
+            if partition_lock_process is not None and partition_lock_process.poll() is None:
+                assert partition_lock_process.stdin is not None
+                partition_lock_process.stdin.write("ROLLBACK;\n\\q\n")
+                partition_lock_process.stdin.flush()
+                partition_lock_process.wait(timeout=5)
             log.close()
             for server in servers:
                 server.shutdown()
