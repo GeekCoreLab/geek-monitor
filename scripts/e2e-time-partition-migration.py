@@ -118,7 +118,8 @@ def main() -> int:
                 3600,3600,0,0,0,0);
     """
     psql(["-f", "-"], database_env, input_text=seed_sql)
-    psql(["-f", str(migration_dir / "V27__time_partitioned_telemetry.sql")], database_env)
+    partition_migration = (migration_dir / "V27__time_partitioned_telemetry.sql").read_text(encoding="utf-8")
+    psql(["-f", "-"], database_env, input_text=f"BEGIN;\n{partition_migration}\nCOMMIT;\n")
 
     parent_count = int(psql([
         "-c",
