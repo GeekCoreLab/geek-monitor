@@ -73,4 +73,6 @@ openssl rand -base64 32
 - DATABASE 资源支持 PostgreSQL、MySQL 和 Redis 只读可用性检查、连接数/上限/利用率曲线，以及指标阈值告警；统计权限不足时不会误判数据库不可用。最小账号权限见[数据库监控权限说明](docs/database-monitoring-permissions.md)。
 - 心跳任务和 HOST/DATABASE 指标阈值可在控制台配置。
 
+部署交付文档还包括[指标与状态字典](docs/metrics-and-states.md)、[告警配置说明](docs/alert-configuration.md)、[Agent 安装与卸载指南](agent/README.md)和[数据库监控最小权限说明](docs/database-monitoring-permissions.md)。
+
 可用率统计、数据库备份与空库恢复已实现。真实 SMTP 投递、异机备份恢复、目标硬件与规模压测、至少 7 天连续试运行仍待验收，详见[产品与技术规划](docs/产品与技术规划.md)和[部署手册](docs/deployment.md)。

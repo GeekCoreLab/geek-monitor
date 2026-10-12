@@ -88,3 +88,5 @@ Agent 使用独立 systemd 服务和受限服务账户安装，断网队列文�
 ## 数据库监控账号
 
 为每个 PostgreSQL、MySQL 或 Redis 目标配置单独的最小权限账号。监控只执行固定只读探测；数据库版本对应的授权命令、可选连接指标权限和验证步骤见[数据库监控账号权限说明](database-monitoring-permissions.md)。
+
+运维人员可将[指标与状态字典](metrics-and-states.md)和[告警配置说明](alert-configuration.md)作为日常配置及故障处理参考。
