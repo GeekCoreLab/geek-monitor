@@ -112,7 +112,14 @@ class ApiClient:
         self.password = password
         self.cookie: str | None = None
 
-    def request(self, method: str, path: str, body: dict[str, object] | None = None) -> tuple[int, object]:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, object] | None = None,
+        *,
+        allow_http_error: bool = False,
+    ) -> tuple[int, object]:
         encoded = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -126,11 +133,17 @@ class ApiClient:
             response = urllib.request.urlopen(request, timeout=12)
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
+            if allow_http_error:
+                try:
+                    payload = json.loads(detail) if detail else {}
+                except json.JSONDecodeError:
+                    payload = {"body": detail[:300]}
+                return error.code, payload
             raise RuntimeError(f"HTTP {error.code} for {method} {path}: {detail}") from error
         with response:
             raw = response.read()
             payload = json.loads(raw) if raw else {}
-            if method == "POST" and path == "/api/v1/install/setup":
+            if method == "POST" and path in {"/api/v1/install/setup", "/api/v1/auth/login"}:
                 set_cookie = response.headers.get("Set-Cookie")
                 if set_cookie:
                     self.cookie = set_cookie.split(";", 1)[0]
@@ -317,6 +330,38 @@ def main() -> int:
         ):
             raise RuntimeError("the private sink did not receive the matching incident.opened notification")
 
+        read_only_email = "incident-readonly@example.test"
+        read_only_password = "local-readonly-incident-password"
+        status, read_only_member = api.request(
+            "POST",
+            f"/api/v1/projects/{project_id}/members",
+            {"email": read_only_email, "password": read_only_password, "role": "READ_ONLY"},
+        )
+        if status != 201 or not isinstance(read_only_member, dict) or read_only_member.get("role") != "READ_ONLY":
+            raise RuntimeError(f"could not create an isolated READ_ONLY member (HTTP {status})")
+        read_only_api = ApiClient(args.base_url, read_only_email, read_only_password)
+        status, _ = read_only_api.request(
+            "POST",
+            "/api/v1/auth/login",
+            {"email": read_only_email, "password": read_only_password},
+        )
+        if status != 200 or not read_only_api.cookie:
+            raise RuntimeError(f"the isolated READ_ONLY member could not log in (HTTP {status})")
+        status, forbidden_ack = read_only_api.request(
+            "POST",
+            f"/api/v1/incidents/{incident_id}/ack",
+            {"note": "read-only members cannot acknowledge incidents"},
+            allow_http_error=True,
+        )
+        if (
+            status != 403
+            or not isinstance(forbidden_ack, dict)
+            or forbidden_ack.get("code") != "READ_ONLY"
+        ):
+            raise RuntimeError(f"a READ_ONLY member was not forbidden from acknowledging incidents (HTTP {status})")
+        if _incident_by_id(api, incident_id, "OPEN") is None:
+            raise RuntimeError("a rejected READ_ONLY acknowledgement changed the incident state")
+
         acknowledgement_note = "已接手排查；确认事件不能改变仍失败的监控状态。"
         status, acknowledged = api.request(
             "POST",
@@ -502,6 +547,7 @@ def main() -> int:
                     "status": acknowledged.get("status"),
                     "acknowledgedBy": acknowledged.get("acknowledgedBy"),
                     "note": acknowledged.get("acknowledgementNote"),
+                    "readOnlyRequest": "403/READ_ONLY",
                     "monitorStateAfterAck": subsequent_failure.get("state"),
                     "resourceStateAfterAck": "DOWN",
                 },
