@@ -250,16 +250,97 @@ def main() -> int:
             )
 
         api = Api(base_url)
+        status, install_status = api.request("GET", "/api/v1/install/status")
+        if status != 200 or not isinstance(install_status, dict) or install_status.get("initialized") is not False:
+            raise RuntimeError("fresh database did not expose the first-install setup state")
+
         status, setup = api.request("POST", "/api/v1/install/setup", {
             "email": ADMIN_EMAIL,
             "password": ADMIN_PASSWORD,
             "projectName": "心跳任务生命周期验收",
         })
-        if status != 201 or not api.cookie or not isinstance(setup, dict) or setup.get("user", {}).get("email") != ADMIN_EMAIL:
+        if (
+            status != 201
+            or not api.cookie
+            or not isinstance(setup, dict)
+            or setup.get("user", {}).get("email") != ADMIN_EMAIL
+            or setup.get("user", {}).get("role") != "ADMIN"
+        ):
             raise RuntimeError(f"could not initialize the disposable application (HTTP {status})")
+
+        status, initialized = api.request("GET", "/api/v1/install/status")
+        if status != 200 or not isinstance(initialized, dict) or initialized.get("initialized") is not True:
+            raise RuntimeError("successful setup did not close the first-install gate")
+        setup_session = api.cookie
+        status, current_user = api.request("GET", "/api/v1/auth/me")
+        if status != 200 or current_user.get("email") != ADMIN_EMAIL or current_user.get("role") != "ADMIN":
+            raise RuntimeError("first-install session did not authenticate the requested administrator")
+
+        status, repeated_setup = api.request("POST", "/api/v1/install/setup", {
+            "email": ADMIN_EMAIL,
+            "password": ADMIN_PASSWORD,
+            "projectName": "重复初始化不应创建",
+        })
+        if status != 409 or not isinstance(repeated_setup, dict) or repeated_setup.get("code") != "ALREADY_INITIALIZED":
+            raise RuntimeError(f"repeated initialization returned HTTP {status}, expected ALREADY_INITIALIZED")
+
+        status, _ = api.request("POST", "/api/v1/auth/logout")
+        if status != 204:
+            raise RuntimeError(f"first-install session logout returned HTTP {status}, expected 204")
+        api.cookie = setup_session
+        status, _ = api.request("GET", "/api/v1/auth/me")
+        if status != 401:
+            raise RuntimeError(f"logged-out first-install session remained valid (HTTP {status})")
+        api.cookie = None
+
+        status, _ = api.request("POST", "/api/v1/auth/login", {
+            "email": ADMIN_EMAIL,
+            "password": "incorrect-password-not-used",
+        })
+        if status != 401:
+            raise RuntimeError(f"invalid administrator password returned HTTP {status}, expected 401")
+        status, login = api.request("POST", "/api/v1/auth/login", {
+            "email": ADMIN_EMAIL,
+            "password": ADMIN_PASSWORD,
+        })
+        if (
+            status != 200
+            or not api.cookie
+            or not isinstance(login, dict)
+            or login.get("user", {}).get("email") != ADMIN_EMAIL
+            or login.get("user", {}).get("role") != "ADMIN"
+        ):
+            raise RuntimeError(f"requested test administrator login failed (HTTP {status})")
+        login_session = api.cookie
+        status, current_user = api.request("GET", "/api/v1/auth/me")
+        if status != 200 or current_user.get("email") != ADMIN_EMAIL or current_user.get("role") != "ADMIN":
+            raise RuntimeError("login session did not authenticate the requested administrator")
+        status, _ = api.request("POST", "/api/v1/auth/logout")
+        if status != 204:
+            raise RuntimeError(f"administrator logout returned HTTP {status}, expected 204")
+        api.cookie = login_session
+        status, _ = api.request("GET", "/api/v1/auth/me")
+        if status != 401:
+            raise RuntimeError(f"logged-out administrator session remained valid (HTTP {status})")
+        api.cookie = None
+
+        status, login = api.request("POST", "/api/v1/auth/login", {
+            "email": ADMIN_EMAIL,
+            "password": ADMIN_PASSWORD,
+        })
+        if (
+            status != 200
+            or not api.cookie
+            or not isinstance(login, dict)
+            or login.get("user", {}).get("email") != ADMIN_EMAIL
+            or login.get("user", {}).get("role") != "ADMIN"
+        ):
+            raise RuntimeError(f"administrator could not establish a fresh session (HTTP {status})")
+
         status, projects = api.request("GET", "/api/v1/projects")
         if status != 200 or not isinstance(projects, list) or not projects:
-            raise RuntimeError("initialization did not create its default project")
+            raise RuntimeError("administrator login did not restore access to its default project")
+        print("first_install=201 initialized=true repeated_setup=409 test_admin_login=200 logout=revoked", flush=True)
 
         status, resource = api.request("POST", "/api/v1/resources", {
             "projectId": projects[0]["id"],
