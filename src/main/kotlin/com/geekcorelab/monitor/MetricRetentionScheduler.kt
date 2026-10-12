@@ -1,5 +1,6 @@
 package com.geekcorelab.monitor
 
+import com.geekcorelab.api.PlatformTelemetry
 import io.quarkus.scheduler.Scheduled
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
@@ -15,29 +16,37 @@ private typealias TimeSpan = AvailabilitySpan
 @ApplicationScoped
 class MetricRetentionScheduler {
     @Inject lateinit var dataSource: DataSource
+    @Inject lateinit var platformTelemetry: PlatformTelemetry
 
     @Scheduled(every = "\${geek-monitor.retention.interval:1m}", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
     fun retain() {
         val now = Instant.now()
-        dataSource.connection.use { connection ->
-            connection.autoCommit = false
-            try {
-                lockJob(connection)
-                compactRawMetrics(connection, now)
-                compactFiveMinuteRollups(connection, now)
-                deleteExpiredRollups(connection, now)
-                rollupAvailability(connection, now)
-                deleteExpiredCheckExecutions(connection, now)
-                deleteExpiredAvailabilityRollups(connection, now)
-                deleteExpiredAgentBatches(connection, now)
-                deleteExpiredNotificationOutbox(connection, now)
-                deleteExpiredResolvedIncidents(connection, now)
-                deleteExpiredAuditEntries(connection, now)
-                connection.commit()
-            } catch (exception: Exception) {
-                connection.rollback()
-                throw exception
+        platformTelemetry.retentionStarted(now)
+        try {
+            dataSource.connection.use { connection ->
+                connection.autoCommit = false
+                try {
+                    lockJob(connection)
+                    compactRawMetrics(connection, now)
+                    compactFiveMinuteRollups(connection, now)
+                    deleteExpiredRollups(connection, now)
+                    rollupAvailability(connection, now)
+                    deleteExpiredCheckExecutions(connection, now)
+                    deleteExpiredAvailabilityRollups(connection, now)
+                    deleteExpiredAgentBatches(connection, now)
+                    deleteExpiredNotificationOutbox(connection, now)
+                    deleteExpiredResolvedIncidents(connection, now)
+                    deleteExpiredAuditEntries(connection, now)
+                    connection.commit()
+                } catch (exception: Exception) {
+                    connection.rollback()
+                    throw exception
+                }
             }
+            platformTelemetry.retentionSucceeded()
+        } catch (exception: Exception) {
+            platformTelemetry.retentionFailed(failureType = exception::class.simpleName ?: "Exception")
+            throw exception
         }
     }
 

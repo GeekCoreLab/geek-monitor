@@ -1387,7 +1387,7 @@ class _DashboardShellState extends State<_DashboardShell> {
         onCreateEnrollment: _createAgentEnrollment,
         onRevoke: _revokeAgent,
       ),
-      _Section.settings => _SystemSettingsPage(
+      _Section.settings => SystemSettingsPage(
         api: widget.api,
         isAdmin: widget.user['role'] == 'ADMIN',
       ),
@@ -3643,17 +3643,17 @@ class _ProjectMemberDialogState extends State<_ProjectMemberDialog> {
   );
 }
 
-class _SystemSettingsPage extends StatefulWidget {
-  const _SystemSettingsPage({required this.api, required this.isAdmin});
+class SystemSettingsPage extends StatefulWidget {
+  const SystemSettingsPage({super.key, required this.api, required this.isAdmin});
 
   final ApiClient api;
   final bool isAdmin;
 
   @override
-  State<_SystemSettingsPage> createState() => _SystemSettingsPageState();
+  State<SystemSettingsPage> createState() => _SystemSettingsPageState();
 }
 
-class _SystemSettingsPageState extends State<_SystemSettingsPage> {
+class _SystemSettingsPageState extends State<SystemSettingsPage> {
   Map<String, dynamic>? _status;
   List<Map<String, dynamic>> _auditEntries = [];
   Map<String, dynamic>? _nextCursor;
@@ -3779,6 +3779,28 @@ class _SystemSettingsPageState extends State<_SystemSettingsPage> {
               ),
             )
           else if (_status != null) ...[
+            if (_error != null) ...[
+              Card(
+                color: _amber.withValues(alpha: 0.08),
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.warning_amber_rounded, color: _amber),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          '最新状态刷新失败，以下内容是上次成功读取的快照。${_error!}',
+                          style: const TextStyle(color: _amber, fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
             _systemOverviewCard(_status!),
             const SizedBox(height: 14),
             _retentionCard(_status!['retentionPolicies'] as List? ?? const []),
@@ -3794,6 +3816,35 @@ class _SystemSettingsPageState extends State<_SystemSettingsPage> {
     final databaseBytes = status['databaseSizeBytes'] as num? ?? 0;
     final version = status['schemaVersion'] as String? ?? '未知';
     final backup = Map<String, dynamic>.from(status['backup'] as Map);
+    final platform = status['platformHealth'] is Map
+        ? Map<String, dynamic>.from(status['platformHealth'] as Map)
+        : <String, dynamic>{};
+    final retention = platform['retention'] is Map
+        ? Map<String, dynamic>.from(platform['retention'] as Map)
+        : <String, dynamic>{};
+    final platformState = platform['status'] as String? ?? 'UNKNOWN';
+    final (platformLabel, platformColor) = switch (platformState) {
+      'HEALTHY' => ('平台采集正常', _green),
+      'DEGRADED' => ('平台存在异常', _red),
+      _ => ('平台状态未知', _amber),
+    };
+    final attempts = platform['notificationAttempts24h'] as num? ?? 0;
+    final delivered = platform['notificationDelivered24h'] as num? ?? 0;
+    final notificationRate = platform['notificationSuccessRate24h'] as num?;
+    final retentionState = retention['status'] as String? ?? 'NOT_RUN';
+    final retentionLabel = switch (retentionState) {
+      'CURRENT' => '最近一次成功',
+      'RUNNING' => '正在运行',
+      'FAILED' => '连续失败 ${retention['consecutiveFailures'] ?? 1} 次',
+      _ => '进程启动后尚未成功运行',
+    };
+    final retentionDetails = [
+      retentionLabel,
+      if (retention['lastSuccessAt'] is String)
+        _formatSystemTime(retention['lastSuccessAt'] as String),
+      if (retention['lastFailureType'] is String && retentionState == 'FAILED')
+        retention['lastFailureType'] as String,
+    ].join(' · ');
     final backupState = backup['status'] as String? ?? 'NOT_RECORDED';
     final (backupLabel, backupColor) = switch (backupState) {
       'CURRENT' => ('24 小时内有备份记录', _green),
@@ -3831,13 +3882,13 @@ class _SystemSettingsPageState extends State<_SystemSettingsPage> {
                     vertical: 5,
                   ),
                   decoration: BoxDecoration(
-                    color: _green.withValues(alpha: 0.12),
+                    color: platformColor.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(20),
                   ),
-                  child: const Text(
-                    '数据库连接正常',
+                  child: Text(
+                    platformLabel,
                     style: TextStyle(
-                      color: _green,
+                      color: platformColor,
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
@@ -3860,6 +3911,43 @@ class _SystemSettingsPageState extends State<_SystemSettingsPage> {
                   value: _formatSystemTime(
                     status['generatedAt'] as String? ?? '',
                   ),
+                ),
+                _SystemValue(
+                  label: '到期检查积压',
+                  value: '${platform['dueChecks'] ?? '—'}',
+                ),
+                _SystemValue(
+                  label: '最久调度延迟',
+                  value: '${platform['oldestScheduleDelaySeconds'] ?? '—'} 秒',
+                ),
+                _SystemValue(
+                  label: '过期检查结果',
+                  value:
+                      '${platform['staleChecks'] ?? '—'} / ${platform['enabledChecks'] ?? '—'}',
+                ),
+                _SystemValue(
+                  label: '运行中检查',
+                  value: '${platform['runningChecks'] ?? '—'}',
+                ),
+                _SystemValue(
+                  label: '近 1 小时规则处理 P95',
+                  value: platform['recentResultP95LatencyMs'] is num
+                      ? '${(platform['recentResultP95LatencyMs'] as num).toStringAsFixed(0)} ms'
+                      : '暂无样本',
+                ),
+                _SystemValue(
+                  label: 'Agent 批次拒绝（进程启动后）',
+                  value: '${platform['rejectedAgentBatchesSinceStart'] ?? '—'}',
+                ),
+                _SystemValue(
+                  label: '通知 24 小时送达率',
+                  value: notificationRate == null
+                      ? '暂无投递（$delivered / $attempts）'
+                      : '${notificationRate.toStringAsFixed(1)}%（$delivered / $attempts）',
+                ),
+                _SystemValue(
+                  label: '数据清理任务',
+                  value: retentionDetails,
                 ),
               ],
             ),

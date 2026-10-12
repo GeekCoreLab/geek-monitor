@@ -32,6 +32,7 @@ class AgentResource {
     @Inject lateinit var credentials: CredentialService
     @Inject lateinit var objectMapper: ObjectMapper
     @Inject lateinit var notificationOutbox: NotificationOutbox
+    @Inject lateinit var platformTelemetry: PlatformTelemetry
 
     @POST
     @Path("/agent-enrollments")
@@ -270,27 +271,31 @@ class AgentResource {
     @POST
     @Path("/agents/{id}/batches")
     fun ingestBatch(@PathParam("id") idText: String, request: AgentBatchRequest, @Context headers: HttpHeaders): Response {
-        val agentId = parseId(idText) ?: return error(Response.Status.BAD_REQUEST, "INVALID_AGENT", "Agent 编号无效")
+        fun rejected(status: Response.Status, code: String, message: String): Response {
+            platformTelemetry.recordRejectedAgentBatch()
+            return error(status, code, message)
+        }
+        val agentId = parseId(idText) ?: return rejected(Response.Status.BAD_REQUEST, "INVALID_AGENT", "Agent 编号无效")
         val bootId = request.bootId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-            ?: return error(Response.Status.BAD_REQUEST, "INVALID_BATCH", "启动编号无效")
+            ?: return rejected(Response.Status.BAD_REQUEST, "INVALID_BATCH", "启动编号无效")
         val sequence = request.sequence ?: 0
         val configVersion = request.configVersion ?: 0
         val sampledAt = request.sampledAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
-            ?: return error(Response.Status.BAD_REQUEST, "INVALID_BATCH", "采样时间无效")
+            ?: return rejected(Response.Status.BAD_REQUEST, "INVALID_BATCH", "采样时间无效")
         val metrics = request.metrics ?: emptyList()
         if (sequence <= 0 || configVersion <= 0 || metrics.isEmpty() || metrics.size > MAX_METRICS_PER_BATCH) {
-            return error(Response.Status.BAD_REQUEST, "INVALID_BATCH", "批次序号、配置版本或指标数量无效")
+            return rejected(Response.Status.BAD_REQUEST, "INVALID_BATCH", "批次序号、配置版本或指标数量无效")
         }
-        val normalized = normalizeMetrics(metrics) ?: return error(Response.Status.BAD_REQUEST, "INVALID_METRIC", "指标名称、标签或数值不在允许范围内")
+        val normalized = normalizeMetrics(metrics) ?: return rejected(Response.Status.BAD_REQUEST, "INVALID_METRIC", "指标名称、标签或数值不在允许范围内")
         val now = Instant.now()
         if (sampledAt.isBefore(now.minus(MAX_SAMPLE_AGE)) || sampledAt.isAfter(now.plus(MAX_FUTURE_SKEW))) {
-            return error(Response.Status.BAD_REQUEST, "SAMPLE_TIME_OUT_OF_RANGE", "采样时间超出允许范围")
+            return rejected(Response.Status.BAD_REQUEST, "SAMPLE_TIME_OUT_OF_RANGE", "采样时间超出允许范围")
         }
         val sampleAgeMillis = Duration.between(sampledAt, now).toMillis()
         val clockSynced = request.clockSynced == true
         val clientClockOffsetMillis = request.clientClockOffsetMs
         if (clockSynced && clientClockOffsetMillis == null) {
-            return error(Response.Status.BAD_REQUEST, "INVALID_BATCH", "时钟校准状态与偏差值不匹配")
+            return rejected(Response.Status.BAD_REQUEST, "INVALID_BATCH", "时钟校准状态与偏差值不匹配")
         }
         val trusted = clockSynced && clientClockOffsetMillis?.let { offset ->
             offset >= -TRUSTED_CLOCK_SKEW.toMillis() && offset <= TRUSTED_CLOCK_SKEW.toMillis()
@@ -302,11 +307,11 @@ class AgentResource {
                 val agent = authenticateAgent(connection, agentId, headers)
                 if (agent == null) {
                     connection.rollback()
-                    return@use error(Response.Status.UNAUTHORIZED, "AGENT_UNAUTHENTICATED", "Agent 凭据无效或已吊销")
+                    return@use rejected(Response.Status.UNAUTHORIZED, "AGENT_UNAUTHENTICATED", "Agent 凭据无效或已吊销")
                 }
                 if (configVersion > agent.configVersion) {
                     connection.rollback()
-                    return@use error(Response.Status.CONFLICT, "AGENT_CONFIG_VERSION_FUTURE", "批次配置版本尚未由服务端签发")
+                    return@use rejected(Response.Status.CONFLICT, "AGENT_CONFIG_VERSION_FUTURE", "批次配置版本尚未由服务端签发")
                 }
                 val batchId = UUID.randomUUID()
                 val insertedBatchId = connection.prepareStatement(

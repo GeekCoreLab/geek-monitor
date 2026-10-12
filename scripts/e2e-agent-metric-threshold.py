@@ -41,7 +41,7 @@ class ApiClient:
         self.cookie: str | None = None
 
     def request(self, method: str, path: str, body: dict[str, object] | None = None,
-                bearer: str | None = None) -> tuple[int, object]:
+                bearer: str | None = None, allow_http_error: bool = False) -> tuple[int, object]:
         encoded = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
         request = urllib.request.Request(
             f"{self.base_url}{path}", data=encoded, method=method,
@@ -55,6 +55,8 @@ class ApiClient:
             response = urllib.request.urlopen(request, timeout=12)
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
+            if allow_http_error:
+                return error.code, json.loads(detail) if detail else {}
             raise RuntimeError(f"HTTP {error.code} for {method} {path}: {detail}") from error
         with response:
             raw = response.read()
@@ -245,6 +247,9 @@ def main() -> int:
             wait_until("application readiness", 120, ready)
             api = ApiClient(base_url, args.email, args.password)
             project_id = api.initialize()
+            status, initial_system_status = api.request("GET", "/api/v1/system/status")
+            if status != 200 or not isinstance(initial_system_status, dict) or "platformHealth" not in initial_system_status:
+                raise RuntimeError(f"system status omitted platform health telemetry (HTTP {status})")
             status, resource = api.request("POST", "/api/v1/resources", {
                 "projectId": project_id, "name": "CPU 与磁盘阈值验收主机", "type": "HOST", "environment": "e2e",
             })
@@ -266,6 +271,22 @@ def main() -> int:
             credential = str(registration["credential"])
             boot_id = str(uuid.uuid4())
             sequence = 0
+
+            status, rejected = api.request("POST", f"/api/v1/agents/{agent_id}/batches", {
+                "bootId": boot_id,
+                "sequence": 999,
+                "sampledAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "configVersion": 1,
+                "clientClockOffsetMs": 0,
+                "clockSynced": True,
+                "metrics": [{"name": "not_a_host_metric", "value": 1}],
+            }, bearer=credential, allow_http_error=True)
+            if status != 400 or not isinstance(rejected, dict) or rejected.get("code") != "INVALID_METRIC":
+                raise RuntimeError(f"expected the Agent API to reject an invalid metric (HTTP {status}): {rejected!r}")
+            status, system_status = api.request("GET", "/api/v1/system/status")
+            health = system_status.get("platformHealth") if isinstance(system_status, dict) else None
+            if status != 200 or not isinstance(health, dict) or health.get("rejectedAgentBatchesSinceStart") != 1:
+                raise RuntimeError(f"system status did not count the rejected Agent batch: {health!r}")
 
             high_values = [
                 (95.0, 92.0),
@@ -317,7 +338,21 @@ def main() -> int:
                 raise RuntimeError(f"expected two HIGH PERFORMANCE incidents with OPENED and RESOLVED events: {counts}")
             for monitor_id in monitor_ids:
                 assert_history(api, monitor_id, "METRIC_RECOVERY_PENDING")
+            status, system_status = api.request("GET", "/api/v1/system/status")
+            health = system_status.get("platformHealth") if isinstance(system_status, dict) else None
+            if status != 200 or not isinstance(health, dict):
+                raise RuntimeError(f"could not read platform health after the scheduler run (HTTP {status})")
+            if (health.get("status") != "HEALTHY" or health.get("enabledChecks", 0) < 3
+                    or health.get("recentCheckCount", 0) < 2 or health.get("recentResultP95LatencyMs") is None):
+                raise RuntimeError(f"platform status omitted healthy scheduler/check telemetry: {health!r}")
+            if health.get("rejectedAgentBatchesSinceStart") != 1:
+                raise RuntimeError(f"rejected Agent batch counter changed unexpectedly: {health!r}")
+            if health.get("notificationSuccessRate24h") is not None:
+                raise RuntimeError(f"notification success rate should be unknown before any deliveries: {health!r}")
+            if health.get("retention", {}).get("status") not in {"CURRENT", "RUNNING"}:
+                raise RuntimeError(f"retention job status did not record a successful run: {health!r}")
             print("PASS: trusted CPU and disk metrics opened HIGH PERFORMANCE incidents and the scheduler resolved both after recovery", flush=True)
+            print("PASS: admin system status reports scheduler, check freshness/latency, Agent rejection, delivery, and retention telemetry", flush=True)
             return 0
         except Exception:
             if app_log_path.is_file():
