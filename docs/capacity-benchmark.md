@@ -23,3 +23,5 @@
 启动数分钟后的检查中，100/100 Agent 均在 90 秒在线窗口内，已写入 900 个可信批次和 17,800 条可信样本；批次相邻采样间隔平均约 30.2 秒。100 个 Agent 总 RSS 约 1,172.6 MiB，P95 为 12.11 MiB；PostgreSQL 和 JVM 容器当时分别使用约 187 MiB 和 222 MiB。PostgreSQL 容器限制为 3 CPU / 4 GiB，JVM 限制为 1 CPU / 2 GiB；当前全部 Agent、数据库进程及 JVM 线程均限制在 CPU 0–3 上。开发服务 `127.0.0.1:18082` 及其数据库在同一检查时仍为 UP。
 
 该试运行尚未完成，以上是早期存活、节奏与资源检查，不是 7 天稳定性结论。rootless Podman 未提供 cpuset cgroup 控制器，因此以进程 affinity 将工作负载限制在 4 个 CPU 上；数据库与 JVM 分别设置内存上限，但没有整个宿主机级 8 GiB 聚合硬限制。本机进程也不是 100 台异机 Agent，故这次试运行仍不能单独证明异机网络或规划目标主机的完整容量验收。最终报告需核对全程进程状态、可信批次、指标保留/rollup、曲线查询、容器峰值资源和磁盘占用，并清理本次容器与临时卷。
+
+2026-10-12 11:37（UTC+8）增加只读检查器 [`scripts/monitor-agent-soak.py`](../scripts/monitor-agent-soak.py)，每 5 分钟记录 Agent/容器/数据库状态、CPU 与内存、数据库行数估计及宿主机磁盘余量；起始/结束快照另做精确可信批次与样本数核对。当前 JSONL 记录保存在 `/tmp/geek-monitor-agent-soak-verified.jsonl`，文件权限为 `0600`。此时真实进程已运行约 48 分钟，100/100 Agent 在线，9,700 个批次全部可信，已接受和实际存储的可信样本均为 202,600（差值 0）；Agent RSS 合计约 840 MiB，应用/数据库容器分别约 240/202 MiB，宿主机剩余 232.4 GiB，未发现异常。复查命令为 `taskset -c 4-17 ./scripts/monitor-agent-soak.py --once --log-file /tmp/geek-monitor-agent-soak-final.jsonl`。以上仅为进行中的检查点；最终结果仍以连续运行满 604,800 秒、监控器正常退出和最终精确快照为准。
