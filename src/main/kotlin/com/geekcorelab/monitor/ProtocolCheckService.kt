@@ -529,7 +529,7 @@ class NetworkCheckService {
         }
     }
 
-    private fun normalizeDnsName(host: String, recordType: String): String? = runCatching {
+    internal fun normalizeDnsName(host: String, recordType: String): String? = runCatching {
         val value = host.trim().removeSuffix(".")
         require(value.isNotBlank() && value.length <= 253 && '/' !in value && '@' !in value)
         if (recordType == "PTR" && isIpLiteral(value)) {
@@ -538,10 +538,10 @@ class NetworkCheckService {
             return if (address is java.net.Inet4Address) {
                 bytes.reversed().joinToString(".") { (it.toInt() and 0xff).toString() } + ".in-addr.arpa"
             } else {
-                bytes.joinToString("") { byte ->
+                bytes.reversed().flatMap { byte ->
                     val octet = byte.toInt() and 0xff
-                    "${"%x".format(octet and 0x0f)}.${"%x".format(octet ushr 4)}"
-                } + ".ip6.arpa"
+                    listOf(octet and 0x0f, octet ushr 4)
+                }.joinToString(".") { it.toString(16) } + ".ip6.arpa"
             }
         }
         val asciiLabels = value.split('.').map { label ->
