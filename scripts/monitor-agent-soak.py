@@ -59,16 +59,25 @@ def run(command: list[str], timeout: int = 20) -> str:
     return result.stdout.strip()
 
 
-def count_processes(markers: tuple[bytes, ...]) -> int:
-    matches = 0
+def matching_processes(markers: tuple[bytes, ...]) -> list[int]:
+    matches = []
     for command_line in Path("/proc").glob("[0-9]*/cmdline"):
         try:
             contents = command_line.read_bytes()
         except OSError:
             continue
         if all(marker in contents for marker in markers):
-            matches += 1
+            matches.append(int(command_line.parent.name))
     return matches
+
+
+def process_elapsed_seconds(pid: int) -> float:
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    fields_after_comm = stat[stat.rfind(")") + 1 :].split()
+    start_ticks = int(fields_after_comm[19])
+    uptime_seconds = float(Path("/proc/uptime").read_text().split()[0])
+    clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
+    return max(0.0, uptime_seconds - start_ticks / clock_ticks_per_second)
 
 
 def agent_rss() -> tuple[int, int]:
@@ -136,9 +145,11 @@ def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -
     if app_state != "running" or db_state != "running":
         raise RuntimeError(f"container state is app={app_state}, db={db_state}")
     process_count, rss_kib = agent_rss()
-    runner_count = count_processes((RUNNER_COMMAND, RUNNER_ARGUMENTS))
+    runner_pids = matching_processes((RUNNER_COMMAND, RUNNER_ARGUMENTS))
+    runner_count = len(runner_pids)
     if runner_count > 1:
         raise RuntimeError(f"found {runner_count} Agent soak runner processes")
+    runner_elapsed = process_elapsed_seconds(runner_pids[0]) if runner_pids else None
 
     database = database_snapshot(args.db_container, detailed)
     stats = container_stats((args.db_container, args.app_container))
@@ -148,6 +159,7 @@ def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 1),
         "runner_processes": runner_count,
+        "runner_elapsed_seconds": round(runner_elapsed, 1) if runner_elapsed is not None else None,
         "agent_processes": process_count,
         "agent_rss_mib": round(rss_kib / 1024, 2),
         "app_health": app_health["status"],
@@ -199,6 +211,7 @@ def main() -> int:
     started = time.monotonic()
     deadline = started + args.duration_seconds
     runner_seen = False
+    runner_started_monotonic: float | None = None
     with os.fdopen(descriptor, "a", encoding="utf-8") as log:
         while True:
             elapsed = time.monotonic() - started
@@ -207,10 +220,19 @@ def main() -> int:
                 runner_count = int(record["runner_processes"])
                 if runner_count:
                     runner_seen = True
+                    if runner_started_monotonic is None:
+                        runner_started_monotonic = time.monotonic() - float(record["runner_elapsed_seconds"])
                 elif not args.once and not runner_seen:
                     record["problems"].append("Agent soak runner process was not detected")
                 elif runner_seen and not args.once:
+                    runner_runtime = time.monotonic() - float(runner_started_monotonic)
                     record = snapshot(args, elapsed, detailed=True)
+                    record["runner_runtime_seconds"] = round(runner_runtime, 1)
+                    if runner_runtime < args.duration_seconds:
+                        record["problems"].append(
+                            f"Agent soak runner exited after {runner_runtime:.1f}s; "
+                            f"expected at least {args.duration_seconds}s"
+                        )
             except Exception as exception:
                 record = {
                     "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
