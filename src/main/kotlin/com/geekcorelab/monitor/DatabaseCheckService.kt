@@ -8,11 +8,13 @@ import jakarta.inject.Inject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
+import java.io.InterruptedIOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.sql.DriverManager
 import java.sql.SQLException
+import java.sql.SQLTimeoutException
 import java.time.Instant
 import java.util.Properties
 import java.util.concurrent.TimeUnit
@@ -20,6 +22,8 @@ import javax.net.ssl.SSLException
 import javax.net.ssl.SSLParameters
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+
+internal data class DatabaseCheckFailure(val status: String, val code: String, val summary: String)
 
 @ApplicationScoped
 class DatabaseCheckService {
@@ -214,21 +218,27 @@ class DatabaseCheckService {
         exception: Exception?,
         result: (String, String?, String?) -> CheckResponse,
     ): CheckResponse {
+        val failure = classifyDatabaseFailure(exception)
+        return result(failure.status, failure.code, failure.summary)
+    }
+
+    internal fun classifyDatabaseFailure(exception: Exception?): DatabaseCheckFailure {
         val root = rootCause(exception)
         val sql = generateSequence(exception) { (it as? SQLException)?.nextException }.firstOrNull { it is SQLException } as? SQLException
         return when {
-            root is java.net.SocketTimeoutException -> result("DOWN", "TIMEOUT", "数据库连接或查询超时")
-            root is SSLException -> result("DOWN", "TLS_FAILURE", "数据库 TLS 证书或握手校验失败")
-            sql?.sqlState?.startsWith("28") == true -> result("DOWN", "AUTHENTICATION_FAILED", "数据库认证失败")
-            sql?.sqlState?.startsWith("3D") == true -> result("DOWN", "DATABASE_NOT_FOUND", "数据库名称不存在")
+            root is InterruptedIOException || root is SQLTimeoutException || sql?.sqlState == "57014" ->
+                DatabaseCheckFailure("DOWN", "TIMEOUT", "数据库连接或查询超时")
+            root is SSLException -> DatabaseCheckFailure("DOWN", "TLS_FAILURE", "数据库 TLS 证书或握手校验失败")
+            sql?.sqlState?.startsWith("28") == true -> DatabaseCheckFailure("DOWN", "AUTHENTICATION_FAILED", "数据库认证失败")
+            sql?.sqlState?.startsWith("3D") == true -> DatabaseCheckFailure("DOWN", "DATABASE_NOT_FOUND", "数据库名称不存在")
             sql?.sqlState?.startsWith("08") == true || root is java.net.ConnectException ->
-                result("DOWN", "CONNECTION_FAILED", "无法建立数据库连接")
-            exception != null -> result("DOWN", "DATABASE_QUERY_FAILED", "数据库只读探测失败")
-            else -> result("DOWN", "CONNECTION_FAILED", "无法建立数据库连接")
+                DatabaseCheckFailure("DOWN", "CONNECTION_FAILED", "无法建立数据库连接")
+            exception != null -> DatabaseCheckFailure("DOWN", "DATABASE_QUERY_FAILED", "数据库只读探测失败")
+            else -> DatabaseCheckFailure("DOWN", "CONNECTION_FAILED", "无法建立数据库连接")
         }
     }
 
-    private fun readJdbcConnectionMetrics(kind: String, connection: java.sql.Connection): Map<String, Double> {
+    internal fun readJdbcConnectionMetrics(kind: String, connection: java.sql.Connection): Map<String, Double> {
         val connected = runCatching {
             connection.createStatement().use { statement ->
                 statement.queryTimeout = METRIC_QUERY_TIMEOUT_SECONDS
