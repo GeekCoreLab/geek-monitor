@@ -81,6 +81,15 @@ def process_elapsed_seconds(pid: int) -> float:
     return max(0.0, uptime_seconds - start_ticks / clock_ticks_per_second)
 
 
+def suspend_gap_seconds(
+    previous_monotonic: float,
+    current_monotonic: float,
+    previous_boottime: float,
+    current_boottime: float,
+) -> float:
+    return max(0.0, (current_boottime - previous_boottime) - (current_monotonic - previous_monotonic))
+
+
 def agent_process_metrics() -> tuple[dict[int, dict[str, int]], float]:
     processes: dict[int, dict[str, int]] = {}
     for command_line in Path("/proc").glob("[0-9]*/cmdline"):
@@ -232,12 +241,26 @@ def main() -> int:
     deadline = started + args.duration_seconds
     runner_seen = False
     runner_max_elapsed_seconds = 0.0
+    previous_problem_count = 0
+    if not args.once and args.log_file.exists():
+        with args.log_file.open("r", encoding="utf-8") as existing_log:
+            for line in existing_log:
+                try:
+                    previous_problem_count += len(json.loads(line).get("problems", []))
+                except (json.JSONDecodeError, AttributeError):
+                    continue
     previous_agent_cpu_ticks: dict[int, int] | None = None
     previous_agent_cpu_sample_monotonic: float | None = None
+    previous_loop_monotonic: float | None = None
+    previous_loop_boottime: float | None = None
+    boottime_clock = getattr(time, "CLOCK_BOOTTIME", None)
+    problem_count = previous_problem_count
     clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
     with os.fdopen(descriptor, "a", encoding="utf-8") as log:
         while True:
-            elapsed = time.monotonic() - started
+            loop_monotonic = time.monotonic()
+            loop_boottime = time.clock_gettime(boottime_clock) if boottime_clock is not None else None
+            elapsed = loop_monotonic - started
             try:
                 record = snapshot(args, elapsed, detailed=args.once)
                 runner_count = int(record["runner_processes"])
@@ -264,6 +287,18 @@ def main() -> int:
                     "elapsed_seconds": round(elapsed, 1),
                     "problems": [f"snapshot failed: {type(exception).__name__}: {exception}"],
                 }
+            if previous_loop_monotonic is not None and previous_loop_boottime is not None and loop_boottime is not None:
+                suspend_gap = suspend_gap_seconds(
+                    previous_loop_monotonic,
+                    loop_monotonic,
+                    previous_loop_boottime,
+                    loop_boottime,
+                )
+                record["host_suspend_gap_seconds"] = round(suspend_gap, 1)
+                if suspend_gap >= 5:
+                    record["problems"].append(f"host suspended for approximately {suspend_gap:.1f}s")
+            previous_loop_monotonic = loop_monotonic
+            previous_loop_boottime = loop_boottime
             current_agent_cpu_ticks = record.pop("_agent_cpu_ticks_by_pid", None)
             current_agent_cpu_sample_monotonic = record.pop("_agent_cpu_sample_monotonic", None)
             if current_agent_cpu_ticks is not None and current_agent_cpu_sample_monotonic is not None:
@@ -303,6 +338,9 @@ def main() -> int:
                 )
             if not args.once and time.monotonic() >= deadline and record.get("runner_processes"):
                 record["problems"].append("monitor duration elapsed while Agent soak runner remained active")
+            if record["problems"]:
+                problem_count += len(record["problems"])
+            record["cumulative_problem_count"] = problem_count
             log.write(json.dumps(record, separators=(",", ":")) + "\n")
             log.flush()
             os.fsync(log.fileno())
@@ -323,10 +361,15 @@ def main() -> int:
             )
             if record["problems"]:
                 print(f"FAIL {summary} problems={record['problems']}", flush=True)
-                return 1
-            print(f"OK {summary}", flush=True)
-            if args.once or (runner_seen and not record.get("runner_processes")) or time.monotonic() >= deadline:
+                if args.once:
+                    return 1
+            else:
+                print(f"OK {summary}", flush=True)
+            if args.once:
                 return 0
+            finished = (runner_seen and not record.get("runner_processes")) or time.monotonic() >= deadline
+            if finished:
+                return 1 if problem_count else 0
             sleep_seconds = args.interval_seconds
             runner_elapsed = record.get("runner_elapsed_seconds")
             final_observation_window = max(args.interval_seconds * 2, 600)
