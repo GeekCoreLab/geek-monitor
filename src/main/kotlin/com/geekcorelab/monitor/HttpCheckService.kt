@@ -29,6 +29,10 @@ data class TargetResolution(val addresses: List<InetAddress>, val errorCode: Str
 class HttpCheckService {
     @Inject lateinit var secretEncryption: SecretEncryptionService
 
+    internal var addressResolver: (String) -> List<InetAddress> = { hostname ->
+        InetAddress.getAllByName(hostname).toList()
+    }
+
     @Inject @field:ConfigProperty(name = "geek-monitor.network.allow-private-targets", defaultValue = "false")
     var allowPrivateTargets: Boolean = false
 
@@ -259,7 +263,7 @@ class HttpCheckService {
 
     private fun resolveAndValidate(hostname: String, targetHost: String, allowedNetworks: List<IpNetwork>): List<InetAddress> {
         if (!hostname.equals(targetHost, ignoreCase = true)) throw UnknownHostException("request attempted DNS lookup for an unexpected host")
-        val addresses = InetAddress.getAllByName(hostname).toList()
+        val addresses = addressResolver(hostname)
         if (addresses.isEmpty()) throw UnknownHostException("host returned no addresses")
         if (addresses.any { !addressAllowed(it, allowedNetworks) }) {
             throw UnknownHostException("address rejected by network policy")

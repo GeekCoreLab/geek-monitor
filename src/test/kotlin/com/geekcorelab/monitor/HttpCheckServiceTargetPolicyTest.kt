@@ -9,6 +9,7 @@ import com.sun.net.httpserver.HttpServer
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.IOException
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.util.Base64
@@ -153,6 +154,63 @@ class HttpCheckServiceTargetPolicyTest {
             assertEquals("DOWN", timeout.status)
             assertEquals("TIMEOUT", timeout.errorCode)
             assertTrue(timeout.durationMs < 3_000)
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `HTTP client pins validated DNS answer and rechecks it on the next request`() {
+        val targetAddress = NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .firstOrNull { it.isSiteLocalAddress && !it.isLoopbackAddress }
+        assumeTrue(targetAddress != null, "No private IPv4 interface is available for the local HTTP smoke test")
+
+        val blockedAddress = InetAddress.getByAddress(
+            byteArrayOf(169.toByte(), 254.toByte(), 169.toByte(), 254.toByte()),
+        )
+        val currentAnswer = AtomicReference<List<java.net.InetAddress>>(listOf(targetAddress!!))
+        val lookupCount = AtomicInteger()
+        val requestCount = AtomicInteger()
+        val server = HttpServer.create(InetSocketAddress("0.0.0.0", 0), 0)
+        server.createContext("/") { exchange ->
+            requestCount.incrementAndGet()
+            val response = "ready".toByteArray()
+            exchange.sendResponseHeaders(200, response.size.toLong())
+            exchange.responseBody.use { it.write(response) }
+        }
+        server.start()
+        try {
+            val checker = service(allowPrivateTargets = true).apply {
+                addressResolver = { hostname ->
+                    assertEquals("dns-rebind.test", hostname)
+                    val answer = currentAnswer.get()
+                    if (lookupCount.incrementAndGet() == 1) currentAnswer.set(listOf(blockedAddress))
+                    answer
+                }
+            }
+            val url = "http://dns-rebind.test:${server.address.port}/"
+
+            val pinnedAnswer = checker.execute(url, "GET", 3, setOf(200), "ready")
+
+            assertEquals("UP", pinnedAnswer.status)
+            assertEquals(1, lookupCount.get())
+            assertEquals(1, requestCount.get())
+
+            val blockedAnswer = checker.execute(url, "GET", 3, setOf(200), "ready")
+
+            assertEquals("UNKNOWN", blockedAnswer.status)
+            assertEquals("TARGET_BLOCKED", blockedAnswer.errorCode)
+            assertEquals(2, lookupCount.get())
+            assertEquals(1, requestCount.get())
+
+            currentAnswer.set(listOf(targetAddress))
+            val recovered = checker.execute(url, "GET", 3, setOf(200), "ready")
+
+            assertEquals("UP", recovered.status)
+            assertEquals(3, lookupCount.get())
+            assertEquals(2, requestCount.get())
         } finally {
             server.stop(0)
         }
