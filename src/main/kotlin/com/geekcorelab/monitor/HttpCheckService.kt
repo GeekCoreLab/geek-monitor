@@ -15,6 +15,7 @@ import java.io.InterruptedIOException
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.net.Proxy
 import java.net.URI
 import java.net.UnknownHostException
 import java.time.Instant
@@ -70,6 +71,7 @@ class HttpCheckService {
         }
         val dns = Dns { hostname -> resolveAndValidate(hostname, uri.host, allowedNetworks) }
         val client = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
             .dns(dns)
             .connectTimeout(WEBHOOK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(WEBHOOK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
@@ -158,6 +160,7 @@ class HttpCheckService {
             val remainingMillis = max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos))
             val dns = Dns { hostname -> resolveAndValidate(hostname, uri.host, allowedNetworks) }
             val client = OkHttpClient.Builder()
+                .proxy(Proxy.NO_PROXY)
                 .dns(dns)
                 .connectTimeout(remainingMillis, TimeUnit.MILLISECONDS)
                 .readTimeout(remainingMillis, TimeUnit.MILLISECONDS)
