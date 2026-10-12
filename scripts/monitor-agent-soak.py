@@ -102,6 +102,37 @@ def missing_runner_problem(
     return "Agent soak runner process was not detected"
 
 
+def incomplete_observation_problem(log_file: Path, once: bool = False) -> str | None:
+    if once or not log_file.is_file():
+        return None
+    last_soak_record = None
+    with log_file.open("r", encoding="utf-8") as existing_log:
+        for line in existing_log:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("observation_kind", "soak") == "soak":
+                last_soak_record = record
+    if last_soak_record is None or last_soak_record.get("observation_completed") is True:
+        return None
+    return "Previous Agent soak observation ended before completion; this run cannot count as continuous"
+
+
+def checkpoint_gap_problem(
+    previous_monotonic: float,
+    current_monotonic: float,
+    interval_seconds: int,
+) -> tuple[float, str | None]:
+    gap_seconds = max(0.0, current_monotonic - previous_monotonic)
+    allowed_gap_seconds = interval_seconds + 60
+    if gap_seconds > allowed_gap_seconds:
+        return gap_seconds, (
+            f"observer checkpoint gap={gap_seconds:.1f}s exceeds {allowed_gap_seconds}s"
+        )
+    return gap_seconds, None
+
+
 def agent_identity_fingerprint(processes: dict[int, dict[str, int]]) -> str:
     identity = ",".join(
         f"{pid}:{metrics['start_ticks']}" for pid, metrics in sorted(processes.items())
@@ -264,6 +295,7 @@ def main() -> int:
     args.minimum_free_bytes = int(args.minimum_free_gib * 1024**3)
 
     args.log_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    restart_problem = incomplete_observation_problem(args.log_file, args.once)
     descriptor = os.open(args.log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     started = time.monotonic()
     deadline = started + args.duration_seconds
@@ -329,6 +361,10 @@ def main() -> int:
                     "elapsed_seconds": round(elapsed, 1),
                     "problems": [f"snapshot failed: {type(exception).__name__}: {exception}"],
                 }
+            record["observation_kind"] = "checkpoint" if args.once else "soak"
+            if restart_problem:
+                record["problems"].append(restart_problem)
+                restart_problem = None
             if not args.once and time.monotonic() >= deadline and not record.get("database", {}).get("detailed"):
                 previous_problems = list(record.get("problems", []))
                 try:
@@ -354,6 +390,13 @@ def main() -> int:
                 record["host_suspend_gap_seconds"] = round(suspend_gap, 1)
                 if suspend_gap >= 5:
                     record["problems"].append(f"host suspended for approximately {suspend_gap:.1f}s")
+            if previous_loop_monotonic is not None:
+                checkpoint_gap, gap_problem = checkpoint_gap_problem(
+                    previous_loop_monotonic, loop_monotonic, args.interval_seconds,
+                )
+                record["observer_checkpoint_gap_seconds"] = round(checkpoint_gap, 1)
+                if gap_problem:
+                    record["problems"].append(gap_problem)
             previous_loop_monotonic = loop_monotonic
             previous_loop_boottime = loop_boottime
             workload_observed = bool(record.get("runner_processes")) or args.observe_existing_agent_cohort

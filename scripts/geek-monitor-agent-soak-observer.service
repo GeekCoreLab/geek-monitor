@@ -1,0 +1,17 @@
+[Unit]
+Description=Geek Monitor Agent recovery soak observer
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/codes/geek-monitor
+ExecStart=/usr/bin/python3 -u %h/codes/geek-monitor/scripts/monitor-agent-soak.py --base-url http://127.0.0.1:18084 --app-container geek-monitor-agent-soak-app --db-container geek-monitor-agent-soak-db --expected-agents 100 --interval-seconds 300 --duration-seconds 604800 --minimum-free-gib 20 --maximum-agent-rss-mib 50 --maximum-agent-average-cpu-percent 1 --observe-existing-agent-cohort --log-file %h/.local/state/geek-monitor/agent-soak-recovery-v4.jsonl
+Restart=on-abnormal
+RestartSec=15s
+TimeoutStopSec=30s
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -38,6 +39,52 @@ class RunnerDetectionTests(unittest.TestCase):
         self.assertIsNone(MONITOR.missing_runner_problem(
             runner_count=0, runner_seen=False, once=False, observe_existing_agent_cohort=True,
         ))
+
+
+class ObservationContinuityTests(unittest.TestCase):
+    def test_new_or_single_checkpoint_log_is_not_a_restarted_soak(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "observer.jsonl"
+            self.assertIsNone(MONITOR.incomplete_observation_problem(log_file))
+            log_file.write_text('{"observation_kind":"checkpoint"}\n', encoding="utf-8")
+            self.assertIsNone(MONITOR.incomplete_observation_problem(log_file))
+
+    def test_incomplete_soak_is_reported_even_after_a_one_off_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "observer.jsonl"
+            log_file.write_text(
+                '{"observation_kind":"soak","elapsed_seconds":300}\n'
+                '{"observation_kind":"checkpoint"}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                MONITOR.incomplete_observation_problem(log_file),
+                "Previous Agent soak observation ended before completion; this run cannot count as continuous",
+            )
+
+    def test_completed_soak_can_be_followed_by_a_new_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "observer.jsonl"
+            log_file.write_text(
+                '{"observation_kind":"soak","observation_completed":true}\n',
+                encoding="utf-8",
+            )
+            self.assertIsNone(MONITOR.incomplete_observation_problem(log_file))
+
+    def test_once_mode_does_not_report_an_interrupted_soak(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "observer.jsonl"
+            log_file.write_text('{"observation_kind":"soak"}\n', encoding="utf-8")
+            self.assertIsNone(MONITOR.incomplete_observation_problem(log_file, once=True))
+
+    def test_checkpoint_gap_allows_scheduling_jitter_but_reports_long_pause(self) -> None:
+        gap, problem = MONITOR.checkpoint_gap_problem(100.0, 359.0, 300)
+        self.assertEqual(gap, 259.0)
+        self.assertIsNone(problem)
+
+        gap, problem = MONITOR.checkpoint_gap_problem(100.0, 461.0, 300)
+        self.assertEqual(gap, 361.0)
+        self.assertEqual(problem, "observer checkpoint gap=361.0s exceeds 360s")
 
 
 class AgentIdentityTests(unittest.TestCase):
