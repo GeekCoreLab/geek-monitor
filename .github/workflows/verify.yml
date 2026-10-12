@@ -29,6 +29,7 @@ jobs:
           POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
         ports:
           - 55435:5432
+          - 55436:5432
         options: >-
           --health-cmd "pg_isready -U geek_monitor -d geek_monitor_status_stream"
           --health-interval 5s
