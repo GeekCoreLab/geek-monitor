@@ -172,6 +172,8 @@ def main() -> int:
     app_container = f"geek-monitor-db-outage-app-{suffix}"
     db_password = secrets.token_urlsafe(24)
     target_password = secrets.token_urlsafe(24)
+    rejected_password = secrets.token_urlsafe(24)
+    limited_password = secrets.token_urlsafe(24)
     timeout_password = secrets.token_urlsafe(24)
     encryption_key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     app_started = False
@@ -293,6 +295,63 @@ def main() -> int:
         print(f"application_schema=V{schema_version} database_monitor_initial={initial[0]['state']} "
               f"result={initial[1]['status']}", flush=True)
 
+        podman(
+            "exec", target_db_container, "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "monitor_user",
+            "-d", "monitored", "-c", f"""
+                CREATE ROLE monitor_limited LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+                    PASSWORD '{limited_password}';
+                GRANT CONNECT ON DATABASE monitored TO monitor_limited;
+                REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
+                REVOKE SELECT ON pg_catalog.pg_settings FROM PUBLIC;
+            """,
+        )
+        status, limited_monitor = api.request("POST", "/api/v1/monitors", {
+            "resourceId": resource["id"], "name": "PostgreSQL 指标权限不足验收",
+            "type": "POSTGRESQL", "targetHost": str(parsed_target_ip), "port": 5432,
+            "databaseName": "monitored", "databaseUsername": "monitor_limited",
+            "databasePassword": limited_password, "databaseTls": False,
+            "intervalSeconds": 10, "timeoutSeconds": 2,
+            "failureThreshold": 1, "recoveryThreshold": 1,
+            "critical": False, "enabled": False,
+        })
+        if status != 201 or not isinstance(limited_monitor, dict):
+            raise RuntimeError(f"could not create limited PostgreSQL monitor (HTTP {status})")
+        status, limited_result = api.request(
+            "POST", f"/api/v1/monitors/{limited_monitor['id']}/test",
+        )
+        if (status != 200 or not isinstance(limited_result, dict) or limited_result.get("status") != "UP" or
+                limited_result.get("metrics") != {}):
+            raise RuntimeError(
+                f"missing statistics permissions incorrectly failed PostgreSQL availability: "
+                f"HTTP {status}, result={limited_result!r}"
+            )
+        print("database_monitor_limited_statistics=UP metrics=empty", flush=True)
+
+        status, rejected_monitor = api.request("POST", "/api/v1/monitors", {
+            "resourceId": resource["id"], "name": "PostgreSQL 错误凭据验收",
+            "type": "POSTGRESQL", "targetHost": str(parsed_target_ip), "port": 5432,
+            "databaseName": "monitored", "databaseUsername": "monitor_user",
+            "databasePassword": rejected_password, "databaseTls": False,
+            "intervalSeconds": 10, "timeoutSeconds": 2,
+            "failureThreshold": 1, "recoveryThreshold": 1,
+            "critical": False, "enabled": False,
+        })
+        if status != 201 or not isinstance(rejected_monitor, dict):
+            raise RuntimeError(f"could not create invalid-credential PostgreSQL monitor (HTTP {status})")
+        status, rejected_result = api.request(
+            "POST", f"/api/v1/monitors/{rejected_monitor['id']}/test",
+        )
+        if (status != 200 or not isinstance(rejected_result, dict) or rejected_result.get("status") != "DOWN" or
+                rejected_result.get("errorCode") != "AUTHENTICATION_FAILED"):
+            raise RuntimeError(
+                f"invalid PostgreSQL credentials were not classified as AUTHENTICATION_FAILED: "
+                f"HTTP {status}, result={rejected_result!r}"
+            )
+        rejected_payload = json.dumps(rejected_result, ensure_ascii=False).lower()
+        if rejected_password.lower() in rejected_payload or "org.postgresql" in rejected_payload or "jdbc:" in rejected_payload:
+            raise RuntimeError("invalid-credential result leaked credentials or JDBC internals")
+        print("database_monitor_invalid_credentials=DOWN/AUTHENTICATION_FAILED sanitized=yes", flush=True)
+
         status, timeout_monitor = api.request("POST", "/api/v1/monitors", {
             "resourceId": resource["id"], "name": "PostgreSQL 查询超时验收",
             "type": "POSTGRESQL", "targetHost": "query-timeout-db", "port": 5432,
@@ -362,7 +421,7 @@ def main() -> int:
     finally:
         if app_started and not completed:
             logs = podman("logs", "--tail", "80", app_container, check=False).stdout
-            for secret in (db_password, target_password, timeout_password):
+            for secret in (db_password, target_password, rejected_password, limited_password, timeout_password):
                 logs = logs.replace(secret, "[REDACTED]")
             if logs:
                 print(f"temporary application log tail:\n{logs[-12000:]}", file=sys.stderr)
