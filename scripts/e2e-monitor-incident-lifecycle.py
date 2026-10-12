@@ -317,6 +317,43 @@ def main() -> int:
         ):
             raise RuntimeError("the private sink did not receive the matching incident.opened notification")
 
+        acknowledgement_note = "已接手排查；确认事件不能改变仍失败的监控状态。"
+        status, acknowledged = api.request(
+            "POST",
+            f"/api/v1/incidents/{incident_id}/ack",
+            {"note": acknowledgement_note},
+        )
+        if (
+            status != 200
+            or not isinstance(acknowledged, dict)
+            or acknowledged.get("status") != "ACKNOWLEDGED"
+            or acknowledged.get("acknowledgedBy") != args.email.lower()
+            or acknowledged.get("acknowledgementNote") != acknowledgement_note
+            or not isinstance(acknowledged.get("acknowledgedAt"), str)
+        ):
+            raise RuntimeError(f"incident acknowledgement was not persisted for the administrator (HTTP {status})")
+        acknowledged_at = datetime.fromisoformat(
+            str(acknowledged["acknowledgedAt"]).replace("Z", "+00:00")
+        )
+        subsequent_failure = wait_until(
+            "a later DOWN result after incident acknowledgement",
+            args.failure_timeout,
+            lambda: _failure_after(api, monitor_id, acknowledged_at),
+        )
+        acknowledged_incident = _incident_by_id(api, incident_id, "ACKNOWLEDGED")
+        if acknowledged_incident is None:
+            raise RuntimeError("a repeated failure changed the acknowledged incident status")
+        if _matching_incident(api, monitor_id, "OPEN") is not None:
+            raise RuntimeError("a repeated failure created a duplicate OPEN incident after acknowledgement")
+        if _monitor_state(api, monitor_id, "DOWN") is None or subsequent_failure.get("state") != "DOWN":
+            raise RuntimeError("acknowledging an incident incorrectly marked the failed monitor healthy")
+        resource_rows = api.request("GET", f"/api/v1/resources?projectId={urllib.parse.quote(project_id)}")[1]
+        if not isinstance(resource_rows, list) or not any(
+            row.get("id") == resource_id and row.get("healthStatus") == "DOWN"
+            for row in resource_rows
+        ):
+            raise RuntimeError("acknowledging an incident incorrectly marked the critical resource healthy")
+
         state.set_healthy(True)
         resolved = wait_until(
             "monitor UP and incident RESOLVED",
@@ -338,8 +375,8 @@ def main() -> int:
             lambda: _matching_delivery(api, channel_id, "RESOLVED", "DELIVERED"),
         )
         event_rows = api.request("GET", f"/api/v1/incidents/{incident_id}/events")[1]
-        if not isinstance(event_rows, list) or not {row.get("eventType") for row in event_rows}.issuperset({"OPENED", "RESOLVED"}):
-            raise RuntimeError("the incident event history is missing OPENED or RESOLVED")
+        if not isinstance(event_rows, list) or not {row.get("eventType") for row in event_rows}.issuperset({"OPENED", "ACKNOWLEDGED", "RESOLVED"}):
+            raise RuntimeError("the incident event history is missing OPENED, ACKNOWLEDGED, or RESOLVED")
         with sink.lock:
             payloads = list(sink.received)
         webhook_types = sorted({
@@ -458,7 +495,18 @@ def main() -> int:
 
         print(json.dumps({
             "monitor_result": "DOWN/503 -> UP/200",
-            "incident": {"id": incident_id, "category": incident.get("category"), "events": ["OPENED", "RESOLVED"]},
+            "incident": {
+                "id": incident_id,
+                "category": incident.get("category"),
+                "acknowledgement": {
+                    "status": acknowledged.get("status"),
+                    "acknowledgedBy": acknowledged.get("acknowledgedBy"),
+                    "note": acknowledged.get("acknowledgementNote"),
+                    "monitorStateAfterAck": subsequent_failure.get("state"),
+                    "resourceStateAfterAck": "DOWN",
+                },
+                "events": ["OPENED", "ACKNOWLEDGED", "RESOLVED"],
+            },
             "incident_count": len([row for row in resolved if row.get("monitorId") == monitor_id]),
             "open_delivery": {"status": open_delivery.get("status"), "groupCount": open_delivery.get("groupCount")},
             "resolved_delivery": {"status": resolved_delivery.get("status"), "groupCount": resolved_delivery.get("groupCount")},
