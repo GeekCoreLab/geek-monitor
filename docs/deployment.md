@@ -84,3 +84,7 @@ RESTORE_CONFIRM_DATABASE=geek_monitor_restore \
 ## Agent
 
 Agent 使用独立 systemd 服务和受限服务账户安装，断网队列文件及凭据目录应保持 `0700`，状态文件为 `0600`。注册、升级、卸载与重注册方式见[Agent 指南](../agent/README.md)。
+
+## 数据库监控账号
+
+为每个 PostgreSQL、MySQL 或 Redis 目标配置单独的最小权限账号。监控只执行固定只读探测；数据库版本对应的授权命令、可选连接指标权限和验证步骤见[数据库监控账号权限说明](database-monitoring-permissions.md)。
