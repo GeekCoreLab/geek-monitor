@@ -75,6 +75,25 @@ WantedBy=multi-user.target
 
 Enable it with `sudo systemctl daemon-reload && sudo systemctl enable --now geek-monitor-agent`. Re-enrollment is required after an administrator revokes the node credential.
 
+## Uninstall
+
+First revoke the Agent credential from **Agent 节点** in the Admin console. This prevents a copied state file from reconnecting. Then stop and remove the local service and files:
+
+```sh
+sudo systemctl disable --now geek-monitor-agent.service
+sudo rm -f /etc/systemd/system/geek-monitor-agent.service
+sudo systemctl daemon-reload
+sudo rm -f /usr/local/bin/geek-monitor-agent
+sudo rm -rf /var/lib/geek-monitor /etc/geek-monitor
+```
+
+Removing `/var/lib/geek-monitor` also deletes the local retry queue and any samples that had not reached the server. Remove the `geek-monitor` system user and group only if no other local Agent installation uses them:
+
+```sh
+sudo userdel geek-monitor
+sudo groupdel geek-monitor
+```
+
 ## Collection and delivery behavior
 
 - The Agent polls its collection configuration and samples immediately on startup, then follows the server interval (30 seconds by default).
