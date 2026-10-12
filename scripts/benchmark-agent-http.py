@@ -8,6 +8,7 @@ import concurrent.futures
 import datetime as dt
 import http.client
 import json
+import itertools
 import math
 import threading
 import time
@@ -99,8 +100,8 @@ def main() -> int:
         parser.error("base URL must be plain HTTP on 127.0.0.1, localhost, or ::1")
     if not (1 <= args.hosts <= 100):
         parser.error("hosts must be between 1 and 100")
-    if not (1 <= args.batches_per_host <= 1000):
-        parser.error("batches-per-host must be between 1 and 1000")
+    if not (1 <= args.batches_per_host <= 2880):
+        parser.error("batches-per-host must be between 1 and 2880")
     if not (1 <= args.concurrency <= 64):
         parser.error("concurrency must be between 1 and 64")
 
@@ -150,13 +151,12 @@ def main() -> int:
                        "credential": registration["credential"], "bootId": str(uuid.uuid4())})
 
     anchor = dt.datetime.now(dt.timezone.utc)
-    tasks = [(agent_index, sequence) for agent_index in range(args.hosts)
-             for sequence in range(1, args.batches_per_host + 1)]
+    total_batches = args.hosts * args.batches_per_host
     latencies: list[float] = []
     failures: list[str] = []
     accepted_samples = 0
     started = time.perf_counter()
-    print(f"registered_agents={len(agents)} starting_http_batches={len(tasks)}", flush=True)
+    print(f"registered_agents={len(agents)} starting_http_batches={total_batches}", flush=True)
 
     def upload(task: tuple[int, int]) -> tuple[float, int, str | None]:
         agent_index, sequence = task
@@ -191,19 +191,29 @@ def main() -> int:
                 THREAD_STATE.connection = None
             return time.perf_counter() - request_started, 0, type(exception).__name__
 
+    task_iterator = iter(itertools.product(range(args.hosts), range(1, args.batches_per_host + 1)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = [executor.submit(upload, task) for task in tasks]
+        max_pending = args.concurrency * 4
+        pending: set[concurrent.futures.Future[tuple[float, int, str | None]]] = set()
+        for _ in range(min(max_pending, total_batches)):
+            pending.add(executor.submit(upload, next(task_iterator)))
         completed = 0
-        for future in concurrent.futures.as_completed(futures):
-            elapsed, accepted, error = future.result()
-            latencies.append(elapsed)
-            accepted_samples += accepted
-            completed += 1
-            if error:
-                failures.append(error)
-            progress_step = max(1, len(tasks) // 10)
-            if completed % progress_step == 0:
-                print(f"completed_http_batches={completed}/{len(tasks)}", flush=True)
+        progress_step = max(1, total_batches // 10)
+        next_progress = progress_step
+        while pending:
+            finished, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in finished:
+                elapsed, accepted, error = future.result()
+                latencies.append(elapsed)
+                accepted_samples += accepted
+                completed += 1
+                if error:
+                    failures.append(error)
+            while len(pending) < max_pending and completed + len(pending) < total_batches:
+                pending.add(executor.submit(upload, next(task_iterator)))
+            if completed >= next_progress or completed == total_batches:
+                print(f"completed_http_batches={completed}/{total_batches}", flush=True)
+                next_progress += progress_step
     duration = time.perf_counter() - started
 
     curve_start = anchor - dt.timedelta(seconds=args.batches_per_host * 30)
@@ -220,8 +230,8 @@ def main() -> int:
         failures.append(f"metric curve query failed validation (HTTP {curve_status})")
 
     print(f"hosts={args.hosts} batches_per_host={args.batches_per_host} concurrency={args.concurrency}")
-    print(f"requests={len(tasks)} accepted_samples={accepted_samples} failures={len(failures)}")
-    print(f"duration_seconds={duration:.3f} requests_per_second={len(tasks) / duration:.2f} samples_per_second={accepted_samples / duration:.2f}")
+    print(f"requests={total_batches} accepted_samples={accepted_samples} failures={len(failures)}")
+    print(f"duration_seconds={duration:.3f} requests_per_second={total_batches / duration:.2f} samples_per_second={accepted_samples / duration:.2f}")
     sorted_latencies = sorted(latencies)
     print(f"request_latency_ms_p50={percentile(sorted_latencies, 0.50) * 1000:.2f} "
           f"p95={percentile(sorted_latencies, 0.95) * 1000:.2f} "
