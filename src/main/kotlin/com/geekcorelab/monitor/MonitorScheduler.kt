@@ -288,24 +288,19 @@ class MonitorScheduler {
                 processTlsCertificateAlert(connection, task, result)
                 val previousFailures = if (maintenanceBoundaryCrossed) 0 else monitor.consecutiveFailures
                 val previousSuccesses = if (maintenanceBoundaryCrossed) 0 else monitor.consecutiveSuccesses
-                val success = result.status == "UP"
                 val failure = result.status == "DOWN"
                 val degraded = result.status == "DEGRADED"
-                val failureEvidence = failure || degraded
-                val failures = when {
-                    success || !failureEvidence -> 0
-                    else -> previousFailures + 1
-                }
-                val successes = if (success) previousSuccesses + 1 else 0
-                val nextState = when {
-                    result.status == "UNKNOWN" && monitor.currentState in setOf("DOWN", "DEGRADED") -> monitor.currentState
-                    result.status == "UNKNOWN" -> "UNKNOWN"
-                    success && monitor.currentState in setOf("DOWN", "DEGRADED") && successes >= monitor.recoveryThreshold -> "UP"
-                    success && monitor.currentState in setOf("PENDING", "UNKNOWN") -> "UP"
-                    failure && monitor.currentState != "DOWN" && failures >= monitor.failureThreshold -> "DOWN"
-                    degraded && monitor.currentState !in setOf("DOWN", "DEGRADED") && failures >= monitor.failureThreshold -> "DEGRADED"
-                    else -> monitor.currentState
-                }
+                val transition = transitionMonitorState(
+                    currentState = monitor.currentState,
+                    consecutiveFailures = previousFailures,
+                    consecutiveSuccesses = previousSuccesses,
+                    resultStatus = result.status,
+                    failureThreshold = monitor.failureThreshold,
+                    recoveryThreshold = monitor.recoveryThreshold,
+                )
+                val failures = transition.consecutiveFailures
+                val successes = transition.consecutiveSuccesses
+                val nextState = transition.state
                 connection.prepareStatement(
                     "UPDATE monitor SET current_state = ?, consecutive_failures = ?, consecutive_successes = ?, last_result_at = ?, updated_at = now() WHERE id = ?",
                 ).use { statement ->
