@@ -7,7 +7,6 @@ on:
   push:
     branches:
       - master
-      - feat/agent-install-command
   workflow_dispatch:
 
 permissions:
