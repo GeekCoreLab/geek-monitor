@@ -231,7 +231,7 @@ def main() -> int:
     started = time.monotonic()
     deadline = started + args.duration_seconds
     runner_seen = False
-    runner_started_monotonic: float | None = None
+    runner_max_elapsed_seconds = 0.0
     previous_agent_cpu_ticks: dict[int, int] | None = None
     previous_agent_cpu_sample_monotonic: float | None = None
     clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
@@ -243,18 +243,20 @@ def main() -> int:
                 runner_count = int(record["runner_processes"])
                 if runner_count:
                     runner_seen = True
-                    if runner_started_monotonic is None:
-                        runner_started_monotonic = time.monotonic() - float(record["runner_elapsed_seconds"])
+                    runner_max_elapsed_seconds = max(
+                        runner_max_elapsed_seconds,
+                        float(record["runner_elapsed_seconds"]),
+                    )
+                    record["runner_max_observed_elapsed_seconds"] = round(runner_max_elapsed_seconds, 1)
                 elif not args.once and not runner_seen:
                     record["problems"].append("Agent soak runner process was not detected")
                 elif runner_seen and not args.once:
-                    runner_runtime = time.monotonic() - float(runner_started_monotonic)
                     record = snapshot(args, elapsed, detailed=True)
-                    record["runner_runtime_seconds"] = round(runner_runtime, 1)
-                    if runner_runtime < args.duration_seconds:
+                    record["runner_max_observed_elapsed_seconds"] = round(runner_max_elapsed_seconds, 1)
+                    if runner_max_elapsed_seconds < args.duration_seconds:
                         record["problems"].append(
-                            f"Agent soak runner exited after {runner_runtime:.1f}s; "
-                            f"expected at least {args.duration_seconds}s"
+                            f"Agent soak runner was last observed at {runner_max_elapsed_seconds:.1f}s; "
+                            f"monitor did not observe the required {args.duration_seconds}s duration"
                         )
             except Exception as exception:
                 record = {
@@ -299,6 +301,8 @@ def main() -> int:
                     f"max Agent RSS={record['agent_rss_mib_per_agent_max']} MiB reaches/exceeds "
                     f"{args.maximum_agent_rss_mib} MiB"
                 )
+            if not args.once and time.monotonic() >= deadline and record.get("runner_processes"):
+                record["problems"].append("monitor duration elapsed while Agent soak runner remained active")
             log.write(json.dumps(record, separators=(",", ":")) + "\n")
             log.flush()
             os.fsync(log.fileno())
@@ -323,6 +327,15 @@ def main() -> int:
             print(f"OK {summary}", flush=True)
             if args.once or (runner_seen and not record.get("runner_processes")) or time.monotonic() >= deadline:
                 return 0
-            time.sleep(min(args.interval_seconds, max(0, deadline - time.monotonic())))
+            sleep_seconds = args.interval_seconds
+            runner_elapsed = record.get("runner_elapsed_seconds")
+            final_observation_window = max(args.interval_seconds * 2, 600)
+            if (
+                record.get("runner_processes")
+                and isinstance(runner_elapsed, (int, float))
+                and runner_elapsed >= max(0, args.duration_seconds - final_observation_window)
+            ):
+                sleep_seconds = 1
+            time.sleep(min(sleep_seconds, max(0, deadline - time.monotonic())))
 if __name__ == "__main__":
     raise SystemExit(main())
