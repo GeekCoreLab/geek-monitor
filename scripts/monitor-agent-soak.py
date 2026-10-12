@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -80,14 +81,14 @@ def process_elapsed_seconds(pid: int) -> float:
     return max(0.0, uptime_seconds - start_ticks / clock_ticks_per_second)
 
 
-def agent_rss() -> tuple[int, int]:
-    count = 0
-    total_kib = 0
+def agent_process_metrics() -> tuple[dict[int, dict[str, int]], float]:
+    processes: dict[int, dict[str, int]] = {}
     for command_line in Path("/proc").glob("[0-9]*/cmdline"):
         try:
             contents = command_line.read_bytes()
             status_path = command_line.parent / "status"
             status = status_path.read_text()
+            stat = (command_line.parent / "stat").read_text()
         except OSError:
             continue
         if AGENT_COMMAND not in contents:
@@ -95,9 +96,16 @@ def agent_rss() -> tuple[int, int]:
         rss_line = next((line for line in status.splitlines() if line.startswith("VmRSS:")), None)
         if rss_line is None:
             continue
-        count += 1
-        total_kib += int(rss_line.split()[1])
-    return count, total_kib
+        try:
+            fields_after_comm = stat[stat.rfind(")") + 1 :].split()
+            cpu_ticks = int(fields_after_comm[11]) + int(fields_after_comm[12])
+            processes[int(command_line.parent.name)] = {
+                "rss_kib": int(rss_line.split()[1]),
+                "cpu_ticks": cpu_ticks,
+            }
+        except (IndexError, ValueError):
+            continue
+    return processes, time.monotonic()
 
 
 def health(base_url: str) -> dict[str, object]:
@@ -144,7 +152,10 @@ def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -
     db_state = run(["podman", "inspect", "--format", "{{.State.Status}}", args.db_container])
     if app_state != "running" or db_state != "running":
         raise RuntimeError(f"container state is app={app_state}, db={db_state}")
-    process_count, rss_kib = agent_rss()
+    agent_processes, agent_cpu_sample_monotonic = agent_process_metrics()
+    process_count = len(agent_processes)
+    rss_kib = sum(process["rss_kib"] for process in agent_processes.values())
+    rss_mib_per_agent = [process["rss_kib"] / 1024 for process in agent_processes.values()]
     runner_pids = matching_processes((RUNNER_COMMAND, RUNNER_ARGUMENTS))
     runner_count = len(runner_pids)
     if runner_count > 1:
@@ -162,6 +173,11 @@ def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -
         "runner_elapsed_seconds": round(runner_elapsed, 1) if runner_elapsed is not None else None,
         "agent_processes": process_count,
         "agent_rss_mib": round(rss_kib / 1024, 2),
+        "agent_rss_mib_per_agent_average": round(sum(rss_mib_per_agent) / process_count, 2) if process_count else 0,
+        "agent_rss_mib_per_agent_p95": round(sorted(rss_mib_per_agent)[math.ceil(len(rss_mib_per_agent) * 0.95) - 1], 2) if process_count else 0,
+        "agent_rss_mib_per_agent_max": round(max(rss_mib_per_agent), 2) if process_count else 0,
+        "_agent_cpu_ticks_by_pid": {pid: process["cpu_ticks"] for pid, process in agent_processes.items()},
+        "_agent_cpu_sample_monotonic": agent_cpu_sample_monotonic,
         "app_health": app_health["status"],
         "containers": stats,
         "database": database,
@@ -194,6 +210,8 @@ def main() -> int:
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--duration-seconds", type=int, default=604800)
     parser.add_argument("--minimum-free-gib", type=float, default=20)
+    parser.add_argument("--maximum-agent-rss-mib", type=float, default=50)
+    parser.add_argument("--maximum-agent-average-cpu-percent", type=float, default=1)
     parser.add_argument("--log-file", type=Path, default=Path("/tmp/geek-monitor-agent-soak-metrics.jsonl"))
     parser.add_argument("--once", action="store_true", help="record and verify one checkpoint")
     args = parser.parse_args()
@@ -201,6 +219,8 @@ def main() -> int:
         parser.error("agents must be positive, interval at least 10 seconds, and duration non-negative")
     if args.minimum_free_gib < 0:
         parser.error("minimum-free-gib must be non-negative")
+    if args.maximum_agent_rss_mib <= 0 or args.maximum_agent_average_cpu_percent <= 0:
+        parser.error("Agent RSS and average CPU limits must be positive")
     base = urllib.parse.urlsplit(args.base_url)
     if base.scheme != "http" or base.hostname not in {"127.0.0.1", "localhost", "::1"} or base.port != 18084:
         parser.error("base-url must use HTTP on loopback port 18084")
@@ -212,6 +232,9 @@ def main() -> int:
     deadline = started + args.duration_seconds
     runner_seen = False
     runner_started_monotonic: float | None = None
+    previous_agent_cpu_ticks: dict[int, int] | None = None
+    previous_agent_cpu_sample_monotonic: float | None = None
+    clock_ticks_per_second = os.sysconf("SC_CLK_TCK")
     with os.fdopen(descriptor, "a", encoding="utf-8") as log:
         while True:
             elapsed = time.monotonic() - started
@@ -239,6 +262,43 @@ def main() -> int:
                     "elapsed_seconds": round(elapsed, 1),
                     "problems": [f"snapshot failed: {type(exception).__name__}: {exception}"],
                 }
+            current_agent_cpu_ticks = record.pop("_agent_cpu_ticks_by_pid", None)
+            current_agent_cpu_sample_monotonic = record.pop("_agent_cpu_sample_monotonic", None)
+            if current_agent_cpu_ticks is not None and current_agent_cpu_sample_monotonic is not None:
+                current_agent_cpu_ticks = {int(pid): int(ticks) for pid, ticks in current_agent_cpu_ticks.items()}
+                if previous_agent_cpu_ticks is not None and previous_agent_cpu_sample_monotonic is not None:
+                    sample_seconds = current_agent_cpu_sample_monotonic - previous_agent_cpu_sample_monotonic
+                    cpu_percentages = [
+                        (current_agent_cpu_ticks[pid] - previous_agent_cpu_ticks[pid])
+                        / clock_ticks_per_second / sample_seconds * 100
+                        for pid in current_agent_cpu_ticks.keys() & previous_agent_cpu_ticks.keys()
+                        if sample_seconds > 0 and current_agent_cpu_ticks[pid] >= previous_agent_cpu_ticks[pid]
+                    ]
+                    if cpu_percentages:
+                        sorted_cpu_percentages = sorted(cpu_percentages)
+                        average_cpu = sum(cpu_percentages) / len(cpu_percentages)
+                        p95_cpu = sorted_cpu_percentages[math.ceil(len(sorted_cpu_percentages) * 0.95) - 1]
+                        record["agent_cpu_sample_seconds"] = round(sample_seconds, 1)
+                        record["agent_cpu_measured_processes"] = len(cpu_percentages)
+                        record["agent_cpu_percent_per_core_average"] = round(average_cpu, 4)
+                        record["agent_cpu_percent_per_core_p95"] = round(p95_cpu, 4)
+                        record["agent_cpu_percent_per_core_max"] = round(max(cpu_percentages), 4)
+                        if record.get("runner_processes") and len(cpu_percentages) != args.expected_agents:
+                            record["problems"].append(
+                                f"CPU measured Agents={len(cpu_percentages)}/{args.expected_agents}"
+                            )
+                        if record.get("runner_processes") and average_cpu >= args.maximum_agent_average_cpu_percent:
+                            record["problems"].append(
+                                f"average Agent CPU={average_cpu:.4f}% per core reaches/exceeds "
+                                f"{args.maximum_agent_average_cpu_percent}%"
+                            )
+                previous_agent_cpu_ticks = current_agent_cpu_ticks
+                previous_agent_cpu_sample_monotonic = current_agent_cpu_sample_monotonic
+            if record.get("runner_processes") and record.get("agent_rss_mib_per_agent_max", 0) >= args.maximum_agent_rss_mib:
+                record["problems"].append(
+                    f"max Agent RSS={record['agent_rss_mib_per_agent_max']} MiB reaches/exceeds "
+                    f"{args.maximum_agent_rss_mib} MiB"
+                )
             log.write(json.dumps(record, separators=(",", ":")) + "\n")
             log.flush()
             os.fsync(log.fileno())
@@ -246,11 +306,16 @@ def main() -> int:
             batch_count = database.get("batches", database.get("batch_rows_estimate", "?"))
             sample_count = database.get("stored_trusted_samples", database.get("raw_sample_rows_estimate", "?"))
             sample_label = "stored_trusted_samples" if database.get("detailed") else "raw_sample_rows_estimate"
+            cpu_average = record.get("agent_cpu_percent_per_core_average")
+            cpu_summary = f"cpu_avg={cpu_average:.4f}%/core" if isinstance(cpu_average, (int, float)) else "cpu_avg=warming-up"
             summary = (
                 f"elapsed={int(elapsed)}s agents={record.get('agent_processes', 0)}/"
                 f"{database.get('online_agents', 0)}/{args.expected_agents} "
                 f"batches={batch_count} {sample_label}={sample_count} free_gib="
-                f"{record.get('host_disk_bytes', {}).get('free', 0) / 1024**3:.1f}"
+                f"{record.get('host_disk_bytes', {}).get('free', 0) / 1024**3:.1f} "
+                f"rss_avg={record.get('agent_rss_mib_per_agent_average', 0):.2f}/"
+                f"{record.get('agent_rss_mib_per_agent_p95', 0):.2f}/"
+                f"{record.get('agent_rss_mib_per_agent_max', 0):.2f}MiB {cpu_summary}"
             )
             if record["problems"]:
                 print(f"FAIL {summary} problems={record['problems']}", flush=True)
