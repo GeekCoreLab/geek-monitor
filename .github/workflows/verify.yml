@@ -1,0 +1,68 @@
+name: Verify
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+      - feat/agent-install-command
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  platform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.9'
+          cache: true
+
+      - name: Resolve Flutter dependencies
+        working-directory: admin-flutter
+        run: flutter pub get
+
+      - name: Analyze and test Flutter admin
+        working-directory: admin-flutter
+        run: |
+          flutter analyze
+          flutter test
+
+      - name: Run backend tests and build Flutter Web
+        run: ./gradlew test --no-daemon --console=plain
+
+      - name: Test persistent soak observer
+        run: python3 scripts/test_monitor_agent_soak.py
+
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+
+      - name: Run Agent tests with race detector
+        working-directory: agent
+        run: go test -race -count=1 ./...
