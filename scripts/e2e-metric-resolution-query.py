@@ -181,6 +181,7 @@ def main() -> int:
         "QUARKUS_HTTP_HOST": "127.0.0.1",
         "QUARKUS_HTTP_PORT": str(args.app_port),
         "QUARKUS_MAILER_MOCK": "true",
+        "GEEK_MONITOR_PARTITION_INTERVAL": "1s",
     })
     app_process: subprocess.Popen | None = None
     with tempfile.TemporaryDirectory(prefix="geek-monitor-metric-resolution-") as directory:
@@ -244,7 +245,66 @@ def main() -> int:
                 "-v", f"resource_id={resource_id}", "-f", "-",
             ], database_env, input_text=seed_sql)
 
+            partitioned_tables = int(psql([
+                "-c",
+                """SELECT count(*) FROM pg_partitioned_table
+                   WHERE partrelid IN ('check_execution'::regclass, 'metric_sample'::regclass,
+                       'database_metric_sample'::regclass, 'metric_rollup'::regclass,
+                       'availability_rollup'::regclass)""",
+            ], database_env))
+            if partitioned_tables != 5:
+                raise RuntimeError(f"expected all five telemetry parents to be partitioned, found {partitioned_tables}")
+            current_partition = psql([
+                "-c",
+                """SELECT count(*) FROM pg_inherits
+                   WHERE inhparent = 'metric_sample'::regclass
+                     AND inhrelid = to_regclass('public.metric_sample_' || to_char(now() AT TIME ZONE 'UTC', 'YYYYMM'))""",
+            ], database_env)
+            if current_partition != "1":
+                raise RuntimeError("application startup did not ensure the current metric partition")
             now = dt.datetime.now(dt.timezone.utc)
+            future_month_index = now.year * 12 + now.month - 1 + 2
+            future_month = (future_month_index // 12, future_month_index % 12 + 1)
+            future_partition = f"metric_sample_{future_month[0]:04d}{future_month[1]:02d}"
+            future_attached = psql([
+                "-c",
+                f"SELECT count(*) FROM pg_inherits WHERE inhparent = 'metric_sample'::regclass "
+                f"AND inhrelid = to_regclass('public.{future_partition}')",
+            ], database_env)
+            if future_attached != "1":
+                raise RuntimeError(f"expected future partition {future_partition} to be attached")
+            psql(["-c", f"DROP TABLE public.\"{future_partition}\""], database_env)
+            wait_until(
+                "future metric partition creation",
+                15,
+                lambda: psql([
+                    "-c",
+                    f"SELECT count(*) FROM pg_inherits WHERE inhparent = 'metric_sample'::regclass "
+                    f"AND inhrelid = to_regclass('public.{future_partition}')",
+                ], database_env) == "1",
+            )
+            metric_partitions = psql([
+                "-c",
+                f"""SELECT string_agg(DISTINCT tableoid::regclass::text, ',' ORDER BY tableoid::regclass::text)
+                   FROM metric_rollup WHERE resource_id = '{resource_id}'::uuid""",
+            ], database_env)
+            if "_default" in metric_partitions or not metric_partitions:
+                raise RuntimeError(f"seeded rollups did not route to month partitions: {metric_partitions!r}")
+            psql([
+                "-c",
+                "CREATE TABLE metric_sample_202001 PARTITION OF metric_sample "
+                "FOR VALUES FROM (TIMESTAMPTZ '2020-01-01 00:00:00+00') TO (TIMESTAMPTZ '2020-02-01 00:00:00+00')",
+            ], database_env)
+            wait_until(
+                "empty expired partition cleanup",
+                15,
+                lambda: psql([
+                    "-c",
+                    "SELECT count(*) FROM pg_inherits WHERE inhparent = 'metric_sample'::regclass "
+                    "AND inhrelid = to_regclass('public.metric_sample_202001')",
+                ], database_env) == "0",
+            )
+
             to = now + dt.timedelta(seconds=60)
             full = query_metrics(api, resource_id, now - dt.timedelta(days=41), to, 60)
             if full.get("stepSeconds") != 3600 or full.get("pointCount") != 3:
@@ -274,6 +334,10 @@ def main() -> int:
                     "2_days": {"stepSeconds": raw["stepSeconds"], "averages": [8]},
                 },
                 "raw_five_minute_hourly_sources_merged": True,
+                "time_partitioned_tables": partitioned_tables,
+                "rollup_month_partitions": metric_partitions,
+                "future_partition_recreated": True,
+                "empty_expired_partitions_removed": True,
                 "external_services_contacted": False,
             }, separators=(",", ":")))
             return 0

@@ -28,6 +28,7 @@ class MonitorScheduler {
     @Inject lateinit var objectMapper: ObjectMapper
     @Inject lateinit var checker: ProtocolCheckService
     @Inject lateinit var notificationOutbox: NotificationOutbox
+    @Inject lateinit var timePartitionMaintenance: TimePartitionMaintenance
 
     private val instanceId = UUID.randomUUID()
     private val threadNumber = AtomicInteger()
@@ -109,6 +110,7 @@ class MonitorScheduler {
     }
 
     fun recoverAfterStartup(@Observes event: StartupEvent) {
+        timePartitionMaintenance.ensurePartitions()
         recoverInterruptedExecutions()
     }
 
@@ -178,7 +180,7 @@ class MonitorScheduler {
 
     private fun execute(task: CheckTask) {
         val result = try {
-            markExecutionStarted(task.executionId)
+            markExecutionStarted(task)
             val config = objectMapper.readTree(task.config)
             if (task.type == "HEARTBEAT" && config is ObjectNode) {
                 config.put("monitorId", task.id.toString())
@@ -195,10 +197,11 @@ class MonitorScheduler {
         persistResult(task, result)
     }
 
-    private fun markExecutionStarted(executionId: UUID) {
+    private fun markExecutionStarted(task: CheckTask) {
         dataSource.connection.use { connection ->
-            connection.prepareStatement("UPDATE check_execution SET started_at = now() WHERE id = ? AND result_status = 'RUNNING'").use { statement ->
-                statement.setObject(1, executionId)
+            connection.prepareStatement("UPDATE check_execution SET started_at = now() WHERE id = ? AND scheduled_at = ? AND result_status = 'RUNNING'").use { statement ->
+                statement.setObject(1, task.executionId)
+                statement.setTimestamp(2, java.sql.Timestamp.from(task.scheduledAt))
                 statement.executeUpdate()
             }
         }
@@ -212,7 +215,7 @@ class MonitorScheduler {
                     statement.executeQuery().use { rows -> rows.next(); rows.getTimestamp(1).toInstant() }
                 }
                 val updatedExecution = connection.prepareStatement(
-                    "UPDATE check_execution SET finished_at = ?, result_status = ?, error_code = ?, error_summary = ?, duration_ms = ?, http_status = ? WHERE id = ? AND result_status = 'RUNNING'",
+                    "UPDATE check_execution SET finished_at = ?, result_status = ?, error_code = ?, error_summary = ?, duration_ms = ?, http_status = ? WHERE id = ? AND scheduled_at = ? AND result_status = 'RUNNING'",
                 ).use { statement ->
                     statement.setObject(1, java.sql.Timestamp.from(processedAt))
                     statement.setString(2, result.status)
@@ -221,6 +224,7 @@ class MonitorScheduler {
                     statement.setLong(5, result.durationMs)
                     if (result.statusCode == null) statement.setNull(6, java.sql.Types.INTEGER) else statement.setInt(6, result.statusCode)
                     statement.setObject(7, task.executionId)
+                    statement.setTimestamp(8, java.sql.Timestamp.from(task.scheduledAt))
                     statement.executeUpdate() == 1
                 }
                 if (!updatedExecution) {

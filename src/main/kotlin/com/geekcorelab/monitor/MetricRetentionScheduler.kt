@@ -151,10 +151,11 @@ class MetricRetentionScheduler {
     private fun deleteExpiredRollups(connection: Connection, now: Instant) {
         connection.prepareStatement(
             """WITH expired AS (
-                   SELECT id FROM metric_rollup
+                   SELECT id, bucket_at FROM metric_rollup
                    WHERE resolution_seconds = 3600 AND bucket_at < ?
                    ORDER BY bucket_at LIMIT ?
-               ) DELETE FROM metric_rollup rollup USING expired WHERE rollup.id = expired.id""",
+               ) DELETE FROM metric_rollup rollup USING expired
+                 WHERE rollup.id = expired.id AND rollup.bucket_at = expired.bucket_at""",
         ).use { statement ->
             statement.setTimestamp(1, Timestamp.from(now.minusSeconds(HOURLY_ROLLUP_RETENTION_SECONDS)))
             statement.setInt(2, DELETE_BATCH_SIZE)
@@ -165,9 +166,10 @@ class MetricRetentionScheduler {
     private fun deleteExpiredCheckExecutions(connection: Connection, now: Instant) {
         connection.prepareStatement(
             """WITH expired AS (
-                   SELECT id FROM check_execution WHERE scheduled_at < ?
+                   SELECT id, scheduled_at FROM check_execution WHERE scheduled_at < ?
                    ORDER BY scheduled_at LIMIT ?
-               ) DELETE FROM check_execution execution USING expired WHERE execution.id = expired.id""",
+               ) DELETE FROM check_execution execution USING expired
+                 WHERE execution.id = expired.id AND execution.scheduled_at = expired.scheduled_at""",
         ).use { statement ->
             statement.setTimestamp(1, Timestamp.from(now.minusSeconds(CHECK_EXECUTION_RETENTION_SECONDS)))
             statement.setInt(2, DELETE_BATCH_SIZE)
