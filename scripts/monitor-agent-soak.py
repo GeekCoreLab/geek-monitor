@@ -90,6 +90,12 @@ def suspend_gap_seconds(
     return max(0.0, (current_boottime - previous_boottime) - (current_monotonic - previous_monotonic))
 
 
+def missing_runner_problem(runner_count: int, runner_seen: bool, once: bool) -> str | None:
+    if runner_count > 0 or (runner_seen and not once):
+        return None
+    return "Agent soak runner process was not detected"
+
+
 def agent_process_metrics() -> tuple[dict[int, dict[str, int]], float]:
     processes: dict[int, dict[str, int]] = {}
     for command_line in Path("/proc").glob("[0-9]*/cmdline"):
@@ -271,9 +277,11 @@ def main() -> int:
                         float(record["runner_elapsed_seconds"]),
                     )
                     record["runner_max_observed_elapsed_seconds"] = round(runner_max_elapsed_seconds, 1)
-                elif not args.once and not runner_seen:
-                    record["problems"].append("Agent soak runner process was not detected")
-                elif runner_seen and not args.once:
+                else:
+                    runner_problem = missing_runner_problem(runner_count, runner_seen, args.once)
+                    if runner_problem:
+                        record["problems"].append(runner_problem)
+                if runner_seen and not runner_count and not args.once:
                     record = snapshot(args, elapsed, detailed=True)
                     record["runner_max_observed_elapsed_seconds"] = round(runner_max_elapsed_seconds, 1)
                     if runner_max_elapsed_seconds < args.duration_seconds:
