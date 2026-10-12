@@ -20,13 +20,17 @@ Linux Agent samples these metrics from `/proc`, `statfs`, and local filesystem i
 
 ## Database metrics
 
-PostgreSQL, MySQL, and Redis checks sample connection statistics every 60 seconds when the optional read-only query succeeds.
+PostgreSQL, MySQL, and Redis checks sample metrics every 60 seconds when the optional read-only query succeeds. Redis also reports memory and eviction metrics from `INFO memory` and `INFO stats`.
 
 | Metric key | Meaning | Unit and notes |
 | --- | --- | --- |
 | `database_connections` | Current connections | Count. |
 | `database_connection_limit` | Configured connection limit | Count. |
 | `database_connections_percent` | Current connections divided by limit | Percent. |
+| `redis_memory_used_bytes` | Redis memory currently allocated | Bytes. |
+| `redis_memory_limit_bytes` | Configured Redis `maxmemory` limit | Bytes; omitted when Redis has no configured limit. |
+| `redis_memory_used_percent` | Redis memory use divided by `maxmemory` | Percent; omitted when no limit is configured. |
+| `redis_evicted_keys_total` | Keys evicted by Redis | Cumulative count from `INFO stats`. |
 
 Missing statistics do not make a successful `SELECT 1` or Redis `PING` fail. Threshold checks for a database metric show `UNKNOWN` until the rule has sufficient samples. See [database monitoring account permissions](database-monitoring-permissions.md) for the optional queries and least-privilege grants.
 

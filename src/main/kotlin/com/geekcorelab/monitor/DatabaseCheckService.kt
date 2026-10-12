@@ -185,7 +185,7 @@ class DatabaseCheckService {
                     writeRedisCommand(output, listOf("PING"))
                     updateReadTimeout(connected, deadline)
                     if (readRedisReply(input) != "PONG") throw RedisCheckException("Redis PING returned an unexpected response")
-                    val metrics = readRedisConnectionMetrics(input, output, connected, deadline)
+                    val metrics = readRedisMetrics(input, output, connected, deadline)
                     val utilization = metrics["database_connections_percent"]
                         ?.let { "; Redis 连接使用率 %.1f%%".format(java.util.Locale.ROOT, it) }
                         .orEmpty()
@@ -268,28 +268,57 @@ class DatabaseCheckService {
         return connectionMetrics(connected, maximum)
     }
 
-    private fun readRedisConnectionMetrics(
+    private fun readRedisMetrics(
         input: DataInputStream,
         output: BufferedOutputStream,
         socket: Socket,
         deadline: Long,
     ): Map<String, Double> {
-        val info = runCatching {
-            writeRedisCommand(output, listOf("INFO", "clients"))
+        fun readInfo(section: String): String? = runCatching {
+            writeRedisCommand(output, listOf("INFO", section))
             updateReadTimeout(socket, deadline)
             readRedisReply(input)
         }.getOrNull()
-        val connected = info?.lineSequence()
-            ?.map(String::trim)
-            ?.firstOrNull { it.startsWith("connected_clients:") }
-            ?.substringAfter(':')
-            ?.toDoubleOrNull()
+
+        val clientsInfo = readInfo("clients")
+        val memoryInfo = readInfo("memory")
+        val statsInfo = readInfo("stats")
         val maximum = runCatching {
             writeRedisCommand(output, listOf("CONFIG", "GET", "maxclients"))
             updateReadTimeout(socket, deadline)
             readRedisReply(input).split(',', limit = 2).getOrNull(1)?.toDoubleOrNull()
         }.getOrNull()
-        return connectionMetrics(connected, maximum)
+        return parseRedisMetrics(clientsInfo, memoryInfo, statsInfo, maximum)
+    }
+
+    internal fun parseRedisMetrics(
+        clientsInfo: String?,
+        memoryInfo: String?,
+        statsInfo: String?,
+        maximumClients: Double?,
+    ): Map<String, Double> {
+        fun value(info: String?, name: String): Double? = info
+            ?.lineSequence()
+            ?.map(String::trim)
+            ?.firstOrNull { it.substringBefore(':') == name }
+            ?.substringAfter(':')
+            ?.toDoubleOrNull()
+            ?.takeIf { it.isFinite() && it >= 0 }
+
+        val connected = value(clientsInfo, "connected_clients")
+        val usedMemory = value(memoryInfo, "used_memory")
+        val memoryLimit = value(memoryInfo, "maxmemory")?.takeIf { it > 0 }
+        val evictedKeys = value(statsInfo, "evicted_keys")
+
+        return buildMap {
+            putAll(connectionMetrics(connected, maximumClients))
+            usedMemory?.let { put("redis_memory_used_bytes", it) }
+            memoryLimit?.let { put("redis_memory_limit_bytes", it) }
+            if (usedMemory != null && memoryLimit != null) {
+                put("redis_memory_used_percent", usedMemory / memoryLimit * 100.0)
+            }
+            evictedKeys?.let { put("redis_evicted_keys_total", it) }
+        }
     }
 
     private fun connectionMetrics(connected: Double?, maximum: Double?): Map<String, Double> = buildMap {

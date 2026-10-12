@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Verify a PostgreSQL monitor detects an actual outage and recovers.
+"""Verify PostgreSQL outage recovery and Redis metric collection.
 
 The script creates a private Podman network with disposable service and target
-PostgreSQL containers, a query-timeout fixture, and an application container.
-It tests a real JDBC query cancellation, then scheduler-driven UP -> DOWN
-(TIMEOUT or CONNECTION_FAILED) -> UP and incident resolution through the API.
-All containers use temporary data directories and are removed on exit.
+PostgreSQL container, Redis, a query-timeout fixture, and an application
+container. It tests PostgreSQL JDBC query cancellation and outage recovery,
+plus Redis memory/client/eviction metrics and restricted ACL behavior. All
+containers use temporary data directories and are removed on exit.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ APP_PORT = 18093
 ADMIN_EMAIL = "admin@biliwind.com"
 ADMIN_PASSWORD = "admin@biliwind.com"
 POSTGRES_IMAGE = "docker.io/library/postgres:17-alpine"
+REDIS_IMAGE = "docker.io/library/redis:7-alpine"
 PYTHON_IMAGE = "docker.io/library/python:3.13-alpine"
 EXPECTED_FLYWAY_VERSION = "27"
 
@@ -39,6 +40,17 @@ def podman(*args: str, check: bool = True, timeout: int = 120) -> subprocess.Com
     )
     if check and result.returncode:
         raise RuntimeError(f"podman {' '.join(args[:3])} failed: {result.stderr[-500:]}")
+    return result
+
+
+def podman_with_input(container: str, *args: str, input_data: bytes, timeout: int = 120) -> subprocess.CompletedProcess[bytes]:
+    result = subprocess.run(
+        ["podman", "exec", "-i", container, *args], input=input_data,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=timeout,
+    )
+    if result.returncode:
+        details = result.stderr.decode("utf-8", errors="replace")[-500:]
+        raise RuntimeError(f"podman exec {container} {' '.join(args[:2])} failed: {details}")
     return result
 
 
@@ -97,6 +109,29 @@ def wait_for_database(container: str, username: str, database: str, timeout_seco
             return
         time.sleep(1)
     raise TimeoutError(f"disposable PostgreSQL container {container} did not become ready")
+
+
+def wait_for_redis(container: str, timeout_seconds: int = 60) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        result = podman("exec", container, "redis-cli", "PING", check=False, timeout=5)
+        if result.returncode == 0 and result.stdout.strip() == "PONG":
+            return
+        time.sleep(1)
+    raise TimeoutError(f"disposable Redis container {container} did not become ready")
+
+
+def redis_set_pipeline(count: int, value_size: int) -> bytes:
+    value = b"x" * value_size
+    payload = bytearray()
+    for index in range(count):
+        arguments = (b"SET", f"geek-monitor-e2e:{index}".encode(), value)
+        payload.extend(f"*{len(arguments)}\r\n".encode())
+        for argument in arguments:
+            payload.extend(f"${len(argument)}\r\n".encode())
+            payload.extend(argument)
+            payload.extend(b"\r\n")
+    return bytes(payload)
 
 
 def wait_for_container_log(container: str, marker: str, timeout_seconds: int = 30) -> None:
@@ -161,6 +196,8 @@ def main() -> int:
         parser.error(f"Geek Monitor image {args.app_image!r} is not available locally")
     if podman("image", "exists", POSTGRES_IMAGE, check=False).returncode != 0:
         podman("pull", POSTGRES_IMAGE, timeout=600)
+    if podman("image", "exists", REDIS_IMAGE, check=False).returncode != 0:
+        podman("pull", REDIS_IMAGE, timeout=600)
     if podman("image", "exists", PYTHON_IMAGE, check=False).returncode != 0:
         podman("pull", PYTHON_IMAGE, timeout=600)
 
@@ -168,6 +205,7 @@ def main() -> int:
     network = f"geek-monitor-db-outage-{suffix}"
     app_db_container = f"geek-monitor-db-outage-appdb-{suffix}"
     target_db_container = f"geek-monitor-db-outage-targetdb-{suffix}"
+    redis_container = f"geek-monitor-db-outage-redis-{suffix}"
     timeout_container = f"geek-monitor-db-outage-timeout-{suffix}"
     app_container = f"geek-monitor-db-outage-app-{suffix}"
     db_password = secrets.token_urlsafe(24)
@@ -175,6 +213,7 @@ def main() -> int:
     rejected_password = secrets.token_urlsafe(24)
     limited_password = secrets.token_urlsafe(24)
     timeout_password = secrets.token_urlsafe(24)
+    redis_limited_password = secrets.token_urlsafe(24)
     encryption_key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     app_started = False
     completed = False
@@ -192,6 +231,7 @@ def main() -> int:
             raise RuntimeError("isolated Podman network has no usable IPv4 subnet")
         target_ip = ipv4_subnet.network_address + 10
         timeout_ip = ipv4_subnet.network_address + 11
+        redis_ip = ipv4_subnet.network_address + 12
         podman(
             "run", "-d", "--name", app_db_container, "--network", network,
             "--network-alias", "db", "--memory", "1g",
@@ -206,6 +246,12 @@ def main() -> int:
             "-e", "POSTGRES_DB=monitored", "-e", "POSTGRES_USER=monitor_user",
             "-e", f"POSTGRES_PASSWORD={target_password}", POSTGRES_IMAGE,
         )
+        podman(
+            "run", "-d", "--name", redis_container, "--network", network,
+            "--network-alias", "monitor-redis", "--ip", str(redis_ip), "--memory", "128m",
+            REDIS_IMAGE, "redis-server", "--save", "", "--appendonly", "no",
+            "--maxmemory", "8mb", "--maxmemory-policy", "allkeys-lru",
+        )
         timeout_fixture = Path(__file__).resolve().parent / "fixtures" / "postgres-query-timeout.py"
         podman(
             "run", "-d", "--name", timeout_container, "--network", network,
@@ -215,6 +261,7 @@ def main() -> int:
         )
         wait_for_database(app_db_container, "geek_monitor", "geek_monitor")
         wait_for_database(target_db_container, "monitor_user", "monitored")
+        wait_for_redis(redis_container)
         wait_for_container_log(timeout_container, "POSTGRES_QUERY_TIMEOUT_SERVER_READY")
 
         target_inspect = json.loads(podman("inspect", target_db_container).stdout)[0]
@@ -226,6 +273,10 @@ def main() -> int:
             raise RuntimeError("target PostgreSQL did not receive an isolated network address") from error
         if parsed_target_ip.version != 4 or parsed_target_ip != target_ip or not target_network.get("Aliases"):
             raise RuntimeError("target PostgreSQL network attachment is incomplete")
+        redis_inspect = json.loads(podman("inspect", redis_container).stdout)[0]
+        inspected_redis_ip = redis_inspect.get("NetworkSettings", {}).get("Networks", {}).get(network, {}).get("IPAddress")
+        if inspected_redis_ip != str(redis_ip):
+            raise RuntimeError("Redis target did not receive its expected isolated network address")
 
         podman(
             "run", "-d", "--name", app_container, "--network", network,
@@ -233,7 +284,7 @@ def main() -> int:
             "-e", "DB_URL=jdbc:postgresql://db:5432/geek_monitor",
             "-e", "DB_USERNAME=geek_monitor", "-e", f"DB_PASSWORD={db_password}",
             "-e", f"GEEK_MONITOR_ENCRYPTION_KEY={encryption_key}",
-            "-e", f"MONITOR_ALLOWED_CIDRS={parsed_target_ip}/32,{timeout_ip}/32",
+            "-e", f"MONITOR_ALLOWED_CIDRS={parsed_target_ip}/32,{timeout_ip}/32,{redis_ip}/32",
             "-e", "SMTP_MOCK=true", args.app_image,
         )
         app_started = True
@@ -294,6 +345,88 @@ def main() -> int:
         initial = wait_for_state(api, monitor_id, "UP", "UP", timeout_seconds=args.timeout)
         print(f"application_schema=V{schema_version} database_monitor_initial={initial[0]['state']} "
               f"result={initial[1]['status']}", flush=True)
+
+        status, redis_monitor = api.request("POST", "/api/v1/monitors", {
+            "resourceId": resource["id"], "name": "Redis 内存与淘汰指标验收",
+            "type": "REDIS", "targetHost": "monitor-redis", "port": 6379,
+            "databaseTls": False, "redisDatabase": 0,
+            "intervalSeconds": 10, "timeoutSeconds": 3,
+            "failureThreshold": 1, "recoveryThreshold": 1,
+            "critical": False, "enabled": False,
+        })
+        if status != 201 or not isinstance(redis_monitor, dict):
+            raise RuntimeError(f"could not create Redis metrics monitor (HTTP {status})")
+        status, redis_result = api.request("POST", f"/api/v1/monitors/{redis_monitor['id']}/test")
+        redis_metrics = redis_result.get("metrics") if isinstance(redis_result, dict) else None
+        required_redis_metrics = {
+            "database_connections", "database_connection_limit", "database_connections_percent",
+            "redis_memory_used_bytes", "redis_memory_limit_bytes", "redis_memory_used_percent",
+            "redis_evicted_keys_total",
+        }
+        if (status != 200 or not isinstance(redis_result, dict) or redis_result.get("status") != "UP" or
+                not isinstance(redis_metrics, dict) or not required_redis_metrics.issubset(redis_metrics) or
+                redis_metrics["redis_memory_used_bytes"] <= 0 or
+                redis_metrics["redis_memory_limit_bytes"] != 8 * 1024 * 1024 or
+                redis_metrics["redis_evicted_keys_total"] < 0):
+            raise RuntimeError(f"Redis metrics are incomplete: HTTP {status}, result={redis_result!r}")
+
+        limited_redis_user = podman(
+            "exec", redis_container, "redis-cli", "ACL", "SETUSER", "monitor_limited",
+            "reset", "on", f">{redis_limited_password}", "~*", "+ping",
+        )
+        if limited_redis_user.stdout.strip() != "OK":
+            raise RuntimeError("could not create the restricted Redis ACL user")
+        status, redis_limited_monitor = api.request("POST", "/api/v1/monitors", {
+            "resourceId": resource["id"], "name": "Redis 统计权限不足验收",
+            "type": "REDIS", "targetHost": "monitor-redis", "port": 6379,
+            "databaseUsername": "monitor_limited", "databasePassword": redis_limited_password,
+            "databaseTls": False, "redisDatabase": 0,
+            "intervalSeconds": 10, "timeoutSeconds": 3,
+            "failureThreshold": 1, "recoveryThreshold": 1,
+            "critical": False, "enabled": False,
+        })
+        if status != 201 or not isinstance(redis_limited_monitor, dict):
+            raise RuntimeError(f"could not create restricted Redis monitor (HTTP {status})")
+        status, redis_limited_result = api.request(
+            "POST", f"/api/v1/monitors/{redis_limited_monitor['id']}/test",
+        )
+        if (status != 200 or not isinstance(redis_limited_result, dict) or
+                redis_limited_result.get("status") != "UP" or redis_limited_result.get("metrics") != {}):
+            raise RuntimeError(
+                f"Redis with PING-only ACL did not stay UP with optional metrics omitted: "
+                f"HTTP {status}, result={redis_limited_result!r}"
+            )
+
+        eviction_seed = podman_with_input(
+            redis_container, "redis-cli", "--pipe", input_data=redis_set_pipeline(2_000, 8_192), timeout=90,
+        )
+        eviction_output = eviction_seed.stdout.decode("utf-8", errors="replace")
+        if "errors: 0" not in eviction_output:
+            raise RuntimeError(f"Redis eviction fixture reported command errors: {eviction_output[-300:]}")
+        time.sleep(5.1)
+        status, evicted_result = api.request("POST", f"/api/v1/monitors/{redis_monitor['id']}/test")
+        evicted_metrics = evicted_result.get("metrics") if isinstance(evicted_result, dict) else None
+        if (status != 200 or not isinstance(evicted_result, dict) or evicted_result.get("status") != "UP" or
+                not isinstance(evicted_metrics, dict) or evicted_metrics.get("redis_evicted_keys_total", 0) <= 0):
+            raise RuntimeError(f"Redis eviction counter did not increase after memory pressure: {evicted_result!r}")
+        print(
+            "redis_metrics=UP memory=present clients=present "
+            f"evicted_keys={evicted_metrics['redis_evicted_keys_total']} "
+            "ping_only_acl=UP/metrics_empty", flush=True,
+        )
+
+        status, redis_threshold = api.request("POST", "/api/v1/monitors", {
+            "resourceId": resource["id"], "name": "Redis 淘汰计数阈值验收",
+            "type": "METRIC_THRESHOLD", "metricName": "redis_evicted_keys_total",
+            "metricOperator": "GT", "metricThreshold": 1, "metricRecoveryValue": 0,
+            "metricWindowSeconds": 240, "metricSeverity": "WARNING",
+            "intervalSeconds": 60, "timeoutSeconds": 1,
+            "failureThreshold": 1, "recoveryThreshold": 1,
+            "critical": False, "enabled": False,
+        })
+        if status != 201:
+            raise RuntimeError(f"Redis eviction threshold metric was not accepted (HTTP {status})")
+        print("redis_threshold_metric=redis_evicted_keys_total accepted=yes", flush=True)
 
         podman(
             "exec", target_db_container, "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "monitor_user",
@@ -421,13 +554,16 @@ def main() -> int:
     finally:
         if app_started and not completed:
             logs = podman("logs", "--tail", "80", app_container, check=False).stdout
-            for secret in (db_password, target_password, rejected_password, limited_password, timeout_password):
+            for secret in (
+                db_password, target_password, rejected_password, limited_password,
+                timeout_password, redis_limited_password,
+            ):
                 logs = logs.replace(secret, "[REDACTED]")
             if logs:
                 print(f"temporary application log tail:\n{logs[-12000:]}", file=sys.stderr)
         if app_started:
             podman("rm", "-f", app_container, check=False)
-        podman("rm", "-f", target_db_container, timeout_container, app_db_container, check=False)
+        podman("rm", "-f", target_db_container, redis_container, timeout_container, app_db_container, check=False)
         podman("network", "rm", network, check=False)
 
 

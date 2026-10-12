@@ -3238,6 +3238,10 @@ String _metricName(String value) => switch (value) {
   'database_connections' => '数据库当前连接数（个）',
   'database_connection_limit' => '数据库连接上限（个）',
   'database_connections_percent' => '数据库连接使用率（%）',
+  'redis_memory_used_bytes' => 'Redis 已使用内存（字节）',
+  'redis_memory_limit_bytes' => 'Redis 内存上限（字节）',
+  'redis_memory_used_percent' => 'Redis 内存使用率（%）',
+  'redis_evicted_keys_total' => 'Redis 已淘汰键累计数（个）',
   _ => value,
 };
 
@@ -8770,6 +8774,10 @@ const _thresholdMetricNames = [
   'database_connections',
   'database_connection_limit',
   'database_connections_percent',
+  'redis_memory_used_bytes',
+  'redis_memory_limit_bytes',
+  'redis_memory_used_percent',
+  'redis_evicted_keys_total',
 ];
 
 String _metricDisplayName(String name) => switch (name) {
@@ -8785,10 +8793,15 @@ String _metricDisplayName(String name) => switch (name) {
   'database_connections' => '数据库当前连接数',
   'database_connection_limit' => '数据库连接上限',
   'database_connections_percent' => '数据库连接使用率',
+  'redis_memory_used_bytes' => 'Redis 已使用内存',
+  'redis_memory_limit_bytes' => 'Redis 内存上限',
+  'redis_memory_used_percent' => 'Redis 内存使用率',
+  'redis_evicted_keys_total' => 'Redis 已淘汰键累计数',
   _ => name,
 };
 
-bool _isDatabaseMetric(String name) => name.startsWith('database_');
+bool _isDatabaseMetric(String name) =>
+    name.startsWith('database_') || name.startsWith('redis_');
 
 String _metricResourceType(String name) =>
     _isDatabaseMetric(name) ? 'DATABASE' : 'HOST';
@@ -8799,6 +8812,8 @@ String _metricUnit(String name) => name.endsWith('_percent')
     ? '(bytes/s)'
     : name.endsWith('_bytes')
     ? '(bytes)'
+    : name.endsWith('_total')
+    ? '(count)'
     : '';
 
 String _metricOperatorSymbol(String? operator) => switch (operator) {

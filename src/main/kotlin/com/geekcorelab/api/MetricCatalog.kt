@@ -10,6 +10,10 @@ object MetricCatalog {
         "database_connections",
         "database_connection_limit",
         "database_connections_percent",
+        "redis_memory_used_bytes",
+        "redis_memory_limit_bytes",
+        "redis_memory_used_percent",
+        "redis_evicted_keys_total",
     )
 
     val thresholdMetricNames = hostMetricNames + databaseMetricNames

@@ -53,22 +53,24 @@ Use an ACL user with only the commands needed by the selected database. For Redi
 ACL SETUSER geek-monitor on >replace-with-a-secret resetkeys resetchannels -@all +auth +select +ping
 ```
 
-The required probe is `PING`. Optional connection metrics use `INFO clients` and `CONFIG GET maxclients`. On Redis 7 or later, grant those read-only commands separately if the additional server information is acceptable:
+The required probe is `PING`. Optional metrics use `INFO clients`, `INFO memory`, `INFO stats`, and `CONFIG GET maxclients`. `INFO` exposes client counts, memory use and limit, and the cumulative number of evicted keys. On Redis 7 or later, grant these read-only commands separately if the additional server information is acceptable:
 
 ```text
 ACL SETUSER geek-monitor +info +config|get
 ```
 
-`CONFIG GET` can reveal server configuration values, so omit this optional grant if that exposure is not acceptable; the availability check still succeeds without the connection metrics. Redis 7 supports ACL rules for individual command subcommands such as `config|get` ([Redis ACL guide](https://redis.io/docs/latest/operate/oss_and_stack/management/security/acl/)). No key patterns or data commands are needed.
+`CONFIG GET` can reveal server configuration values, so omit this optional grant if that exposure is not acceptable; the availability check still succeeds without the connection limit metric. Each optional command is queried independently, so a restricted ACL can still provide whichever `INFO` sections it permits. A Redis `maxmemory` value of zero means no configured limit: the used-memory metric remains available, while limit and utilization metrics are omitted. Redis 7 supports ACL rules for individual command subcommands such as `config|get` ([Redis ACL guide](https://redis.io/docs/latest/operate/oss_and_stack/management/security/acl/)). No key patterns or data commands are needed.
 
 Verify the required and optional commands using the monitor account:
 
 ```text
 PING
 INFO clients
+INFO memory
+INFO stats
 CONFIG GET maxclients
 ```
 
 ## Local verification
 
-These permission sets were checked against isolated PostgreSQL 17, MySQL 8.4, and Redis 7 containers. PostgreSQL `CONNECT` alone allowed the fixed health and connection-count queries. MySQL access to one constant view with `SHOW VIEW` allowed the configured database connection and global status queries while application-table reads were denied. The restricted Redis ACL allowed `PING`, `INFO clients`, `CONFIG GET`, and selecting database 2 without granting key commands.
+These permission sets were checked against isolated PostgreSQL 17, MySQL 8.4, and Redis 7 containers. PostgreSQL `CONNECT` alone allowed the fixed health and connection-count queries. MySQL access to one constant view with `SHOW VIEW` allowed the configured database connection and global status queries while application-table reads were denied. The restricted Redis ACL allowed `PING`, the optional `INFO` sections, `CONFIG GET`, and selecting database 2 without granting key commands. A separate PING-only Redis ACL verified that optional permission failures leave the availability result healthy and omit metrics.
