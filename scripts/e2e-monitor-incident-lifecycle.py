@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 
@@ -278,7 +279,7 @@ def main() -> int:
                 "method": "GET",
                 "intervalSeconds": 10,
                 "timeoutSeconds": 3,
-                "failureThreshold": 1,
+                "failureThreshold": 2,
                 "recoveryThreshold": 1,
                 "expectedStatusCodes": [200],
                 "critical": True,
@@ -349,6 +350,112 @@ def main() -> int:
         if not {"incident.opened", "incident.resolved"}.issubset(webhook_types):
             raise RuntimeError(f"the local Webhook sink missed an incident lifecycle event: {webhook_types}")
 
+        maintenance_started = datetime.now(timezone.utc)
+        status, maintenance = api.request(
+            "POST",
+            "/api/v1/maintenance-windows",
+            {
+                "projectId": project_id,
+                "resourceId": resource_id,
+                "name": "失败阈值重置验收",
+                "description": "维护期间记录检查结果但不创建事件，维护结束后重新累计失败阈值。",
+                "startsAt": (maintenance_started - timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+                "endsAt": (maintenance_started + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+            },
+        )
+        if status != 201 or not isinstance(maintenance, dict) or maintenance.get("status") != "ACTIVE":
+            raise RuntimeError(f"could not create an active resource maintenance window (HTTP {status})")
+        maintenance_id = str(maintenance["id"])
+        with sink.lock:
+            deliveries_before_maintenance = len(sink.received)
+        state.set_healthy(False)
+        down_during_maintenance = wait_until(
+            "scheduled DOWN result during maintenance",
+            args.failure_timeout,
+            lambda: _monitor_state(api, monitor_id, "DOWN"),
+        )
+        failures_during_maintenance = wait_until(
+            "failure threshold reached during maintenance",
+            args.failure_timeout,
+            lambda: (
+                _monitor_state(api, monitor_id, "DOWN")
+                if _latest_result(api, monitor_id, "DOWN", 503)
+                else None
+            ),
+        )
+        if _matching_incident(api, monitor_id, "OPEN") is not None:
+            raise RuntimeError("maintenance suppression opened an incident for a failed monitor")
+        with sink.lock:
+            if len(sink.received) != deliveries_before_maintenance:
+                raise RuntimeError("maintenance suppression sent an unexpected Webhook notification")
+        failure_history = api.request("GET", f"/api/v1/monitors/{monitor_id}/results?limit=20")[1]
+        if not isinstance(failure_history, list) or not any(
+            row.get("status") == "DOWN" and row.get("statusCode") == 503 for row in failure_history
+        ):
+            raise RuntimeError("maintenance suppressed or lost the failed check result")
+
+        cancelled_at = datetime.now(timezone.utc)
+        status, _ = api.request("DELETE", f"/api/v1/maintenance-windows/{maintenance_id}")
+        if status != 204:
+            raise RuntimeError(f"could not cancel the active maintenance window (HTTP {status})")
+        cancelled_windows = api.request("GET", f"/api/v1/maintenance-windows?projectId={project_id}")[1]
+        if not isinstance(cancelled_windows, list) or not any(
+            row.get("id") == maintenance_id and row.get("status") == "CANCELLED"
+            for row in cancelled_windows
+        ):
+            raise RuntimeError("cancelled maintenance window was not reported as CANCELLED")
+
+        first_failure_after_cancel = wait_until(
+            "first failed check after maintenance cancellation",
+            args.failure_timeout,
+            lambda: _failure_after(api, monitor_id, cancelled_at),
+        )
+        if _matching_incident(api, monitor_id, "OPEN") is not None:
+            raise RuntimeError(
+                "maintenance boundary did not reset the failure counter; an incident opened after only one post-window failure"
+            )
+        second_failure_after_cancel = wait_until(
+            "second failed check after maintenance cancellation",
+            args.failure_timeout,
+            lambda: _failure_after(api, monitor_id, datetime.fromisoformat(first_failure_after_cancel["lastResultAt"].replace("Z", "+00:00"))),
+        )
+        reopened = wait_until(
+            "incident after the post-maintenance failure threshold",
+            args.failure_timeout,
+            lambda: _matching_incident(api, monitor_id, "OPEN"),
+        )
+        if len(reopened) != 1 or reopened[0].get("id") == incident_id:
+            raise RuntimeError("the post-maintenance failure did not open one new incident")
+        maintenance_incident_id = str(reopened[0]["id"])
+        if not _has_webhook_incident(sink, "incident.opened", maintenance_incident_id):
+            wait_until(
+                "delivered post-maintenance OPENED notification",
+                args.notification_timeout,
+                lambda: _has_webhook_incident(sink, "incident.opened", maintenance_incident_id),
+            )
+
+        state.set_healthy(True)
+        maintenance_resolved = wait_until(
+            "post-maintenance incident RESOLVED",
+            args.recovery_timeout,
+            lambda: _incident_by_id(api, maintenance_incident_id, "RESOLVED"),
+        )
+        if maintenance_resolved is None:
+            raise RuntimeError("post-maintenance recovery did not resolve its incident")
+        if not _has_webhook_incident(sink, "incident.resolved", maintenance_incident_id):
+            wait_until(
+                "delivered post-maintenance RESOLVED notification",
+                args.notification_timeout,
+                lambda: _has_webhook_incident(sink, "incident.resolved", maintenance_incident_id),
+            )
+        with sink.lock:
+            payloads = list(sink.received)
+        webhook_types = sorted({
+            (payload.get("notification") or {}).get("eventType")
+            for payload in payloads
+            if isinstance(payload.get("notification"), dict)
+        })
+
         print(json.dumps({
             "monitor_result": "DOWN/503 -> UP/200",
             "incident": {"id": incident_id, "category": incident.get("category"), "events": ["OPENED", "RESOLVED"]},
@@ -357,6 +464,17 @@ def main() -> int:
             "resolved_delivery": {"status": resolved_delivery.get("status"), "groupCount": resolved_delivery.get("groupCount")},
             "webhook_event_types": webhook_types,
             "webhook_requests": len(payloads),
+            "maintenance": {
+                "during_window": "DOWN/503 recorded, incident and notification suppressed",
+                "after_cancel": "first failure did not open an incident; second failure opened a new incident",
+                "recovery": "same post-maintenance incident resolved",
+                "window_id": maintenance_id,
+                "first_maintenance_result": down_during_maintenance.get("lastResultAt"),
+                "threshold_failure_result": failures_during_maintenance.get("lastResultAt"),
+                "first_post_cancel_failure": first_failure_after_cancel.get("lastResultAt"),
+                "second_post_cancel_failure": second_failure_after_cancel.get("lastResultAt"),
+                "incident_id": maintenance_incident_id,
+            },
             "elapsed_seconds": round(time.monotonic() - started, 2),
         }, separators=(",", ":")))
         return 0
@@ -382,6 +500,52 @@ def _matching_delivery(api: ApiClient, channel_id: str, event_type: str, status:
     if not isinstance(payload, list):
         return None
     return next((row for row in payload if row.get("eventType") == event_type and row.get("status") == status), None)
+
+
+def _monitor_state(api: ApiClient, monitor_id: str, expected_state: str) -> dict[str, object] | None:
+    status, payload = api.request("GET", f"/api/v1/monitors/{monitor_id}")
+    if status != 200 or not isinstance(payload, dict) or payload.get("state") != expected_state:
+        return None
+    return payload
+
+
+def _latest_result(api: ApiClient, monitor_id: str, expected_status: str, expected_http_status: int) -> bool:
+    status, rows = api.request("GET", f"/api/v1/monitors/{monitor_id}/results?limit=1")
+    return (
+        status == 200 and isinstance(rows, list) and bool(rows)
+        and rows[0].get("status") == expected_status
+        and rows[0].get("statusCode") == expected_http_status
+    )
+
+
+def _failure_after(api: ApiClient, monitor_id: str, instant: datetime) -> dict[str, object] | None:
+    monitor = _monitor_state(api, monitor_id, "DOWN")
+    if monitor is None or not isinstance(monitor.get("lastResultAt"), str):
+        return None
+    try:
+        observed = datetime.fromisoformat(monitor["lastResultAt"].replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if observed <= instant or not _latest_result(api, monitor_id, "DOWN", 503):
+        return None
+    return monitor
+
+
+def _incident_by_id(api: ApiClient, incident_id: str, status: str) -> dict[str, object] | None:
+    rows = api.request("GET", f"/api/v1/incidents?status={status}&limit=100")[1]
+    if not isinstance(rows, list):
+        return None
+    return next((row for row in rows if row.get("id") == incident_id), None)
+
+
+def _has_webhook_incident(sink: WebhookServer, event_type: str, incident_id: str) -> bool:
+    with sink.lock:
+        return any(
+            isinstance(payload.get("notification"), dict)
+            and payload["notification"].get("eventType") == event_type
+            and payload["notification"].get("incidentId") == incident_id
+            for payload in sink.received
+        )
 
 
 if __name__ == "__main__":
