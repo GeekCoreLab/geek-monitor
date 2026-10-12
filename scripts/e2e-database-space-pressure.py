@@ -19,8 +19,10 @@ import urllib.request
 
 ADMIN_EMAIL = "admin@biliwind.com"
 ADMIN_PASSWORD = "admin@biliwind.com"
+APP_CONTAINER = "geek-monitor-disk-pressure-app"
 DB_CONTAINER = "geek-monitor-disk-pressure-db"
 PRESSURE_FILE = "/var/lib/postgresql/data/.geek-monitor-capacity-pressure"
+APP_PORT = 18091
 
 
 def podman(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -100,6 +102,40 @@ def tmpfs_capacity_kib() -> tuple[int, int]:
     return int(fields[1]), int(fields[3])
 
 
+def verify_isolated_stack(base_url: str) -> tuple[int, int]:
+    app_inspect = json.loads(podman("inspect", APP_CONTAINER).stdout)[0]
+    db_inspect = json.loads(podman("inspect", DB_CONTAINER).stdout)[0]
+    if app_inspect.get("State", {}).get("Running") is not True:
+        raise SystemExit("application container must be running")
+    app_environment = set(app_inspect.get("Config", {}).get("Env", []))
+    db_environment = set(db_inspect.get("Config", {}).get("Env", []))
+    if "DB_URL=jdbc:postgresql://db:5432/geek_monitor" not in app_environment:
+        raise SystemExit("application container must point directly at the isolated db network alias")
+    if "DB_USERNAME=geek_monitor" not in app_environment:
+        raise SystemExit("application must use the disposable PostgreSQL test user")
+    if "POSTGRES_USER=geek_monitor" not in db_environment or "POSTGRES_DB=geek_monitor" not in db_environment:
+        raise SystemExit("database container must use the disposable geek_monitor database and user")
+    app_networks = set(app_inspect.get("NetworkSettings", {}).get("Networks", {}))
+    db_networks = db_inspect.get("NetworkSettings", {}).get("Networks", {})
+    shared_networks = app_networks.intersection(db_networks)
+    if not shared_networks or not any("db" in db_networks[name].get("Aliases", []) for name in shared_networks):
+        raise SystemExit("application and disposable database must share a network with the db alias")
+    parsed = urllib.parse.urlsplit(base_url)
+    if parsed.port != APP_PORT or parsed.path not in {"", "/"}:
+        raise SystemExit(f"application URL must use the isolated loopback port {APP_PORT}")
+    bindings = app_inspect.get("HostConfig", {}).get("PortBindings", {}).get("8080/tcp", [])
+    if len(bindings) != 1 or bindings[0].get("HostIp") != "127.0.0.1" or bindings[0].get("HostPort") != str(APP_PORT):
+        raise SystemExit("application container must publish only 127.0.0.1:18091")
+    total_kib, available_kib = tmpfs_capacity_kib()
+    state = podman(
+        "exec", DB_CONTAINER, "psql", "-X", "-A", "-t", "-U", "geek_monitor", "-d", "geek_monitor",
+        "-c", "SELECT initialized::text FROM installation_state WHERE id = 1",
+    ).stdout.strip()
+    if state != "false":
+        raise SystemExit("disposable PostgreSQL database must be migrated but not initialized")
+    return total_kib, available_kib
+
+
 def main() -> int:
     import argparse
 
@@ -107,7 +143,7 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:18091")
     args = parser.parse_args()
     require_loopback(args.base_url)
-    total_kib, available_kib = tmpfs_capacity_kib()
+    total_kib, available_kib = verify_isolated_stack(args.base_url)
     if available_kib < total_kib // 2:
         raise SystemExit("database tmpfs already has less than half its space available")
 

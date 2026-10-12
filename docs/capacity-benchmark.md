@@ -26,9 +26,9 @@
 
 ## PostgreSQL 数据目录耗尽与恢复演练
 
-2026-10-12 在 PostgreSQL 17.11/JVM 隔离栈上把一次性数据库数据目录放入 512 MiB tmpfs，并将数据库容器限制为 2 GiB。脚本先确认数据库容器是指定 PostgreSQL 17 镜像、`PGDATA` 指向该 tmpfs，应用是回环地址上的空白实例，然后将 tmpfs 填至 100%。此时就绪 API 仍返回 `UP`，初始化写操作返回 HTTP 500；响应只包含通用错误 ID 和空 stack 字段，不泄露 `No space left on device` 或数据库异常细节。`install/status` 仍为未初始化，证明失败事务没有留下管理员/项目的部分状态。删除测试填充文件后，数据库可用空间恢复到 474,332 KiB，初始化返回 HTTP 201、管理员登录返回 HTTP 200，就绪状态恢复/保持 `UP`。
+2026-10-12 在 PostgreSQL 17.11/JVM 隔离栈上把一次性数据库数据目录放入 512 MiB tmpfs，并将数据库容器限制为 2 GiB。脚本先确认数据库容器是指定 PostgreSQL 17 镜像、`PGDATA` 指向该 tmpfs，应用是回环地址上的空白实例，然后将 tmpfs 填至 100%。此时就绪 API 仍返回 `UP`，初始化写操作返回 HTTP 500；响应只包含通用错误 ID 和空 stack 字段，不泄露 `No space left on device` 或数据库异常细节。`install/status` 仍为未初始化，证明失败事务没有留下管理员/项目的部分状态。删除测试填充文件后，数据库可用空间恢复到 474,220 KiB，初始化返回 HTTP 201、管理员登录返回 HTTP 200，就绪状态恢复/保持 `UP`。
 
-复跑时预先启动名为 `geek-monitor-disk-pressure-db` 的 PostgreSQL 17 Alpine 容器，使用 `--memory 2g --tmpfs /var/lib/postgresql/data:rw,size=512m`，并在仅测试用途的网络中启动连到该库的空白 JVM 应用，绑定 `127.0.0.1:18091`；随后运行 `python3 scripts/e2e-database-space-pressure.py --base-url http://127.0.0.1:18091`。脚本拒绝非回环 URL、已初始化应用、非 PostgreSQL 17/非默认 `PGDATA`、未限定 tmpfs 或大于 2 GiB 的数据目录；无论测试结果如何，都会在 `finally` 中移除填充文件。演练使用临时 tmpfs，不触碰开发库、七天观察库或持久卷。它验证磁盘耗尽时事务回滚和空间恢复后的可用性，不代表目标硬件持续写入或生产磁盘故障矩阵。
+复跑时预先启动名为 `geek-monitor-disk-pressure-db` 的 PostgreSQL 17 Alpine 容器，使用 `--memory 2g --tmpfs /var/lib/postgresql/data:rw,size=512m`，并在仅测试用途的网络中启动名为 `geek-monitor-disk-pressure-app` 的空白 JVM 应用，绑定 `127.0.0.1:18091`；随后运行 `python3 scripts/e2e-database-space-pressure.py --base-url http://127.0.0.1:18091`。脚本会确认两个容器运行在同一临时网络、应用准确连接 `db` 别名下的 `geek_monitor` 测试库、该库仍未初始化，且应用只绑定回环地址；同时拒绝非回环 URL、非 PostgreSQL 17/非默认 `PGDATA`、未限定 tmpfs 或大于 2 GiB 的数据目录。无论测试结果如何，都会在 `finally` 中移除填充文件。演练使用临时 tmpfs，不触碰开发库、七天观察库或持久卷。它验证磁盘耗尽时事务回滚和空间恢复后的可用性，不代表目标硬件持续写入或生产磁盘故障矩阵。
 
 ## 7 天真实 Agent 试运行（进行中）
 
