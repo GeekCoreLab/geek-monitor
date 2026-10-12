@@ -30,6 +30,7 @@ jobs:
         ports:
           - 55435:5432
           - 55436:5432
+          - 55437:5432
         options: >-
           --health-cmd "pg_isready -U geek_monitor -d geek_monitor_status_stream"
           --health-interval 5s
@@ -151,6 +152,17 @@ jobs:
           python3 scripts/e2e-monitor-incident-lifecycle.py \
             --base-url http://127.0.0.1:18089 \
             --service-address "$service_address"
+
+      - name: Verify interrupted execution and notification recovery after restart
+        env:
+          GEEK_MONITOR_E2E_DB_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          PGPASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          createdb --host 127.0.0.1 --port 55437 --username geek_monitor \
+            --maintenance-db geek_monitor_status_stream geek_monitor_restart_recovery
+          service_address="$(ip -4 route get 1.1.1.1 | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+          python3 scripts/e2e-startup-recovery.py --service-address "$service_address"
 
       - name: Test persistent soak observer
         run: python3 scripts/test_monitor_agent_soak.py
