@@ -176,6 +176,9 @@ jobs:
       - name: Verify first install and heartbeat failure/recovery lifecycle
         run: python3 scripts/e2e-heartbeat-lifecycle.py --app-image geek-monitor-acceptance:ci
 
+      - name: Verify monitored PostgreSQL outage and recovery lifecycle
+        run: python3 scripts/e2e-database-outage.py --app-image geek-monitor-acceptance:ci
+
       - name: Test persistent soak observer
         run: python3 scripts/test_monitor_agent_soak.py
 
