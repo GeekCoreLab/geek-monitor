@@ -11,6 +11,7 @@ import okhttp3.Request
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -94,7 +95,7 @@ class HttpCheckService {
             } else {
                 val code = when (exception) {
                     is UnknownHostException -> "DNS_FAILURE"
-                    is java.net.SocketTimeoutException -> "TIMEOUT"
+                    is InterruptedIOException -> "TIMEOUT"
                     is SSLHandshakeException -> "TLS_FAILURE"
                     else -> "NETWORK_FAILURE"
                 }
@@ -219,7 +220,7 @@ class HttpCheckService {
                 }
                 val (code, summary) = when (exception) {
                     is UnknownHostException -> "DNS_FAILURE" to "目标域名无法解析"
-                    is java.net.SocketTimeoutException -> "TIMEOUT" to "连接或读取超时"
+                    is InterruptedIOException -> "TIMEOUT" to "连接或读取超时"
                     is SSLHandshakeException -> "TLS_FAILURE" to "TLS 证书或握手校验失败"
                     else -> "NETWORK_FAILURE" to "无法连接目标服务"
                 }

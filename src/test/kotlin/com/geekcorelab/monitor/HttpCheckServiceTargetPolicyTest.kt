@@ -1,11 +1,13 @@
 package com.geekcorelab.monitor
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import com.geekcorelab.security.SecretEncryptionService
 import com.sun.net.httpserver.HttpServer
 import org.junit.jupiter.api.Assumptions.assumeTrue
+import java.io.IOException
 import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
@@ -75,6 +77,85 @@ class HttpCheckServiceTargetPolicyTest {
 
         assertEquals("UNKNOWN", result.status)
         assertEquals("CHECK_CONFIG_INVALID", result.errorCode)
+    }
+
+    @Test
+    fun `HTTP checks classify status assertions timeouts and redirect limits`() {
+        val targetAddress = NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .filterIsInstance<Inet4Address>()
+            .firstOrNull { it.isSiteLocalAddress && !it.isLoopbackAddress }
+        assumeTrue(targetAddress != null, "No private IPv4 interface is available for the local HTTP smoke test")
+
+        val server = HttpServer.create(InetSocketAddress("0.0.0.0", 0), 0)
+        server.createContext("/") { exchange ->
+            try {
+                val path = exchange.requestURI.path
+                when {
+                    path == "/error" -> {
+                        val body = "private-response-marker".toByteArray()
+                        exchange.sendResponseHeaders(500, body.size.toLong())
+                        exchange.responseBody.use { it.write(body) }
+                    }
+                    path == "/slow" -> {
+                        Thread.sleep(1_500)
+                        val body = "ready".toByteArray()
+                        exchange.sendResponseHeaders(200, body.size.toLong())
+                        exchange.responseBody.use { it.write(body) }
+                    }
+                    path.startsWith("/redirect/") -> {
+                        val parts = path.split('/')
+                        val limit = parts[2].toInt()
+                        val index = parts[3].toInt()
+                        if (index < limit) {
+                            exchange.responseHeaders.add("Location", "/redirect/$limit/${index + 1}")
+                            exchange.sendResponseHeaders(302, -1)
+                            exchange.close()
+                        } else {
+                            val body = "ready".toByteArray()
+                            exchange.sendResponseHeaders(200, body.size.toLong())
+                            exchange.responseBody.use { it.write(body) }
+                        }
+                    }
+                    else -> {
+                        val body = "ready".toByteArray()
+                        exchange.sendResponseHeaders(200, body.size.toLong())
+                        exchange.responseBody.use { it.write(body) }
+                    }
+                }
+            } catch (_: IOException) {
+                exchange.close()
+            }
+        }
+        server.start()
+        try {
+            val checker = service(allowPrivateTargets = true)
+            val baseUrl = "http://${targetAddress!!.hostAddress}:${server.address.port}"
+
+            val statusFailure = checker.execute("$baseUrl/error", "GET", 3, setOf(200), null)
+            assertEquals("DOWN", statusFailure.status)
+            assertEquals("HTTP_STATUS", statusFailure.errorCode)
+            assertEquals(500, statusFailure.statusCode)
+            assertFalse(statusFailure.summary.orEmpty().contains("private-response-marker"))
+
+            val bodyFailure = checker.execute("$baseUrl/ready", "GET", 3, setOf(200), "missing-marker")
+            assertEquals("DOWN", bodyFailure.status)
+            assertEquals("ASSERTION_FAILED", bodyFailure.errorCode)
+
+            val fiveRedirects = checker.execute("$baseUrl/redirect/5/0", "GET", 3, setOf(200), null)
+            assertEquals("UP", fiveRedirects.status)
+
+            val sixRedirects = checker.execute("$baseUrl/redirect/6/0", "GET", 3, setOf(200), null)
+            assertEquals("DOWN", sixRedirects.status)
+            assertEquals("TOO_MANY_REDIRECTS", sixRedirects.errorCode)
+
+            val timeout = checker.execute("$baseUrl/slow", "GET", 1, setOf(200), null)
+            assertEquals("DOWN", timeout.status)
+            assertEquals("TIMEOUT", timeout.errorCode)
+            assertTrue(timeout.durationMs < 3_000)
+        } finally {
+            server.stop(0)
+        }
     }
 
     @Test
