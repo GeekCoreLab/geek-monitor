@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the 24-hour Geek Monitor Agent cadence acceptance check
+
+[Timer]
+OnCalendar=2026-10-13 05:00:00 UTC
+AccuracySec=1s
+Persistent=true
+Unit=geek-monitor-agent-cadence-24h.service
+
+[Install]
+WantedBy=timers.target

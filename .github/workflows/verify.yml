@@ -155,8 +155,11 @@ jobs:
       - name: Test persistent soak observer
         run: python3 scripts/test_monitor_agent_soak.py
 
+      - name: Test 24-hour Agent cadence verifier
+        run: python3 scripts/test_monitor_agent_cadence.py
+
       - name: Validate integration script syntax
-        run: python3 -m py_compile scripts/e2e-*.py
+        run: python3 -m py_compile scripts/e2e-*.py scripts/verify-agent-cadence.py
 
   agent:
     runs-on: ubuntu-latest
