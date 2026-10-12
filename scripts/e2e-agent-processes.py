@@ -76,8 +76,8 @@ def main() -> int:
         parser.error("base URL must be plain HTTP on 127.0.0.1, localhost, or ::1")
     if not (1 <= args.hosts <= 100):
         parser.error("hosts must be between 1 and 100")
-    if not (65 <= args.duration_seconds <= 3600):
-        parser.error("duration-seconds must be between 65 and 3600")
+    if not (65 <= args.duration_seconds <= 604800):
+        parser.error("duration-seconds must be between 65 and 604800")
     binary = args.agent_binary.expanduser().resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("agent-binary must point to an executable file")
@@ -160,24 +160,33 @@ def main() -> int:
                 cpu_start[process.pid] = (cpu_start[process.pid][0], measurement_start)
 
         deadline = measurement_start + args.duration_seconds
-        next_report = measurement_start + 10
+        process_sample_interval = min(60.0, max(1.0, args.duration_seconds / 3600))
+        status_report_interval = min(300.0, max(10.0, args.duration_seconds / 100))
+        next_process_sample = measurement_start
+        next_report = measurement_start + status_report_interval
         while time.monotonic() < deadline:
             now = time.monotonic()
-            for process in processes:
-                if process.poll() is not None:
-                    failure = f"Agent process exited early with status {process.returncode}"
-                    break
-                current = proc_usage(process.pid)
-                if current:
-                    max_rss[process.pid] = max(max_rss.get(process.pid, 0), current[1])
+            if now >= next_process_sample:
+                for process in processes:
+                    if process.poll() is not None:
+                        failure = f"Agent process exited early with status {process.returncode}"
+                        break
+                    current = proc_usage(process.pid)
+                    if current:
+                        max_rss[process.pid] = max(max_rss.get(process.pid, 0), current[1])
+                next_process_sample = now + process_sample_interval
             if failure:
                 break
             if now >= next_report:
                 status, agents, _ = api_request(base, "GET", f"/api/v1/agents?projectId={project_id}", cookie=cookie)
                 online = sum(1 for agent in agents if agent.get("status") == "ONLINE") if status == 200 else 0
                 print(f"elapsed_seconds={int(now - measurement_start)} online_agents={online}/{args.hosts}", flush=True)
-                next_report = now + 10
-            time.sleep(min(1, max(0, deadline - time.monotonic())))
+                if status != 200 or online != args.hosts:
+                    failure = f"Agent status check failed (HTTP {status}, online {online}/{args.hosts})"
+                    break
+                next_report = now + status_report_interval
+            wake_at = min(deadline, next_process_sample, next_report)
+            time.sleep(max(0, wake_at - time.monotonic()))
 
         elapsed = max(1.0, time.monotonic() - measurement_start)
         cpu_percentages: list[float] = []
@@ -195,7 +204,7 @@ def main() -> int:
             agents = []
         online_resource_ids = {agent["resourceId"] for agent in agents if agent.get("status") == "ONLINE"}
 
-        curve_from = (run_started_at - dt.timedelta(seconds=60)).isoformat()
+        curve_from = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=120)).isoformat()
         curve_to = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)).isoformat()
 
         def read_curve(resource_id: str) -> tuple[int, int, int]:
