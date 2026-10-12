@@ -1,0 +1,66 @@
+name: Release Linux Agent
+
+on:
+  push:
+    tags:
+      - "agent-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: agent/go.mod
+
+      - name: Test Agent
+        working-directory: agent
+        run: go test ./...
+
+      - name: Build release assets
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          version="${TAG_NAME#agent-v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Agent release tag must look like agent-v0.1.0" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          for architecture in amd64 arm64; do
+            (
+              cd agent
+              CGO_ENABLED=0 GOOS=linux GOARCH="$architecture" \
+                go build -trimpath -ldflags="-s -w -X main.agentVersion=$version" \
+                -o "../dist/geek-monitor-agent-linux-$architecture" .
+            )
+          done
+          install -m 0755 scripts/install-agent.sh dist/install-agent.sh
+          (
+            cd dist
+            sha256sum geek-monitor-agent-linux-amd64 \
+              geek-monitor-agent-linux-arm64 install-agent.sh >SHA256SUMS
+          )
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          version="${TAG_NAME#agent-v}"
+          if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/* --repo "$REPOSITORY" --clobber
+          else
+            gh release create "$TAG_NAME" dist/* \
+              --repo "$REPOSITORY" \
+              --verify-tag \
+              --title "Geek Monitor Agent $version" \
+              --notes "Linux Agent release $version. Assets include checksummed amd64 and arm64 binaries and the installer used by the Admin console."
+          fi
