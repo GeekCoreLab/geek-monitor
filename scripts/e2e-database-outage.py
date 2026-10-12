@@ -2,9 +2,9 @@
 """Verify a PostgreSQL monitor detects an actual outage and recovers.
 
 The script creates a private Podman network with disposable service and target
-PostgreSQL containers plus an application container. It tests scheduler-driven
-UP -> DOWN (TIMEOUT or CONNECTION_FAILED) -> UP and incident resolution through
-the real API.
+PostgreSQL containers, a query-timeout fixture, and an application container.
+It tests a real JDBC query cancellation, then scheduler-driven UP -> DOWN
+(TIMEOUT or CONNECTION_FAILED) -> UP and incident resolution through the API.
 All containers use temporary data directories and are removed on exit.
 """
 
@@ -14,6 +14,7 @@ import argparse
 import base64
 import ipaddress
 import json
+from pathlib import Path
 import secrets
 import socket
 import subprocess
@@ -27,6 +28,7 @@ APP_PORT = 18093
 ADMIN_EMAIL = "admin@biliwind.com"
 ADMIN_PASSWORD = "admin@biliwind.com"
 POSTGRES_IMAGE = "docker.io/library/postgres:17-alpine"
+PYTHON_IMAGE = "docker.io/library/python:3.13-alpine"
 EXPECTED_FLYWAY_VERSION = "27"
 
 
@@ -97,6 +99,16 @@ def wait_for_database(container: str, username: str, database: str, timeout_seco
     raise TimeoutError(f"disposable PostgreSQL container {container} did not become ready")
 
 
+def wait_for_container_log(container: str, marker: str, timeout_seconds: int = 30) -> None:
+    def ready() -> bool:
+        state = json.loads(podman("inspect", container).stdout)[0].get("State", {})
+        if state.get("Running") is not True:
+            raise RuntimeError(f"disposable query-timeout fixture exited: {state.get('ExitCode')}")
+        return marker in podman("logs", container, check=False).stdout
+
+    wait_until(f"{container} log marker {marker}", timeout_seconds, ready)
+
+
 def check_result(api: Api, monitor_id: str) -> tuple[dict[str, object], dict[str, object] | None]:
     status, monitor = api.request("GET", f"/api/v1/monitors/{monitor_id}")
     if status != 200 or not isinstance(monitor, dict):
@@ -149,14 +161,18 @@ def main() -> int:
         parser.error(f"Geek Monitor image {args.app_image!r} is not available locally")
     if podman("image", "exists", POSTGRES_IMAGE, check=False).returncode != 0:
         podman("pull", POSTGRES_IMAGE, timeout=600)
+    if podman("image", "exists", PYTHON_IMAGE, check=False).returncode != 0:
+        podman("pull", PYTHON_IMAGE, timeout=600)
 
     suffix = uuid.uuid4().hex[:10]
     network = f"geek-monitor-db-outage-{suffix}"
     app_db_container = f"geek-monitor-db-outage-appdb-{suffix}"
     target_db_container = f"geek-monitor-db-outage-targetdb-{suffix}"
+    timeout_container = f"geek-monitor-db-outage-timeout-{suffix}"
     app_container = f"geek-monitor-db-outage-app-{suffix}"
     db_password = secrets.token_urlsafe(24)
     target_password = secrets.token_urlsafe(24)
+    timeout_password = secrets.token_urlsafe(24)
     encryption_key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     app_started = False
     completed = False
@@ -173,6 +189,7 @@ def main() -> int:
         if ipv4_subnet is None or ipv4_subnet.num_addresses < 16:
             raise RuntimeError("isolated Podman network has no usable IPv4 subnet")
         target_ip = ipv4_subnet.network_address + 10
+        timeout_ip = ipv4_subnet.network_address + 11
         podman(
             "run", "-d", "--name", app_db_container, "--network", network,
             "--network-alias", "db", "--memory", "1g",
@@ -187,8 +204,16 @@ def main() -> int:
             "-e", "POSTGRES_DB=monitored", "-e", "POSTGRES_USER=monitor_user",
             "-e", f"POSTGRES_PASSWORD={target_password}", POSTGRES_IMAGE,
         )
+        timeout_fixture = Path(__file__).resolve().parent / "fixtures" / "postgres-query-timeout.py"
+        podman(
+            "run", "-d", "--name", timeout_container, "--network", network,
+            "--network-alias", "query-timeout-db", "--ip", str(timeout_ip), "--memory", "64m",
+            "--volume", f"{timeout_fixture}:/fixture/postgres-query-timeout.py:ro",
+            PYTHON_IMAGE, "python3", "/fixture/postgres-query-timeout.py",
+        )
         wait_for_database(app_db_container, "geek_monitor", "geek_monitor")
         wait_for_database(target_db_container, "monitor_user", "monitored")
+        wait_for_container_log(timeout_container, "POSTGRES_QUERY_TIMEOUT_SERVER_READY")
 
         target_inspect = json.loads(podman("inspect", target_db_container).stdout)[0]
         target_network = target_inspect.get("NetworkSettings", {}).get("Networks", {}).get(network, {})
@@ -206,7 +231,7 @@ def main() -> int:
             "-e", "DB_URL=jdbc:postgresql://db:5432/geek_monitor",
             "-e", "DB_USERNAME=geek_monitor", "-e", f"DB_PASSWORD={db_password}",
             "-e", f"GEEK_MONITOR_ENCRYPTION_KEY={encryption_key}",
-            "-e", f"MONITOR_ALLOWED_CIDRS={parsed_target_ip}/32",
+            "-e", f"MONITOR_ALLOWED_CIDRS={parsed_target_ip}/32,{timeout_ip}/32",
             "-e", "SMTP_MOCK=true", args.app_image,
         )
         app_started = True
@@ -268,6 +293,29 @@ def main() -> int:
         print(f"application_schema=V{schema_version} database_monitor_initial={initial[0]['state']} "
               f"result={initial[1]['status']}", flush=True)
 
+        status, timeout_monitor = api.request("POST", "/api/v1/monitors", {
+            "resourceId": resource["id"], "name": "PostgreSQL 查询超时验收",
+            "type": "POSTGRESQL", "targetHost": "query-timeout-db", "port": 5432,
+            "databaseName": "monitored", "databaseUsername": "monitor_user",
+            "databasePassword": timeout_password, "databaseTls": False,
+            "intervalSeconds": 10, "timeoutSeconds": 2,
+            "failureThreshold": 1, "recoveryThreshold": 1,
+            "critical": False, "enabled": False,
+        })
+        if status != 201 or not isinstance(timeout_monitor, dict):
+            raise RuntimeError(f"could not create PostgreSQL query-timeout monitor (HTTP {status})")
+        timeout_monitor_id = str(timeout_monitor["id"])
+        status, timed_out = api.request("POST", f"/api/v1/monitors/{timeout_monitor_id}/test")
+        if (status != 200 or not isinstance(timed_out, dict) or timed_out.get("status") != "DOWN" or
+                timed_out.get("errorCode") != "TIMEOUT"):
+            raise RuntimeError(f"stalled PostgreSQL query was not classified as TIMEOUT (HTTP {status}, {timed_out!r})")
+        wait_for_container_log(timeout_container, "POSTGRES_QUERY_TIMEOUT_CANCEL_RECEIVED")
+        timeout_payload = json.dumps(timed_out, ensure_ascii=False).lower()
+        if timeout_password.lower() in timeout_payload or "jdbc:" in timeout_payload or "org.postgresql" in timeout_payload:
+            raise RuntimeError("PostgreSQL query-timeout result leaked credentials or JDBC internals")
+        print(f"database_monitor_query_timeout={timed_out['status']}/{timed_out['errorCode']} "
+              f"elapsed_ms={timed_out['durationMs']} jdbc_cancel=received", flush=True)
+
         podman("stop", "--time", "1", target_db_container)
         status, manual_outage = api.request("POST", f"/api/v1/monitors/{monitor_id}/test")
         if (status != 200 or not isinstance(manual_outage, dict) or manual_outage.get("status") != "DOWN" or
@@ -314,13 +362,13 @@ def main() -> int:
     finally:
         if app_started and not completed:
             logs = podman("logs", "--tail", "80", app_container, check=False).stdout
-            for secret in (db_password, target_password):
+            for secret in (db_password, target_password, timeout_password):
                 logs = logs.replace(secret, "[REDACTED]")
             if logs:
                 print(f"temporary application log tail:\n{logs[-12000:]}", file=sys.stderr)
         if app_started:
             podman("rm", "-f", app_container, check=False)
-        podman("rm", "-f", target_db_container, app_db_container, check=False)
+        podman("rm", "-f", target_db_container, timeout_container, app_db_container, check=False)
         podman("network", "rm", network, check=False)
 
 
