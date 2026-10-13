@@ -1,6 +1,7 @@
 package com.geekcorelab.monitor
 
 import com.geekcorelab.api.CheckResponse
+import com.geekcorelab.security.SecretEncryptionService
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
@@ -10,9 +11,11 @@ import okhttp3.Request
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.net.Proxy
 import java.net.URI
 import java.net.UnknownHostException
 import java.time.Instant
@@ -25,6 +28,12 @@ data class TargetResolution(val addresses: List<InetAddress>, val errorCode: Str
 
 @ApplicationScoped
 class HttpCheckService {
+    @Inject lateinit var secretEncryption: SecretEncryptionService
+
+    internal var addressResolver: (String) -> List<InetAddress> = { hostname ->
+        InetAddress.getAllByName(hostname).toList()
+    }
+
     @Inject @field:ConfigProperty(name = "geek-monitor.network.allow-private-targets", defaultValue = "false")
     var allowPrivateTargets: Boolean = false
 
@@ -62,6 +71,7 @@ class HttpCheckService {
         }
         val dns = Dns { hostname -> resolveAndValidate(hostname, uri.host, allowedNetworks) }
         val client = OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
             .dns(dns)
             .connectTimeout(WEBHOOK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(WEBHOOK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
@@ -91,7 +101,7 @@ class HttpCheckService {
             } else {
                 val code = when (exception) {
                     is UnknownHostException -> "DNS_FAILURE"
-                    is java.net.SocketTimeoutException -> "TIMEOUT"
+                    is InterruptedIOException -> "TIMEOUT"
                     is SSLHandshakeException -> "TLS_FAILURE"
                     else -> "NETWORK_FAILURE"
                 }
@@ -106,9 +116,28 @@ class HttpCheckService {
         timeoutSeconds: Int,
         expectedStatusCodes: Set<Int>,
         textContains: String?,
+        jsonPath: String? = null,
+        jsonExpectedValue: String? = null,
+        allowPostNoSideEffects: Boolean = false,
+        encryptedRequestHeaders: Map<String, String> = emptyMap(),
     ): CheckResponse {
         val startedNanos = System.nanoTime()
         val checkedAt = Instant.now()
+        val normalizedJsonPath = jsonPath?.takeIf(String::isNotBlank)
+        val normalizedJsonExpectedValue = jsonExpectedValue?.takeIf(String::isNotBlank)
+        val normalizedMethod = method.trim().uppercase()
+        if (normalizedMethod !in setOf("GET", "HEAD", "POST") ||
+            (normalizedMethod == "POST") != allowPostNoSideEffects) {
+            return unknown(startedNanos, checkedAt, "CHECK_CONFIG_INVALID", "HTTP 请求方法配置无效")
+        }
+        if (!JsonPointerAssertions.isValidConfiguration(normalizedJsonPath, normalizedJsonExpectedValue)) {
+            return unknown(startedNanos, checkedAt, "CHECK_CONFIG_INVALID", "JSON 路径断言配置无效")
+        }
+        val requestHeaders = try {
+            encryptedRequestHeaders.mapValues { (_, encryptedValue) -> secretEncryption.decrypt(encryptedValue) }
+        } catch (_: Exception) {
+            return unknown(startedNanos, checkedAt, "CREDENTIAL_DECRYPTION_FAILED", "请求头凭据无法解密")
+        }
         val deadlineNanos = startedNanos + TimeUnit.SECONDS.toNanos(timeoutSeconds.toLong())
         val allowedNetworks = parseAllowedNetworks()
         var uri = try {
@@ -120,6 +149,7 @@ class HttpCheckService {
             return unknown(startedNanos, checkedAt, "TARGET_BLOCKED", "目标地址解析到未授权的地址")
         }
         val visited = mutableSetOf<String>()
+        var headersForCurrentOrigin = requestHeaders
 
         for (redirectCount in 0..MAX_REDIRECTS) {
             if (!visited.add(uri.toASCIIString())) {
@@ -130,6 +160,7 @@ class HttpCheckService {
             val remainingMillis = max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos))
             val dns = Dns { hostname -> resolveAndValidate(hostname, uri.host, allowedNetworks) }
             val client = OkHttpClient.Builder()
+                .proxy(Proxy.NO_PROXY)
                 .dns(dns)
                 .connectTimeout(remainingMillis, TimeUnit.MILLISECONDS)
                 .readTimeout(remainingMillis, TimeUnit.MILLISECONDS)
@@ -142,9 +173,10 @@ class HttpCheckService {
             val request = try {
                 Request.Builder()
                     .url(uri.toASCIIString())
-                    .method(method, null)
+                    .method(normalizedMethod, if (normalizedMethod == "POST") ByteArray(0).toRequestBody(null) else null)
                     .header("User-Agent", "GeekMonitor/1.0")
                     .header("Accept", "*/*")
+                    .apply { headersForCurrentOrigin.forEach { (name, value) -> header(name, value) } }
                     .build()
             } catch (exception: Exception) {
                 return unknown(startedNanos, checkedAt, "TARGET_INVALID", "目标地址格式无效")
@@ -152,7 +184,7 @@ class HttpCheckService {
 
             try {
                 client.newCall(request).execute().use { response ->
-                    if (response.code in 300..399 && response.header("Location") != null) {
+                    if (normalizedMethod != "POST" && response.code in 300..399 && response.header("Location") != null) {
                         if (redirectCount == MAX_REDIRECTS) {
                             return failure(startedNanos, checkedAt, "TOO_MANY_REDIRECTS", "重定向次数超过 5 次", response.code)
                         }
@@ -167,20 +199,25 @@ class HttpCheckService {
                         if (uri.scheme == "https" && redirected.scheme != "https") {
                             return unknown(startedNanos, checkedAt, "REDIRECT_DOWNGRADE", "HTTPS 检查不允许重定向到 HTTP", response.code)
                         }
+                        if (!sameOrigin(uri, redirected)) headersForCurrentOrigin = emptyMap()
                         uri = redirected
                         return@use
                     }
 
-                    val bodyContainsText = if (textContains == null) true else {
+                    val body = if (textContains != null || normalizedJsonPath != null) {
                         val bytes = response.body.byteStream().use { it.readNBytes(MAX_RESPONSE_BYTES + 1) }
-                        String(bytes.copyOf(minOf(bytes.size, MAX_RESPONSE_BYTES)), Charsets.UTF_8).contains(textContains)
-                    }
+                        bytes.copyOf(minOf(bytes.size, MAX_RESPONSE_BYTES))
+                    } else null
+                    val bodyContainsText = textContains == null ||
+                        String(body!!, Charsets.UTF_8).contains(textContains)
+                    val jsonAssertionMatches = normalizedJsonPath == null ||
+                        JsonPointerAssertions.matches(body!!, normalizedJsonPath, normalizedJsonExpectedValue!!)
                     val statusMatches = response.code in expectedStatusCodes
                     if (!statusMatches) {
                         return CheckResponse("DOWN", response.code, "HTTP_STATUS", "HTTP 状态码 ${response.code} 不符合期望", elapsedMillis(startedNanos), checkedAt.toString())
                     }
-                    if (!bodyContainsText) {
-                        return CheckResponse("DOWN", response.code, "ASSERTION_FAILED", "响应内容未包含配置的文本", elapsedMillis(startedNanos), checkedAt.toString())
+                    if (!bodyContainsText || !jsonAssertionMatches) {
+                        return CheckResponse("DOWN", response.code, "ASSERTION_FAILED", "响应内容断言未通过", elapsedMillis(startedNanos), checkedAt.toString())
                     }
                     return CheckResponse("UP", response.code, null, null, elapsedMillis(startedNanos), checkedAt.toString())
                 }
@@ -190,7 +227,7 @@ class HttpCheckService {
                 }
                 val (code, summary) = when (exception) {
                     is UnknownHostException -> "DNS_FAILURE" to "目标域名无法解析"
-                    is java.net.SocketTimeoutException -> "TIMEOUT" to "连接或读取超时"
+                    is InterruptedIOException -> "TIMEOUT" to "连接或读取超时"
                     is SSLHandshakeException -> "TLS_FAILURE" to "TLS 证书或握手校验失败"
                     else -> "NETWORK_FAILURE" to "无法连接目标服务"
                 }
@@ -208,6 +245,17 @@ class HttpCheckService {
         return uri.normalize()
     }
 
+    private fun sameOrigin(left: URI, right: URI): Boolean =
+        left.scheme.equals(right.scheme, ignoreCase = true) &&
+            left.host.equals(right.host, ignoreCase = true) &&
+            effectivePort(left) == effectivePort(right)
+
+    private fun effectivePort(uri: URI): Int = when {
+        uri.port != -1 -> uri.port
+        uri.scheme.equals("https", ignoreCase = true) -> 443
+        else -> 80
+    }
+
     private fun hasBlockedIpLiteral(host: String, allowedNetworks: List<IpNetwork>): Boolean {
         val unwrapped = host.removeSurrounding("[", "]")
         val isIpLiteral = ':' in unwrapped || unwrapped.all { it.isDigit() || it == '.' }
@@ -218,7 +266,7 @@ class HttpCheckService {
 
     private fun resolveAndValidate(hostname: String, targetHost: String, allowedNetworks: List<IpNetwork>): List<InetAddress> {
         if (!hostname.equals(targetHost, ignoreCase = true)) throw UnknownHostException("request attempted DNS lookup for an unexpected host")
-        val addresses = InetAddress.getAllByName(hostname).toList()
+        val addresses = addressResolver(hostname)
         if (addresses.isEmpty()) throw UnknownHostException("host returned no addresses")
         if (addresses.any { !addressAllowed(it, allowedNetworks) }) {
             throw UnknownHostException("address rejected by network policy")

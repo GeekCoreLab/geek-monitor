@@ -1,0 +1,6 @@
+[Unit]
+Description=Verify the completed 24-hour Geek Monitor Agent cadence window
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -u %h/codes/geek-monitor/scripts/verify-agent-cadence.py --since 2026-10-12T04:56:03+00:00 --duration-seconds 86400 --expected-agents 100 --db-container geek-monitor-agent-soak-db --jsonl-file %h/.local/state/geek-monitor/agent-cadence-24h.jsonl

@@ -1,8 +1,11 @@
 import 'dart:convert';
 
-import 'package:http/browser_client.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'src/http_client_factory_stub.dart'
+    if (dart.library.js_interop) 'src/http_client_factory_web.dart'
+    as http_client_factory;
 
 class ApiException implements Exception {
   const ApiException(this.message, {this.statusCode});
@@ -14,13 +17,69 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+class StatusStreamEvent {
+  const StatusStreamEvent({
+    required this.id,
+    required this.name,
+    required this.data,
+  });
+
+  final String id;
+  final String name;
+  final Map<String, dynamic> data;
+}
+
+Stream<StatusStreamEvent> parseServerSentEvents(Stream<List<int>> bytes) async* {
+  var lastEventId = '';
+  var eventName = 'message';
+  final dataLines = <String>[];
+
+  StatusStreamEvent? dispatch() {
+    if (dataLines.isEmpty) return null;
+    final decoded = jsonDecode(dataLines.join('\n'));
+    if (decoded is! Map) return null;
+    return StatusStreamEvent(
+      id: lastEventId,
+      name: eventName,
+      data: Map<String, dynamic>.from(decoded),
+    );
+  }
+
+  await for (final line in bytes.transform(utf8.decoder).transform(const LineSplitter())) {
+    if (line.isEmpty) {
+      final event = dispatch();
+      if (event != null) yield event;
+      dataLines.clear();
+      eventName = 'message';
+      continue;
+    }
+    if (line.startsWith(':')) continue;
+
+    final separator = line.indexOf(':');
+    final field = separator < 0 ? line : line.substring(0, separator);
+    var value = separator < 0 ? '' : line.substring(separator + 1);
+    if (value.startsWith(' ')) value = value.substring(1);
+    switch (field) {
+      case 'id':
+        if (!value.contains('\u0000')) lastEventId = value;
+      case 'event':
+        eventName = value.isEmpty ? 'message' : value;
+      case 'data':
+        dataLines.add(value);
+    }
+  }
+
+  final finalEvent = dispatch();
+  if (finalEvent != null) yield finalEvent;
+}
+
 class ApiClient {
   ApiClient();
 
   static const _emailKey = 'geek-monitor.last-email';
   static const _configuredBaseUrl = String.fromEnvironment('API_BASE_URL');
 
-  final BrowserClient _client = BrowserClient()..withCredentials = true;
+  final http.Client _client = http_client_factory.createHttpClient();
 
   Uri get _baseUri => Uri.parse(
     _configuredBaseUrl.isEmpty ? Uri.base.origin : _configuredBaseUrl,
@@ -152,6 +211,62 @@ class ApiClient {
     await _send(
       'DELETE',
       '/api/v1/projects/${Uri.encodeComponent(projectId)}/members/${Uri.encodeComponent(memberId)}',
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> projectCredentials(
+    String projectId,
+  ) async => _asMapList(
+    await _send(
+      'GET',
+      '/api/v1/projects/${Uri.encodeComponent(projectId)}/credentials',
+    ),
+  );
+
+  Future<Map<String, dynamic>> createProjectCredential({
+    required String projectId,
+    required String name,
+    required Map<String, String> headers,
+    required List<String> allowedOrigins,
+  }) async =>
+      (await _send(
+            'POST',
+            '/api/v1/projects/${Uri.encodeComponent(projectId)}/credentials',
+            body: {
+              'name': name,
+              'headers': headers,
+              'allowedOrigins': allowedOrigins,
+            },
+          ))
+          as Map<String, dynamic>;
+
+  Future<Map<String, dynamic>> updateProjectCredential({
+    required String projectId,
+    required String id,
+    required String name,
+    required Map<String, String> headers,
+    required List<String> allowedOrigins,
+    required int version,
+  }) async =>
+      (await _send(
+            'PATCH',
+            '/api/v1/projects/${Uri.encodeComponent(projectId)}/credentials/${Uri.encodeComponent(id)}',
+            body: {
+              'name': name,
+              'headers': headers,
+              'allowedOrigins': allowedOrigins,
+              'version': version,
+            },
+          ))
+          as Map<String, dynamic>;
+
+  Future<void> deleteProjectCredential({
+    required String projectId,
+    required String id,
+  }) async {
+    await _send(
+      'DELETE',
+      '/api/v1/projects/${Uri.encodeComponent(projectId)}/credentials/${Uri.encodeComponent(id)}',
     );
   }
 
@@ -311,6 +426,47 @@ class ApiClient {
         ? ''
         : '?status=${Uri.encodeQueryComponent(status)}';
     return _asMapList(await _send('GET', '/api/v1/incidents$query'));
+  }
+
+  Stream<StatusStreamEvent> statusEvents() async* {
+    String? lastEventId;
+    while (true) {
+      try {
+        final request = http.Request('GET', _baseUri.resolve('/api/v1/events/stream'))
+          ..headers['Accept'] = 'text/event-stream';
+        if (lastEventId != null && lastEventId.isNotEmpty) {
+          request.headers['Last-Event-ID'] = lastEventId;
+        }
+        final response = await _client.send(request).timeout(
+          const Duration(seconds: 20),
+        );
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          final body = await response.stream.bytesToString();
+          var message = '实时状态连接失败（${response.statusCode}）';
+          try {
+            final decoded = jsonDecode(body);
+            if (decoded is Map && decoded['message'] is String) {
+              message = decoded['message'] as String;
+            }
+          } catch (_) {
+            // Keep a short status-only message for non-JSON proxy responses.
+          }
+          throw ApiException(message, statusCode: response.statusCode);
+        }
+
+        await for (final event in parseServerSentEvents(response.stream)) {
+          if (event.id.isNotEmpty) lastEventId = event.id;
+          yield event;
+        }
+      } on ApiException catch (error) {
+        if (error.statusCode != null && error.statusCode! >= 400 && error.statusCode! < 500) {
+          rethrow;
+        }
+        await Future<void>.delayed(const Duration(seconds: 2));
+      } catch (_) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
+    }
   }
 
   Future<Map<String, dynamic>> acknowledgeIncident(

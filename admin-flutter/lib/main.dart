@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -5,7 +8,7 @@ import 'package:flutter/services.dart';
 import 'api_client.dart';
 
 void main() {
-  runApp(const GeekMonitorApp());
+  runApp(GeekMonitorApp());
 }
 
 const _ink = Color(0xFF182433);
@@ -17,16 +20,20 @@ const _red = Color(0xFFB42318);
 const _canvas = Color(0xFFF4F6F9);
 const _showDevCredentials =
     kDebugMode || bool.fromEnvironment('GEEK_MONITOR_DEV_CREDENTIALS');
+const _agentInstallScriptUrl =
+    'https://github.com/skyhhjmk/geek-monitor/releases/latest/download/install-agent.sh';
 
 class GeekMonitorApp extends StatefulWidget {
-  const GeekMonitorApp({super.key});
+  GeekMonitorApp({super.key, ApiClient? api}) : api = api ?? ApiClient();
+
+  final ApiClient api;
 
   @override
   State<GeekMonitorApp> createState() => _GeekMonitorAppState();
 }
 
 class _GeekMonitorAppState extends State<GeekMonitorApp> {
-  final _api = ApiClient();
+  ApiClient get _api => widget.api;
   _GateState _gate = _GateState.loading;
   Map<String, dynamic>? _user;
   String? _startupError;
@@ -67,7 +74,11 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
   }
 
   Future<void> _logout() async {
-    await _api.logout();
+    try {
+      await _api.logout();
+    } on ApiException catch (error) {
+      if (error.statusCode != 401) rethrow;
+    }
     if (!mounted) return;
     setState(() => _gate = _GateState.login);
   }
@@ -87,6 +98,7 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
         colorScheme: colorScheme,
         scaffoldBackgroundColor: _canvas,
         fontFamily: 'Roboto',
+        fontFamilyFallback: const ['NotoSansSC'],
         textTheme: ThemeData.light().textTheme.apply(
           bodyColor: _ink,
           displayColor: _ink,
@@ -820,11 +832,36 @@ class _DashboardShellState extends State<_DashboardShell> {
   List<Map<String, dynamic>> _agents = [];
   bool _loading = true;
   String? _loadError;
+  StreamSubscription<StatusStreamEvent>? _statusSubscription;
+  Timer? _statusRefreshTimer;
 
   @override
   void initState() {
     super.initState();
     _reload();
+    _statusSubscription = widget.api.statusEvents().listen(
+      (_) => _scheduleStatusRefresh(),
+      onError: (Object error) {
+        if (error is ApiException && error.statusCode == 401) {
+          unawaited(widget.onLogout());
+        }
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _statusRefreshTimer?.cancel();
+    _statusSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _scheduleStatusRefresh() {
+    if (!mounted) return;
+    _statusRefreshTimer?.cancel();
+    _statusRefreshTimer = Timer(const Duration(milliseconds: 350), () {
+      if (mounted) unawaited(_reload());
+    });
   }
 
   Future<void> _reload() async {
@@ -909,7 +946,11 @@ class _DashboardShellState extends State<_DashboardShell> {
     }
     final draft = await showDialog<_MonitorDraft>(
       context: context,
-      builder: (_) => _MonitorDialog(resources: _resources, existing: current),
+      builder: (_) => _MonitorDialog(
+        api: widget.api,
+        resources: _resources,
+        existing: current,
+      ),
     );
     if (draft == null) return;
     try {
@@ -1180,55 +1221,19 @@ class _DashboardShellState extends State<_DashboardShell> {
     try {
       final enrollment = await widget.api.createAgentEnrollment(resourceId);
       if (!mounted) return;
+      await _reload();
+      if (!mounted) return;
       final token = enrollment['token'] as String;
+      final resourceName =
+          hosts.firstWhere((item) => item['id'] == resourceId)['name']
+              as String? ??
+          '主机';
       showDialog<void>(
         context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('一次性 Agent 注册令牌'),
-          content: SizedBox(
-            width: 480,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  '令牌仅显示这一次，15 分钟后过期。请通过安全方式传到目标主机。',
-                  style: TextStyle(fontSize: 12, height: 1.5),
-                ),
-                const SizedBox(height: 12),
-                SelectableText(
-                  token,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '绑定资源：${hosts.firstWhere((item) => item['id'] == resourceId)['name']}',
-                  style: const TextStyle(color: _muted, fontSize: 11),
-                ),
-                Text(
-                  '过期时间：${_dateTime(enrollment['expiresAt'] as String?)}',
-                  style: const TextStyle(color: _muted, fontSize: 11),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton.icon(
-              onPressed: () async {
-                await Clipboard.setData(ClipboardData(text: token));
-                if (dialogContext.mounted) {
-                  Navigator.pop(dialogContext);
-                  _notice('注册令牌已复制，请安全保存');
-                }
-              },
-              icon: const Icon(Icons.copy_rounded, size: 17),
-              label: const Text('复制并关闭'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('关闭'),
-            ),
-          ],
+        builder: (_) => _AgentEnrollmentDialog(
+          token: token,
+          resourceName: resourceName,
+          expiresAt: enrollment['expiresAt'] as String?,
         ),
       );
     } catch (error) {
@@ -1382,7 +1387,7 @@ class _DashboardShellState extends State<_DashboardShell> {
         onCreateEnrollment: _createAgentEnrollment,
         onRevoke: _revokeAgent,
       ),
-      _Section.settings => _SystemSettingsPage(
+      _Section.settings => SystemSettingsPage(
         api: widget.api,
         isAdmin: widget.user['role'] == 'ADMIN',
       ),
@@ -2492,13 +2497,14 @@ class _AgentsPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => _PageScroll(
+    expand: true,
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _PageHeading(
           eyebrow: 'LINUX AGENTS',
           title: 'Agent 节点',
-          subtitle: '查看节点在线状态、配置版本并单独吊销节点凭据。',
+          subtitle: '注册 Linux Agent，并生成从 GitHub Release 安装的命令。',
           actions: [
             if (isAdmin)
               FilledButton.icon(
@@ -2517,7 +2523,7 @@ class _AgentsPage extends StatelessWidget {
                   children: [
                     const Expanded(
                       child: Text(
-                        '已注册节点',
+                        '节点列表',
                         style: TextStyle(
                           fontSize: 14,
                           fontWeight: FontWeight.w700,
@@ -2542,89 +2548,109 @@ class _AgentsPage extends StatelessWidget {
                     child: _EmptyState(
                       icon: Icons.memory_outlined,
                       title: '还没有 Agent 节点',
-                      subtitle: '为主机资源签发一次性注册令牌，然后在 Linux 主机运行采集器。',
+                      subtitle: '点击右上角“注册主机 Agent”。签发令牌后会显示可复制的 Linux 安装命令。',
                     ),
                   )
                 else
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: DataTable(
-                      columnSpacing: 22,
-                      headingRowHeight: 42,
-                      dataRowMinHeight: 58,
-                      dataRowMaxHeight: 66,
-                      columns: const [
-                        DataColumn(label: Text('主机资源')),
-                        DataColumn(label: Text('节点')),
-                        DataColumn(label: Text('操作系统')),
-                        DataColumn(label: Text('版本')),
-                        DataColumn(label: Text('状态')),
-                        DataColumn(label: Text('最后上报')),
-                        DataColumn(label: Text('')),
-                      ],
-                      rows: agents.map((agent) {
-                        final status = agent['status'] as String? ?? 'OFFLINE';
-                        return DataRow(
-                          cells: [
-                            DataCell(
-                              Text(
-                                agent['resourceName'] as String? ?? '主机',
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            DataCell(
-                              Text(
-                                agent['hostname'] as String? ?? '',
-                                style: const TextStyle(fontSize: 12),
-                              ),
-                            ),
-                            DataCell(
-                              Text(
-                                agent['operatingSystem'] as String? ?? '',
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: _muted,
-                                ),
-                              ),
-                            ),
-                            DataCell(
-                              Text(
-                                agent['agentVersion'] as String? ?? '',
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: _muted,
-                                ),
-                              ),
-                            ),
-                            DataCell(_AgentStatusTag(status: status)),
-                            DataCell(
-                              Text(
-                                _dateTime(agent['lastSeenAt'] as String?),
-                                style: const TextStyle(
-                                  fontSize: 10,
-                                  color: _muted,
-                                ),
-                              ),
-                            ),
-                            DataCell(
-                              isAdmin && status != 'REVOKED'
-                                  ? IconButton(
-                                      tooltip: '吊销凭据',
-                                      onPressed: () => onRevoke(agent),
-                                      icon: const Icon(
-                                        Icons.key_off_outlined,
-                                        size: 18,
+                  LayoutBuilder(
+                    builder: (context, constraints) => SizedBox(
+                      width: constraints.maxWidth,
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(
+                            minWidth: constraints.maxWidth,
+                          ),
+                          child: DataTable(
+                            columnSpacing: 22,
+                            headingRowHeight: 42,
+                            dataRowMinHeight: 58,
+                            dataRowMaxHeight: 66,
+                            columns: const [
+                              DataColumn(label: Text('主机资源')),
+                              DataColumn(label: Text('节点')),
+                              DataColumn(label: Text('操作系统')),
+                              DataColumn(label: Text('版本')),
+                              DataColumn(label: Text('状态')),
+                              DataColumn(label: Text('最后上报')),
+                              DataColumn(label: Text('')),
+                            ],
+                            rows: agents.map((agent) {
+                              final status =
+                                  agent['status'] as String? ?? 'OFFLINE';
+                              final lastActivity = switch (status) {
+                                'WAITING_INSTALL' =>
+                                  '令牌有效至 ${_dateTime(agent['expiresAt'] as String?)}',
+                                'INSTALL_EXPIRED' => '令牌已过期，可重新签发',
+                                _ => _dateTime(agent['lastSeenAt'] as String?),
+                              };
+                              return DataRow(
+                                cells: [
+                                  DataCell(
+                                    Text(
+                                      agent['resourceName'] as String? ?? '主机',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ),
+                                  DataCell(
+                                    Text(
+                                      agent['hostname'] as String? ?? '—',
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                  ),
+                                  DataCell(
+                                    Text(
+                                      agent['operatingSystem'] as String? ??
+                                          '—',
+                                      style: const TextStyle(
+                                        fontSize: 11,
                                         color: _muted,
                                       ),
-                                    )
-                                  : const SizedBox(width: 32),
-                            ),
-                          ],
-                        );
-                      }).toList(),
+                                    ),
+                                  ),
+                                  DataCell(
+                                    Text(
+                                      agent['agentVersion'] as String? ?? '—',
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        color: _muted,
+                                      ),
+                                    ),
+                                  ),
+                                  DataCell(_AgentStatusTag(status: status)),
+                                  DataCell(
+                                    Text(
+                                      lastActivity,
+                                      style: const TextStyle(
+                                        fontSize: 10,
+                                        color: _muted,
+                                      ),
+                                    ),
+                                  ),
+                                  DataCell(
+                                    isAdmin &&
+                                            (status == 'ONLINE' ||
+                                                status == 'OFFLINE')
+                                        ? IconButton(
+                                            tooltip: '吊销凭据',
+                                            onPressed: () => onRevoke(agent),
+                                            icon: const Icon(
+                                              Icons.key_off_outlined,
+                                              size: 18,
+                                              color: _muted,
+                                            ),
+                                          )
+                                        : const SizedBox(width: 32),
+                                  ),
+                                ],
+                              );
+                            }).toList(),
+                          ),
+                        ),
+                      ),
                     ),
                   ),
               ],
@@ -2645,11 +2671,15 @@ class _AgentStatusTag extends StatelessWidget {
     final color = switch (status) {
       'ONLINE' => const Color(0xFF2C8B66),
       'REVOKED' => const Color(0xFF963F38),
+      'INSTALL_EXPIRED' => const Color(0xFF963F38),
+      'WAITING_INSTALL' => const Color(0xFFAA7514),
       _ => const Color(0xFF7B8794),
     };
     final label = switch (status) {
-      'ONLINE' => '在线',
+      'ONLINE' => '正常',
       'REVOKED' => '已吊销',
+      'WAITING_INSTALL' => '等待安装',
+      'INSTALL_EXPIRED' => '令牌已过期',
       _ => '离线',
     };
     return Container(
@@ -2691,7 +2721,7 @@ class _AgentResourceDialogState extends State<_AgentResourceDialog> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text(
-            '选择要绑定的主机资源。令牌一次有效，15 分钟后过期。',
+            '选择要绑定的主机资源。继续后会签发 15 分钟内有效的一次性令牌，并生成可复制的 Linux 安装命令。',
             style: TextStyle(fontSize: 12, height: 1.5),
           ),
           const SizedBox(height: 14),
@@ -2722,11 +2752,175 @@ class _AgentResourceDialogState extends State<_AgentResourceDialog> {
       ),
       FilledButton(
         onPressed: () => Navigator.pop(context, _resourceId),
-        child: const Text('签发令牌'),
+        child: const Text('签发令牌并生成命令'),
       ),
     ],
   );
 }
+
+class _AgentEnrollmentDialog extends StatefulWidget {
+  const _AgentEnrollmentDialog({
+    required this.token,
+    required this.resourceName,
+    required this.expiresAt,
+  });
+
+  final String token;
+  final String resourceName;
+  final String? expiresAt;
+
+  @override
+  State<_AgentEnrollmentDialog> createState() => _AgentEnrollmentDialogState();
+}
+
+class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
+  late final TextEditingController _serverController = TextEditingController(
+    text: Uri.base.origin,
+  );
+
+  String? get _serverUrl {
+    final value = _serverController.text.trim();
+    final uri = Uri.tryParse(value);
+    final authorityIsSafe =
+        uri != null &&
+        (RegExp(r'^[A-Za-z0-9.-]+(:[0-9]{1,5})?$').hasMatch(uri.authority) ||
+            RegExp(
+              r'^\[[0-9A-Fa-f:]+\](:[0-9]{1,5})?$',
+            ).hasMatch(uri.authority));
+    final pathIsSafe =
+        uri != null && RegExp(r'^(/[A-Za-z0-9._/-]*)?$').hasMatch(uri.path);
+    if (uri == null ||
+        uri.host.isEmpty ||
+        uri.userInfo.isNotEmpty ||
+        uri.hasQuery ||
+        uri.hasFragment ||
+        !authorityIsSafe ||
+        !pathIsSafe ||
+        (uri.scheme != 'https' &&
+            !(uri.scheme == 'http' &&
+                const {'localhost', '127.0.0.1', '::1'}.contains(uri.host)))) {
+      return null;
+    }
+    final path = uri.path.replaceFirst(RegExp(r'/+$'), '');
+    final normalized = uri.replace(path: path).toString();
+    return normalized.endsWith('/')
+        ? normalized.substring(0, normalized.length - 1)
+        : normalized;
+  }
+
+  String get _installCommand =>
+      'curl -fsSL $_agentInstallScriptUrl | sudo bash -s -- --server '
+      '${_shellQuote(_serverUrl!)}';
+
+  @override
+  void dispose() {
+    _serverController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _copy(String value, String message) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final serverUrl = _serverUrl;
+    return AlertDialog(
+      title: const Text('安装 Linux Agent'),
+      content: SizedBox(
+        width: 560,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '绑定资源：${widget.resourceName}',
+                style: const TextStyle(color: _muted, fontSize: 11),
+              ),
+              Text(
+                '注册令牌 15 分钟后过期：${_dateTime(widget.expiresAt)}',
+                style: const TextStyle(color: _muted, fontSize: 11),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: _serverController,
+                onChanged: (_) => setState(() {}),
+                decoration: const InputDecoration(
+                  labelText: '监控中心地址',
+                  hintText: 'https://monitor.example.com',
+                  helperText: '目标主机必须能访问此地址；生产环境请使用 HTTPS。',
+                ),
+                keyboardType: TextInputType.url,
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                '在目标 Linux 主机执行以下命令。命令不含注册令牌；运行时会在终端隐藏提示输入。',
+                style: TextStyle(fontSize: 12, height: 1.5),
+              ),
+              const SizedBox(height: 8),
+              if (serverUrl == null)
+                const Text(
+                  '请输入 HTTPS 地址；HTTP 仅允许 localhost、127.0.0.1 或 ::1。',
+                  style: TextStyle(color: _red, fontSize: 11),
+                )
+              else
+                SelectableText(
+                  _installCommand,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    height: 1.5,
+                  ),
+                ),
+              const SizedBox(height: 8),
+              const Text(
+                '安装脚本从 GitHub 最新 Release 下载 Linux amd64/arm64 二进制并校验 SHA-256，然后创建受限系统账号和 systemd 服务。',
+                style: TextStyle(color: _muted, fontSize: 11, height: 1.45),
+              ),
+              const Divider(height: 24),
+              const Text(
+                '一次性注册令牌（请安全传到目标主机）',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 6),
+              SelectableText(
+                widget.token,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton.icon(
+          onPressed: serverUrl == null
+              ? null
+              : () => _copy(_installCommand, '安装命令已复制'),
+          icon: const Icon(Icons.terminal_rounded, size: 17),
+          label: const Text('复制安装命令'),
+        ),
+        TextButton.icon(
+          onPressed: () => _copy(widget.token, '注册令牌已复制，请安全传递'),
+          icon: const Icon(Icons.key_rounded, size: 17),
+          label: const Text('复制令牌'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('关闭'),
+        ),
+      ],
+    );
+  }
+}
+
+// The accepted server URL is restricted to characters that are safe inside quotes.
+String _shellQuote(String value) =>
+    String.fromCharCode(39) + value + String.fromCharCode(39);
 
 class _MetricsDialog extends StatefulWidget {
   const _MetricsDialog({
@@ -3044,6 +3238,10 @@ String _metricName(String value) => switch (value) {
   'database_connections' => '数据库当前连接数（个）',
   'database_connection_limit' => '数据库连接上限（个）',
   'database_connections_percent' => '数据库连接使用率（%）',
+  'redis_memory_used_bytes' => 'Redis 已使用内存（字节）',
+  'redis_memory_limit_bytes' => 'Redis 内存上限（字节）',
+  'redis_memory_used_percent' => 'Redis 内存使用率（%）',
+  'redis_evicted_keys_total' => 'Redis 已淘汰键累计数（个）',
   _ => value,
 };
 
@@ -3449,17 +3647,17 @@ class _ProjectMemberDialogState extends State<_ProjectMemberDialog> {
   );
 }
 
-class _SystemSettingsPage extends StatefulWidget {
-  const _SystemSettingsPage({required this.api, required this.isAdmin});
+class SystemSettingsPage extends StatefulWidget {
+  const SystemSettingsPage({super.key, required this.api, required this.isAdmin});
 
   final ApiClient api;
   final bool isAdmin;
 
   @override
-  State<_SystemSettingsPage> createState() => _SystemSettingsPageState();
+  State<SystemSettingsPage> createState() => _SystemSettingsPageState();
 }
 
-class _SystemSettingsPageState extends State<_SystemSettingsPage> {
+class _SystemSettingsPageState extends State<SystemSettingsPage> {
   Map<String, dynamic>? _status;
   List<Map<String, dynamic>> _auditEntries = [];
   Map<String, dynamic>? _nextCursor;
@@ -3585,6 +3783,28 @@ class _SystemSettingsPageState extends State<_SystemSettingsPage> {
               ),
             )
           else if (_status != null) ...[
+            if (_error != null) ...[
+              Card(
+                color: _amber.withValues(alpha: 0.08),
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.warning_amber_rounded, color: _amber),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          '最新状态刷新失败，以下内容是上次成功读取的快照。${_error!}',
+                          style: const TextStyle(color: _amber, fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
             _systemOverviewCard(_status!),
             const SizedBox(height: 14),
             _retentionCard(_status!['retentionPolicies'] as List? ?? const []),
@@ -3600,6 +3820,35 @@ class _SystemSettingsPageState extends State<_SystemSettingsPage> {
     final databaseBytes = status['databaseSizeBytes'] as num? ?? 0;
     final version = status['schemaVersion'] as String? ?? '未知';
     final backup = Map<String, dynamic>.from(status['backup'] as Map);
+    final platform = status['platformHealth'] is Map
+        ? Map<String, dynamic>.from(status['platformHealth'] as Map)
+        : <String, dynamic>{};
+    final retention = platform['retention'] is Map
+        ? Map<String, dynamic>.from(platform['retention'] as Map)
+        : <String, dynamic>{};
+    final platformState = platform['status'] as String? ?? 'UNKNOWN';
+    final (platformLabel, platformColor) = switch (platformState) {
+      'HEALTHY' => ('平台采集正常', _green),
+      'DEGRADED' => ('平台存在异常', _red),
+      _ => ('平台状态未知', _amber),
+    };
+    final attempts = platform['notificationAttempts24h'] as num? ?? 0;
+    final delivered = platform['notificationDelivered24h'] as num? ?? 0;
+    final notificationRate = platform['notificationSuccessRate24h'] as num?;
+    final retentionState = retention['status'] as String? ?? 'NOT_RUN';
+    final retentionLabel = switch (retentionState) {
+      'CURRENT' => '最近一次成功',
+      'RUNNING' => '正在运行',
+      'FAILED' => '连续失败 ${retention['consecutiveFailures'] ?? 1} 次',
+      _ => '进程启动后尚未成功运行',
+    };
+    final retentionDetails = [
+      retentionLabel,
+      if (retention['lastSuccessAt'] is String)
+        _formatSystemTime(retention['lastSuccessAt'] as String),
+      if (retention['lastFailureType'] is String && retentionState == 'FAILED')
+        retention['lastFailureType'] as String,
+    ].join(' · ');
     final backupState = backup['status'] as String? ?? 'NOT_RECORDED';
     final (backupLabel, backupColor) = switch (backupState) {
       'CURRENT' => ('24 小时内有备份记录', _green),
@@ -3637,13 +3886,13 @@ class _SystemSettingsPageState extends State<_SystemSettingsPage> {
                     vertical: 5,
                   ),
                   decoration: BoxDecoration(
-                    color: _green.withValues(alpha: 0.12),
+                    color: platformColor.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(20),
                   ),
-                  child: const Text(
-                    '数据库连接正常',
+                  child: Text(
+                    platformLabel,
                     style: TextStyle(
-                      color: _green,
+                      color: platformColor,
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
@@ -3666,6 +3915,43 @@ class _SystemSettingsPageState extends State<_SystemSettingsPage> {
                   value: _formatSystemTime(
                     status['generatedAt'] as String? ?? '',
                   ),
+                ),
+                _SystemValue(
+                  label: '到期检查积压',
+                  value: '${platform['dueChecks'] ?? '—'}',
+                ),
+                _SystemValue(
+                  label: '最久调度延迟',
+                  value: '${platform['oldestScheduleDelaySeconds'] ?? '—'} 秒',
+                ),
+                _SystemValue(
+                  label: '过期检查结果',
+                  value:
+                      '${platform['staleChecks'] ?? '—'} / ${platform['enabledChecks'] ?? '—'}',
+                ),
+                _SystemValue(
+                  label: '运行中检查',
+                  value: '${platform['runningChecks'] ?? '—'}',
+                ),
+                _SystemValue(
+                  label: '近 1 小时规则处理 P95',
+                  value: platform['recentResultP95LatencyMs'] is num
+                      ? '${(platform['recentResultP95LatencyMs'] as num).toStringAsFixed(0)} ms'
+                      : '暂无样本',
+                ),
+                _SystemValue(
+                  label: 'Agent 批次拒绝（进程启动后）',
+                  value: '${platform['rejectedAgentBatchesSinceStart'] ?? '—'}',
+                ),
+                _SystemValue(
+                  label: '通知 24 小时送达率',
+                  value: notificationRate == null
+                      ? '暂无投递（$delivered / $attempts）'
+                      : '${notificationRate.toStringAsFixed(1)}%（$delivered / $attempts）',
+                ),
+                _SystemValue(
+                  label: '数据清理任务',
+                  value: retentionDetails,
                 ),
               ],
             ),
@@ -5405,6 +5691,8 @@ class _MonitorDraft {
     required this.name,
     required this.target,
     required this.method,
+    required this.allowPostNoSideEffects,
+    required this.credentialId,
     required this.port,
     required this.recordType,
     required this.resolver,
@@ -5429,6 +5717,9 @@ class _MonitorDraft {
     required this.reminderIntervalMinutes,
     required this.expectedStatusCodes,
     required this.textContains,
+    required this.jsonPath,
+    required this.jsonExpectedValue,
+    required this.requestHeaders,
     required this.critical,
     required this.enabled,
   });
@@ -5438,6 +5729,8 @@ class _MonitorDraft {
   final String name;
   final String target;
   final String method;
+  final bool allowPostNoSideEffects;
+  final String credentialId;
   final int? port;
   final String? recordType;
   final String? resolver;
@@ -5462,6 +5755,9 @@ class _MonitorDraft {
   final int reminderIntervalMinutes;
   final List<int> expectedStatusCodes;
   final String? textContains;
+  final String? jsonPath;
+  final String? jsonExpectedValue;
+  final Map<String, String> requestHeaders;
   final bool critical;
   final bool enabled;
 
@@ -5498,8 +5794,13 @@ class _MonitorDraft {
     if (type == 'HTTP') ...{
       'targetUrl': target,
       'method': method,
+      'allowPostNoSideEffects': method == 'POST' && allowPostNoSideEffects,
+      'credentialId': credentialId,
       'expectedStatusCodes': expectedStatusCodes,
       'textContains': textContains,
+      'jsonPath': jsonPath,
+      'jsonExpectedValue': jsonExpectedValue,
+      'requestHeaders': requestHeaders,
     },
     if (type == 'TCP') ...{'targetHost': target, 'port': port},
     if (type == 'DNS') ...{
@@ -5516,8 +5817,227 @@ class _MonitorDraft {
   };
 }
 
+class _ProjectCredentialDraft {
+  const _ProjectCredentialDraft({
+    required this.name,
+    required this.headers,
+    required this.allowedOrigins,
+  });
+
+  final String name;
+  final Map<String, String> headers;
+  final List<String> allowedOrigins;
+}
+
+class _ProjectCredentialDialog extends StatefulWidget {
+  const _ProjectCredentialDialog({this.credential});
+
+  final Map<String, dynamic>? credential;
+
+  @override
+  State<_ProjectCredentialDialog> createState() =>
+      _ProjectCredentialDialogState();
+}
+
+class _ProjectCredentialDialogState extends State<_ProjectCredentialDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final _name = TextEditingController(
+    text: widget.credential?['name'] as String? ?? '',
+  );
+  late final _headers = TextEditingController(
+    text: ((widget.credential?['headerNames'] as List?) ?? const [])
+        .map((name) => '$name: ')
+        .join('\n'),
+  );
+  late final _allowedOrigins = TextEditingController(
+    text: ((widget.credential?['allowedOrigins'] as List?) ?? const []).join(
+      '\n',
+    ),
+  );
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _headers.dispose();
+    _allowedOrigins.dispose();
+    super.dispose();
+  }
+
+  Map<String, String>? _parseHeaders() {
+    final parsed = <String, String>{};
+    final seen = <String>{};
+    for (final line in _headers.text.split('\n')) {
+      if (line.trim().isEmpty) continue;
+      final separator = line.indexOf(':');
+      if (separator <= 0) return null;
+      final name = line.substring(0, separator).trim();
+      final value = line.substring(separator + 1).trim();
+      final normalized = name.toLowerCase();
+      if (name.length > 128 ||
+          !RegExp(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$").hasMatch(name) ||
+          const {
+            'host',
+            'content-length',
+            'transfer-encoding',
+            'connection',
+            'keep-alive',
+            'proxy-authenticate',
+            'proxy-authorization',
+            'proxy-connection',
+            'te',
+            'trailer',
+            'upgrade',
+          }.contains(normalized) ||
+          normalized.startsWith('proxy-') ||
+          value.length > 4096 ||
+          value.codeUnits.any(
+            (code) => code < 32 || (code >= 127 && code <= 159),
+          ) ||
+          !seen.add(normalized)) {
+        return null;
+      }
+      parsed[normalized] = value;
+    }
+    if (parsed.length > 32 ||
+        parsed.entries.fold<int>(
+              0,
+              (total, entry) => total + entry.key.length + entry.value.length,
+            ) >
+            16384) {
+      return null;
+    }
+    if (widget.credential == null &&
+        (parsed.isEmpty || parsed.values.every((value) => value.isEmpty))) {
+      return null;
+    }
+    return parsed;
+  }
+
+  List<String>? _parseAllowedOrigins() {
+    final origins = <String>{};
+    for (final line in _allowedOrigins.text.split('\n')) {
+      final value = line.trim();
+      if (value.isEmpty) continue;
+      final uri = Uri.tryParse(value);
+      if (uri == null ||
+          !uri.hasAuthority ||
+          !{'http', 'https'}.contains(uri.scheme.toLowerCase()) ||
+          uri.host.isEmpty ||
+          uri.userInfo.isNotEmpty ||
+          !{'', '/'}.contains(uri.path) ||
+          uri.hasQuery ||
+          uri.hasFragment) {
+        return null;
+      }
+      final port = uri.hasPort ? uri.port : null;
+      if (port != null && (port < 1 || port > 65535)) return null;
+      final scheme = uri.scheme.toLowerCase();
+      final defaultPort =
+          (scheme == 'http' && port == 80) ||
+          (scheme == 'https' && port == 443);
+      final host = uri.host.toLowerCase();
+      final formattedHost = host.contains(':') && !host.startsWith('[')
+          ? '[$host]'
+          : host;
+      origins.add(
+        '$scheme://$formattedHost${port == null || defaultPort ? '' : ':$port'}',
+      );
+    }
+    if (origins.isEmpty || origins.length > 32) return null;
+    return origins.toList();
+  }
+
+  void _save() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.pop(
+      context,
+      _ProjectCredentialDraft(
+        name: _name.text.trim(),
+        headers: _parseHeaders()!,
+        allowedOrigins: _parseAllowedOrigins()!,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.credential == null ? '新建项目共享凭据' : '编辑项目共享凭据'),
+    content: SizedBox(
+      width: 520,
+      child: SingleChildScrollView(
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: _name,
+                maxLength: 100,
+                decoration: const InputDecoration(labelText: '凭据名称'),
+                validator: (value) => value == null || value.trim().isEmpty
+                    ? '请输入凭据名称'
+                    : value.trim().length > 100
+                    ? '名称不能超过 100 个字符'
+                    : null,
+              ),
+              const SizedBox(height: 8),
+              TextFormField(
+                controller: _headers,
+                maxLength: 16384,
+                minLines: 4,
+                maxLines: 8,
+                decoration: InputDecoration(
+                  labelText: 'HTTP 请求头',
+                  hintText: 'Authorization: Bearer …\nX-API-Key: …',
+                  helperText: widget.credential == null
+                      ? '每行填写 Name: value。仅保存 AES-GCM 密文；创建后不会再次显示明文。'
+                      : '已保存的值不回显。留空保留原值，删除整行移除该请求头。',
+                  helperMaxLines: 3,
+                  alignLabelWithHint: true,
+                ),
+                validator: (_) =>
+                    _parseHeaders() == null ? '请求头格式无效、为空、重复或超过限制' : null,
+              ),
+              const SizedBox(height: 8),
+              TextFormField(
+                controller: _allowedOrigins,
+                maxLength: 4096,
+                minLines: 2,
+                maxLines: 5,
+                decoration: const InputDecoration(
+                  labelText: '授权源站范围',
+                  hintText:
+                      'https://api.example.com\nhttps://login.example.com:8443',
+                  helperText: '每行一个精确源站（协议、主机和端口）。请求头只会发送到这些源站。',
+                  helperMaxLines: 2,
+                  alignLabelWithHint: true,
+                ),
+                validator: (_) => _parseAllowedOrigins() == null
+                    ? '至少填写一个有效源站，最多 32 个；不要填写路径、查询参数或片段'
+                    : null,
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('取消'),
+      ),
+      FilledButton(onPressed: _save, child: const Text('保存凭据')),
+    ],
+  );
+}
+
 class _MonitorDialog extends StatefulWidget {
-  const _MonitorDialog({required this.resources, this.existing});
+  const _MonitorDialog({
+    required this.api,
+    required this.resources,
+    this.existing,
+  });
+  final ApiClient api;
   final List<Map<String, dynamic>> resources;
   final Map<String, dynamic>? existing;
 
@@ -5536,6 +6056,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
           )['id']
           as String);
   late String _method = widget.existing?['method'] as String? ?? 'GET';
+  late bool _allowPostNoSideEffects =
+      widget.existing?['allowPostNoSideEffects'] as bool? ?? false;
+  late String _credentialId = widget.existing?['credentialId'] as String? ?? '';
+  List<Map<String, dynamic>> _projectCredentials = [];
+  bool _credentialsLoading = false;
+  String? _credentialsError;
   late String _recordType = widget.existing?['recordType'] as String? ?? 'A';
   late String _metricName =
       widget.existing?['metricName'] as String? ?? 'cpu_usage_percent';
@@ -5612,10 +6138,186 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   late final _contains = TextEditingController(
     text: widget.existing?['textContains'] as String? ?? '',
   );
+  late final _jsonPath = TextEditingController(
+    text: widget.existing?['jsonPath'] as String? ?? '',
+  );
+  late final _jsonExpectedValue = TextEditingController(
+    text: widget.existing?['jsonExpectedValue'] as String? ?? '',
+  );
+  late final _requestHeaders = TextEditingController(
+    text: (widget.existing?['requestHeaders'] as Map? ?? const {}).keys
+        .map((name) => '$name: ')
+        .join('\n'),
+  );
   late bool _critical = widget.existing?['critical'] as bool? ?? true;
   late bool _enabled = widget.existing?['enabled'] as bool? ?? true;
   late bool _databaseTls =
       (widget.existing?['databaseTls'] as bool?) ?? (_type == 'MYSQL');
+
+  @override
+  void initState() {
+    super.initState();
+    _reloadProjectCredentials();
+  }
+
+  String? _projectIdForResource([String? resourceId]) {
+    final selected = widget.resources.firstWhere(
+      (resource) => resource['id'] == (resourceId ?? _resourceId),
+      orElse: () => const <String, dynamic>{},
+    );
+    return selected['projectId'] as String?;
+  }
+
+  Future<void> _reloadProjectCredentials() async {
+    final projectId = _projectIdForResource();
+    if (projectId == null) {
+      setState(() {
+        _projectCredentials = [];
+        _credentialsError = '无法确定资源所属项目';
+        _credentialsLoading = false;
+      });
+      return;
+    }
+    setState(() {
+      _credentialsLoading = true;
+      _credentialsError = null;
+    });
+    try {
+      final values = await widget.api.projectCredentials(projectId);
+      if (!mounted) return;
+      setState(() {
+        _projectCredentials = values;
+        _credentialsLoading = false;
+        if (_credentialId.isNotEmpty &&
+            !values.any((credential) => credential['id'] == _credentialId)) {
+          _credentialId = '';
+        }
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _credentialsError = error.toString();
+        _credentialsLoading = false;
+      });
+    }
+  }
+
+  Future<void> _createProjectCredential() async {
+    final projectId = _projectIdForResource();
+    if (projectId == null) return;
+    final draft = await showDialog<_ProjectCredentialDraft>(
+      context: context,
+      builder: (_) => const _ProjectCredentialDialog(),
+    );
+    if (draft == null) return;
+    try {
+      final credential = await widget.api.createProjectCredential(
+        projectId: projectId,
+        name: draft.name,
+        headers: draft.headers,
+        allowedOrigins: draft.allowedOrigins,
+      );
+      await _reloadProjectCredentials();
+      if (!mounted) return;
+      setState(() => _credentialId = credential['id'] as String);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('项目共享凭据已创建并选中')));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    }
+  }
+
+  Future<void> _editProjectCredential() async {
+    final projectId = _projectIdForResource();
+    final credential = _projectCredentials
+        .cast<Map<String, dynamic>?>()
+        .firstWhere(
+          (value) => value?['id'] == _credentialId,
+          orElse: () => null,
+        );
+    if (projectId == null || credential == null) return;
+    final draft = await showDialog<_ProjectCredentialDraft>(
+      context: context,
+      builder: (_) => _ProjectCredentialDialog(credential: credential),
+    );
+    if (draft == null) return;
+    try {
+      await widget.api.updateProjectCredential(
+        projectId: projectId,
+        id: _credentialId,
+        name: draft.name,
+        headers: draft.headers,
+        allowedOrigins: draft.allowedOrigins,
+        version: credential['version'] as int,
+      );
+      await _reloadProjectCredentials();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('项目共享凭据已更新')));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    }
+  }
+
+  Future<void> _deleteProjectCredential() async {
+    final projectId = _projectIdForResource();
+    final credential = _projectCredentials
+        .cast<Map<String, dynamic>?>()
+        .firstWhere(
+          (value) => value?['id'] == _credentialId,
+          orElse: () => null,
+        );
+    if (projectId == null || credential == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('删除项目共享凭据？'),
+        content: Text('“${credential['name']}”将被删除。仍被监控项引用时，服务端会拒绝删除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await widget.api.deleteProjectCredential(
+        projectId: projectId,
+        id: _credentialId,
+      );
+      if (!mounted) return;
+      setState(() => _credentialId = '');
+      await _reloadProjectCredentials();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('项目共享凭据已删除')));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    }
+  }
 
   String _statusText(List? codes) {
     if (codes == null || codes.isEmpty) return '200-299';
@@ -5649,6 +6351,9 @@ class _MonitorDialogState extends State<_MonitorDialog> {
     _reminderInterval.dispose();
     _statuses.dispose();
     _contains.dispose();
+    _jsonPath.dispose();
+    _jsonExpectedValue.dispose();
+    _requestHeaders.dispose();
     super.dispose();
   }
 
@@ -5724,6 +6429,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         _resourceId = compatibleResource['id'] as String;
       }
     });
+    _reloadProjectCredentials();
   }
 
   @override
@@ -5752,7 +6458,11 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                       ),
                     )
                     .toList(),
-                onChanged: (value) => setState(() => _resourceId = value!),
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() => _resourceId = value);
+                  _reloadProjectCredentials();
+                },
               ),
               const SizedBox(height: 11),
               DropdownButtonFormField<String>(
@@ -5865,6 +6575,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                         items: const [
                           DropdownMenuItem(value: 'GET', child: Text('GET')),
                           DropdownMenuItem(value: 'HEAD', child: Text('HEAD')),
+                          DropdownMenuItem(value: 'POST', child: Text('POST')),
                         ],
                         onChanged: (value) {
                           if (value != null) setState(() => _method = value);
@@ -5886,6 +6597,25 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     ),
                   ],
                 ),
+                if (_method == 'POST') ...[
+                  const SizedBox(height: 6),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: _allowPostNoSideEffects,
+                    onChanged: (value) => setState(
+                      () => _allowPostNoSideEffects = value ?? false,
+                    ),
+                    title: const Text(
+                      '我确认此 URL 是无副作用的检查端点',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                    subtitle: const Text(
+                      '请求不会携带正文，但 POST 仍可能触发服务器写操作。未确认时不能保存。',
+                      style: TextStyle(fontSize: 10),
+                    ),
+                    controlAffinity: ListTileControlAffinity.leading,
+                  ),
+                ],
                 const SizedBox(height: 11),
                 TextFormField(
                   controller: _contains,
@@ -5893,6 +6623,110 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                   decoration: const InputDecoration(
                     labelText: '响应内容必须包含（可选）',
                     hintText: '例：service is healthy',
+                  ),
+                ),
+                const SizedBox(height: 11),
+                TextFormField(
+                  controller: _jsonPath,
+                  maxLength: 256,
+                  decoration: const InputDecoration(
+                    labelText: 'JSON 路径（JSON Pointer，可选）',
+                    hintText: '/status/ready',
+                  ),
+                ),
+                const SizedBox(height: 11),
+                TextFormField(
+                  controller: _jsonExpectedValue,
+                  maxLength: 500,
+                  minLines: 1,
+                  maxLines: 3,
+                  decoration: const InputDecoration(
+                    labelText: 'JSON 期望值（JSON 字面量）',
+                    hintText: 'true、200 或 "ok"',
+                    helperText: '路径和期望值需同时填写；与正文包含同时设置时，两项都必须匹配。',
+                  ),
+                  validator: (_) => _validateJsonAssertion(),
+                ),
+                const SizedBox(height: 11),
+                TextFormField(
+                  controller: _requestHeaders,
+                  maxLength: 16384,
+                  minLines: 3,
+                  maxLines: 6,
+                  decoration: const InputDecoration(
+                    labelText: '自定义请求头（可选）',
+                    hintText: 'Accept-Language: zh-CN\nAuthorization: Bearer …',
+                    helperText:
+                        '每行填写 Name: value。值会加密保存且读取时隐藏；编辑时留空保留原值，删除整行可移除。',
+                    alignLabelWithHint: true,
+                  ),
+                  validator: (_) =>
+                      _parseRequestHeaders() == null ? '请求头格式无效、重复或超过限制' : null,
+                ),
+                const SizedBox(height: 11),
+                DropdownButtonFormField<String>(
+                  initialValue: _credentialId,
+                  decoration: InputDecoration(
+                    labelText: '项目共享 HTTP 凭据',
+                    helperText:
+                        _credentialsError ?? '凭据仅在此项目内可用；同名自定义请求头会覆盖共享值。',
+                    helperMaxLines: 2,
+                  ),
+                  items: [
+                    const DropdownMenuItem(value: '', child: Text('不使用共享凭据')),
+                    if (_credentialId.isNotEmpty &&
+                        !_projectCredentials.any(
+                          (credential) => credential['id'] == _credentialId,
+                        ))
+                      DropdownMenuItem(
+                        value: _credentialId,
+                        child: Text(_credentialsLoading ? '正在加载凭据…' : '凭据不可用'),
+                      ),
+                    ..._projectCredentials.map(
+                      (credential) => DropdownMenuItem(
+                        value: credential['id'] as String,
+                        child: Text(
+                          '${credential['name']} · ${(credential['headerNames'] as List? ?? const []).join(', ')}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                  ],
+                  onChanged: (value) =>
+                      setState(() => _credentialId = value ?? ''),
+                ),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Wrap(
+                    spacing: 4,
+                    children: [
+                      TextButton.icon(
+                        onPressed: _credentialsLoading
+                            ? null
+                            : _createProjectCredential,
+                        icon: const Icon(Icons.key_outlined, size: 16),
+                        label: const Text('新建共享凭据'),
+                      ),
+                      if (_credentialId.isNotEmpty &&
+                          _projectCredentials.any(
+                            (credential) => credential['id'] == _credentialId,
+                          )) ...[
+                        TextButton.icon(
+                          onPressed: _credentialsLoading
+                              ? null
+                              : _editProjectCredential,
+                          icon: const Icon(Icons.edit_outlined, size: 16),
+                          label: const Text('编辑凭据'),
+                        ),
+                        TextButton.icon(
+                          onPressed: _credentialsLoading
+                              ? null
+                              : _deleteProjectCredential,
+                          icon: const Icon(Icons.delete_outline, size: 16),
+                          label: const Text('删除凭据'),
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ] else if (_type != 'HEARTBEAT') ...[
@@ -6337,6 +7171,12 @@ class _MonitorDialogState extends State<_MonitorDialog> {
 
   void _submit() {
     if (!_formKey.currentState!.validate()) return;
+    if (_type == 'HTTP' && _method == 'POST' && !_allowPostNoSideEffects) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('使用 POST 前请确认目标端点无副作用')));
+      return;
+    }
     final selectedResource = widget.resources.firstWhere(
       (resource) => resource['id'] == _resourceId,
       orElse: () => const <String, dynamic>{},
@@ -6400,6 +7240,8 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         name: _name.text.trim(),
         target: _target.text.trim(),
         method: _method,
+        allowPostNoSideEffects: _allowPostNoSideEffects,
+        credentialId: _credentialId,
         port:
             _type == 'TCP' ||
                 _type == 'TLS' ||
@@ -6450,10 +7292,72 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         textContains: _contains.text.trim().isEmpty
             ? null
             : _contains.text.trim(),
+        jsonPath: _jsonPath.text.trim().isEmpty ? null : _jsonPath.text.trim(),
+        jsonExpectedValue: _jsonExpectedValue.text.trim().isEmpty
+            ? null
+            : _jsonExpectedValue.text.trim(),
+        requestHeaders: _parseRequestHeaders()!,
         critical: _critical,
         enabled: _enabled,
       ),
     );
+  }
+
+  String? _validateJsonAssertion() {
+    final path = _jsonPath.text.trim();
+    final expected = _jsonExpectedValue.text.trim();
+    if (path.isEmpty && expected.isEmpty) return null;
+    if (path.isEmpty || expected.isEmpty) return 'JSON 路径和期望值必须同时填写';
+    if (!path.startsWith('/') ||
+        path.length > 256 ||
+        RegExp(r'~(?![01])').hasMatch(path)) {
+      return 'JSON Pointer 必须以 / 开头、正确转义 ~，且不超过 256 个字符';
+    }
+    if (expected.length > 500) return '期望值不能超过 500 个字符';
+    try {
+      jsonDecode(expected);
+    } on FormatException {
+      return '期望值必须是有效的 JSON 字面量，例如 true、200 或 "ok"';
+    }
+    return null;
+  }
+
+  Map<String, String>? _parseRequestHeaders() {
+    final headers = <String, String>{};
+    final seenNames = <String>{};
+    for (final line in _requestHeaders.text.split('\n')) {
+      if (line.trim().isEmpty) continue;
+      final separator = line.indexOf(':');
+      if (separator <= 0) return null;
+      final name = line.substring(0, separator).trim();
+      final value = line.substring(separator + 1).trim();
+      final normalizedName = name.toLowerCase();
+      if (name.length > 128 ||
+          !RegExp(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$").hasMatch(name) ||
+          const {
+            'host',
+            'content-length',
+            'transfer-encoding',
+            'connection',
+            'keep-alive',
+            'proxy-authenticate',
+            'proxy-authorization',
+            'proxy-connection',
+            'te',
+            'trailer',
+            'upgrade',
+          }.contains(normalizedName) ||
+          normalizedName.startsWith('proxy-') ||
+          value.length > 4096 ||
+          value.codeUnits.any(
+            (code) => code < 32 || (code >= 127 && code <= 159),
+          ) ||
+          !seenNames.add(normalizedName)) {
+        return null;
+      }
+      headers[normalizedName] = value;
+    }
+    return headers;
   }
 }
 
@@ -7658,18 +8562,21 @@ class _StatusTag extends StatelessWidget {
 }
 
 class _PageScroll extends StatelessWidget {
-  const _PageScroll({required this.child});
+  const _PageScroll({required this.child, this.expand = false});
   final Widget child;
+  final bool expand;
 
   @override
   Widget build(BuildContext context) => SingleChildScrollView(
     padding: const EdgeInsets.fromLTRB(28, 27, 28, 36),
-    child: Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 1400),
-        child: child,
-      ),
-    ),
+    child: expand
+        ? SizedBox(width: double.infinity, child: child)
+        : Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 1400),
+              child: child,
+            ),
+          ),
   );
 }
 
@@ -7867,6 +8774,10 @@ const _thresholdMetricNames = [
   'database_connections',
   'database_connection_limit',
   'database_connections_percent',
+  'redis_memory_used_bytes',
+  'redis_memory_limit_bytes',
+  'redis_memory_used_percent',
+  'redis_evicted_keys_total',
 ];
 
 String _metricDisplayName(String name) => switch (name) {
@@ -7882,10 +8793,15 @@ String _metricDisplayName(String name) => switch (name) {
   'database_connections' => '数据库当前连接数',
   'database_connection_limit' => '数据库连接上限',
   'database_connections_percent' => '数据库连接使用率',
+  'redis_memory_used_bytes' => 'Redis 已使用内存',
+  'redis_memory_limit_bytes' => 'Redis 内存上限',
+  'redis_memory_used_percent' => 'Redis 内存使用率',
+  'redis_evicted_keys_total' => 'Redis 已淘汰键累计数',
   _ => name,
 };
 
-bool _isDatabaseMetric(String name) => name.startsWith('database_');
+bool _isDatabaseMetric(String name) =>
+    name.startsWith('database_') || name.startsWith('redis_');
 
 String _metricResourceType(String name) =>
     _isDatabaseMetric(name) ? 'DATABASE' : 'HOST';
@@ -7896,6 +8812,8 @@ String _metricUnit(String name) => name.endsWith('_percent')
     ? '(bytes/s)'
     : name.endsWith('_bytes')
     ? '(bytes)'
+    : name.endsWith('_total')
+    ? '(count)'
     : '';
 
 String _metricOperatorSymbol(String? operator) => switch (operator) {

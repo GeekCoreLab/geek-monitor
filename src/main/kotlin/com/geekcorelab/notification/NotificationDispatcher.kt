@@ -297,18 +297,7 @@ class NotificationDispatcher {
         dataSource.connection.use { connection ->
             connection.autoCommit = false
             try {
-                val outboxStatus = when {
-                    result.cancelled -> "CANCELLED"
-                    result.delivered -> "DELIVERED"
-                    attemptNumber >= MAX_ATTEMPTS -> "FAILED"
-                    else -> "PENDING"
-                }
-                val deliveryStatus = when (outboxStatus) {
-                    "DELIVERED" -> "DELIVERED"
-                    "CANCELLED" -> "CANCELLED"
-                    "FAILED" -> "FAILED"
-                    else -> "RETRYING"
-                }
+                val transition = transitionNotificationAttempt(result.delivered, result.cancelled, attemptNumber)
                 connection.prepareStatement(
                     """INSERT INTO notification_delivery(id, outbox_id, attempt_number, status, http_status, error_code, error_summary, group_count, started_at, finished_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now())""",
@@ -316,7 +305,7 @@ class NotificationDispatcher {
                     statement.setObject(1, UUID.randomUUID())
                     statement.setObject(2, id)
                     statement.setInt(3, attemptNumber)
-                    statement.setString(4, deliveryStatus)
+                    statement.setString(4, transition.deliveryStatus)
                     if (result.httpStatus == null) statement.setNull(5, java.sql.Types.INTEGER) else statement.setInt(5, result.httpStatus)
                     statement.setString(6, result.errorCode)
                     statement.setString(7, result.summary?.take(500))
@@ -324,18 +313,17 @@ class NotificationDispatcher {
                     statement.setObject(9, java.sql.Timestamp.from(startedAt))
                     statement.executeUpdate()
                 }
-                val retryDelay = RETRY_DELAYS_SECONDS.getOrNull(attemptNumber - 1) ?: RETRY_DELAYS_SECONDS.last()
                 connection.prepareStatement(
                     """UPDATE notification_outbox SET status = ?, attempt_count = ?, claimed_at = NULL,
                         delivered_at = CASE WHEN ? = 'DELIVERED' THEN now() ELSE delivered_at END,
                         next_attempt_at = CASE WHEN ? = 'PENDING' THEN now() + (? * INTERVAL '1 second') ELSE next_attempt_at END,
                         last_http_status = ?, last_error_code = ?, last_error_summary = ? WHERE id = ?""",
                 ).use { statement ->
-                    statement.setString(1, outboxStatus)
+                    statement.setString(1, transition.outboxStatus)
                     statement.setInt(2, attemptNumber)
-                    statement.setString(3, outboxStatus)
-                    statement.setString(4, outboxStatus)
-                    statement.setInt(5, retryDelay)
+                    statement.setString(3, transition.outboxStatus)
+                    statement.setString(4, transition.outboxStatus)
+                    statement.setInt(5, transition.retryDelaySeconds ?: 0)
                     if (result.httpStatus == null) statement.setNull(6, java.sql.Types.INTEGER) else statement.setInt(6, result.httpStatus)
                     statement.setString(7, result.errorCode)
                     statement.setString(8, result.summary?.take(500))
@@ -396,7 +384,5 @@ class NotificationDispatcher {
     companion object {
         private const val MAX_CLAIM_PER_TICK = 20
         private const val MAX_GROUP_SIZE = 50
-        private const val MAX_ATTEMPTS = 5
-        private val RETRY_DELAYS_SECONDS = listOf(15, 60, 300, 1800)
     }
 }

@@ -32,6 +32,7 @@ class AgentResource {
     @Inject lateinit var credentials: CredentialService
     @Inject lateinit var objectMapper: ObjectMapper
     @Inject lateinit var notificationOutbox: NotificationOutbox
+    @Inject lateinit var platformTelemetry: PlatformTelemetry
 
     @POST
     @Path("/agent-enrollments")
@@ -54,9 +55,25 @@ class AgentResource {
         val enrollmentId = UUID.randomUUID()
         val token = credentials.newToken()
         val expiresAt = Instant.now().plus(ENROLLMENT_TTL)
-        dataSource.connection.use { connection ->
+        val issueError = dataSource.connection.use { connection ->
             connection.autoCommit = false
             try {
+                val activeAgentExists = connection.prepareStatement(
+                    "SELECT EXISTS (SELECT 1 FROM agent WHERE resource_id = ? AND revoked_at IS NULL)",
+                ).use { statement ->
+                    statement.setObject(1, resourceId)
+                    statement.executeQuery().use { rows -> rows.next(); rows.getBoolean(1) }
+                }
+                if (activeAgentExists) {
+                    connection.rollback()
+                    return@use error(Response.Status.CONFLICT, "AGENT_ALREADY_REGISTERED", "该主机资源已有有效 Agent，请先吊销旧凭据")
+                }
+                val supersededCount = connection.prepareStatement(
+                    "UPDATE agent_enrollment SET revoked_at = now() WHERE resource_id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                ).use { statement ->
+                    statement.setObject(1, resourceId)
+                    statement.executeUpdate()
+                }
                 connection.prepareStatement(
                     "INSERT INTO agent_enrollment(id, resource_id, project_id, token_hash, issued_by, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
                 ).use { statement ->
@@ -68,13 +85,15 @@ class AgentResource {
                     statement.setTimestamp(6, Timestamp.from(expiresAt))
                     statement.executeUpdate()
                 }
-                writeAudit(connection, user.id, "agent.enrollment.created", "agent_enrollment", enrollmentId, mapOf("resourceId" to resourceId.toString(), "expiresAt" to expiresAt.toString()))
+                writeAudit(connection, user.id, "agent.enrollment.created", "agent_enrollment", enrollmentId, mapOf("resourceId" to resourceId.toString(), "expiresAt" to expiresAt.toString(), "supersededCount" to supersededCount))
                 connection.commit()
+                null
             } catch (exception: Exception) {
                 connection.rollback()
                 throw exception
             }
         }
+        if (issueError != null) return issueError
         return Response.status(Response.Status.CREATED).entity(
             mapOf("id" to enrollmentId.toString(), "resourceId" to resourceId.toString(), "token" to token, "expiresAt" to expiresAt.toString()),
         ).build()
@@ -101,7 +120,7 @@ class AgentResource {
                 val enrollment = connection.prepareStatement(
                     """SELECT e.id, e.resource_id, e.issued_by
                        FROM agent_enrollment e JOIN monitored_resource r ON r.id = e.resource_id
-                       WHERE e.token_hash = ? AND e.consumed_at IS NULL AND e.expires_at > now()
+                       WHERE e.token_hash = ? AND e.consumed_at IS NULL AND e.revoked_at IS NULL AND e.expires_at > now()
                          AND r.type = 'HOST' AND r.deleted_at IS NULL
                        FOR UPDATE OF e""",
                 ).use { statement ->
@@ -124,6 +143,13 @@ class AgentResource {
                 }
                 connection.prepareStatement("UPDATE agent_enrollment SET consumed_at = now() WHERE id = ?").use { statement ->
                     statement.setObject(1, enrollment.id)
+                    statement.executeUpdate()
+                }
+                connection.prepareStatement(
+                    "UPDATE agent_enrollment SET revoked_at = now() WHERE resource_id = ? AND id <> ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                ).use { statement ->
+                    statement.setObject(1, enrollment.resourceId)
+                    statement.setObject(2, enrollment.id)
                     statement.executeUpdate()
                 }
                 connection.prepareStatement(
@@ -190,8 +216,35 @@ class AgentResource {
                 statement.setObject(3, projectId)
                 statement.executeQuery().use { rows -> while (rows.next()) agents += rows.toAgentResponse() }
             }
+            connection.prepareStatement(
+                """SELECT e.id, e.resource_id, r.name AS resource_name, r.project_id, p.name AS project_name,
+                          e.created_at, e.expires_at,
+                          CASE WHEN e.expires_at > now() THEN 'WAITING_INSTALL' ELSE 'INSTALL_EXPIRED' END AS node_status
+                   FROM agent_enrollment e
+                   JOIN monitored_resource r ON r.id = e.resource_id
+                   JOIN project p ON p.id = r.project_id
+                   JOIN project_membership pm ON pm.project_id = r.project_id
+                   WHERE pm.user_id = ? AND r.type = 'HOST' AND r.deleted_at IS NULL
+                     AND (?::uuid IS NULL OR r.project_id = ?::uuid)
+                     AND e.consumed_at IS NULL AND e.revoked_at IS NULL
+                     AND NOT EXISTS (
+                       SELECT 1 FROM agent a WHERE a.resource_id = e.resource_id AND a.revoked_at IS NULL
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM agent_enrollment newer
+                       WHERE newer.resource_id = e.resource_id
+                         AND newer.consumed_at IS NULL AND newer.revoked_at IS NULL
+                         AND (newer.created_at > e.created_at OR (newer.created_at = e.created_at AND newer.id > e.id))
+                     )
+                   ORDER BY e.created_at DESC LIMIT 500""",
+            ).use { statement ->
+                statement.setObject(1, user.id)
+                statement.setObject(2, projectId)
+                statement.setObject(3, projectId)
+                statement.executeQuery().use { rows -> while (rows.next()) agents += rows.toPendingAgentResponse() }
+            }
         }
-        return Response.ok(agents).build()
+        return Response.ok(agents.sortedByDescending { Instant.parse(it["createdAt"] as String) }.take(500)).build()
     }
 
     @GET
@@ -218,27 +271,31 @@ class AgentResource {
     @POST
     @Path("/agents/{id}/batches")
     fun ingestBatch(@PathParam("id") idText: String, request: AgentBatchRequest, @Context headers: HttpHeaders): Response {
-        val agentId = parseId(idText) ?: return error(Response.Status.BAD_REQUEST, "INVALID_AGENT", "Agent 编号无效")
+        fun rejected(status: Response.Status, code: String, message: String): Response {
+            platformTelemetry.recordRejectedAgentBatch()
+            return error(status, code, message)
+        }
+        val agentId = parseId(idText) ?: return rejected(Response.Status.BAD_REQUEST, "INVALID_AGENT", "Agent 编号无效")
         val bootId = request.bootId?.let { runCatching { UUID.fromString(it) }.getOrNull() }
-            ?: return error(Response.Status.BAD_REQUEST, "INVALID_BATCH", "启动编号无效")
+            ?: return rejected(Response.Status.BAD_REQUEST, "INVALID_BATCH", "启动编号无效")
         val sequence = request.sequence ?: 0
         val configVersion = request.configVersion ?: 0
         val sampledAt = request.sampledAt?.let { runCatching { Instant.parse(it) }.getOrNull() }
-            ?: return error(Response.Status.BAD_REQUEST, "INVALID_BATCH", "采样时间无效")
+            ?: return rejected(Response.Status.BAD_REQUEST, "INVALID_BATCH", "采样时间无效")
         val metrics = request.metrics ?: emptyList()
         if (sequence <= 0 || configVersion <= 0 || metrics.isEmpty() || metrics.size > MAX_METRICS_PER_BATCH) {
-            return error(Response.Status.BAD_REQUEST, "INVALID_BATCH", "批次序号、配置版本或指标数量无效")
+            return rejected(Response.Status.BAD_REQUEST, "INVALID_BATCH", "批次序号、配置版本或指标数量无效")
         }
-        val normalized = normalizeMetrics(metrics) ?: return error(Response.Status.BAD_REQUEST, "INVALID_METRIC", "指标名称、标签或数值不在允许范围内")
+        val normalized = normalizeMetrics(metrics) ?: return rejected(Response.Status.BAD_REQUEST, "INVALID_METRIC", "指标名称、标签或数值不在允许范围内")
         val now = Instant.now()
         if (sampledAt.isBefore(now.minus(MAX_SAMPLE_AGE)) || sampledAt.isAfter(now.plus(MAX_FUTURE_SKEW))) {
-            return error(Response.Status.BAD_REQUEST, "SAMPLE_TIME_OUT_OF_RANGE", "采样时间超出允许范围")
+            return rejected(Response.Status.BAD_REQUEST, "SAMPLE_TIME_OUT_OF_RANGE", "采样时间超出允许范围")
         }
         val sampleAgeMillis = Duration.between(sampledAt, now).toMillis()
         val clockSynced = request.clockSynced == true
         val clientClockOffsetMillis = request.clientClockOffsetMs
         if (clockSynced && clientClockOffsetMillis == null) {
-            return error(Response.Status.BAD_REQUEST, "INVALID_BATCH", "时钟校准状态与偏差值不匹配")
+            return rejected(Response.Status.BAD_REQUEST, "INVALID_BATCH", "时钟校准状态与偏差值不匹配")
         }
         val trusted = clockSynced && clientClockOffsetMillis?.let { offset ->
             offset >= -TRUSTED_CLOCK_SKEW.toMillis() && offset <= TRUSTED_CLOCK_SKEW.toMillis()
@@ -250,11 +307,11 @@ class AgentResource {
                 val agent = authenticateAgent(connection, agentId, headers)
                 if (agent == null) {
                     connection.rollback()
-                    return@use error(Response.Status.UNAUTHORIZED, "AGENT_UNAUTHENTICATED", "Agent 凭据无效或已吊销")
+                    return@use rejected(Response.Status.UNAUTHORIZED, "AGENT_UNAUTHENTICATED", "Agent 凭据无效或已吊销")
                 }
                 if (configVersion > agent.configVersion) {
                     connection.rollback()
-                    return@use error(Response.Status.CONFLICT, "AGENT_CONFIG_VERSION_FUTURE", "批次配置版本尚未由服务端签发")
+                    return@use rejected(Response.Status.CONFLICT, "AGENT_CONFIG_VERSION_FUTURE", "批次配置版本尚未由服务端签发")
                 }
                 val batchId = UUID.randomUUID()
                 val insertedBatchId = connection.prepareStatement(
@@ -476,6 +533,23 @@ class AgentResource {
         "lastSeenAt" to getTimestamp("last_seen_at")?.toInstant()?.toString(),
         "revokedAt" to getTimestamp("revoked_at")?.toInstant()?.toString(),
         "createdAt" to getTimestamp("created_at").toInstant().toString(),
+    )
+
+    private fun ResultSet.toPendingAgentResponse(): Map<String, Any?> = mapOf(
+        "id" to getObject("id").toString(),
+        "resourceId" to getObject("resource_id").toString(),
+        "resourceName" to getString("resource_name"),
+        "projectId" to getObject("project_id").toString(),
+        "projectName" to getString("project_name"),
+        "hostname" to "待安装",
+        "operatingSystem" to null,
+        "agentVersion" to null,
+        "configVersion" to null,
+        "status" to getString("node_status"),
+        "lastSeenAt" to null,
+        "revokedAt" to null,
+        "createdAt" to getTimestamp("created_at").toInstant().toString(),
+        "expiresAt" to getTimestamp("expires_at").toInstant().toString(),
     )
 
     private fun writeAudit(connection: Connection, userId: UUID, action: String, subjectType: String, subjectId: UUID, summary: Map<String, Any?>) {

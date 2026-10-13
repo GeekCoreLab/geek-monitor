@@ -9,7 +9,46 @@ data class SystemStatusResponse(
     val databaseSizeBytes: Long,
     val retentionPolicies: List<RetentionPolicy>,
     val backup: BackupStatusResponse,
+    val platformHealth: PlatformHealthResponse,
 )
+
+data class PlatformHealthResponse(
+    val status: String,
+    val dueChecks: Long,
+    val oldestScheduleDelaySeconds: Long,
+    val runningChecks: Long,
+    val enabledChecks: Long,
+    val staleChecks: Long,
+    val recentCheckCount: Long,
+    val recentCheckAverageDurationMs: Double?,
+    val recentCheckP95DurationMs: Long?,
+    val recentResultAverageLatencyMs: Double?,
+    val recentResultP95LatencyMs: Long?,
+    val rejectedAgentBatchesSinceStart: Long,
+    val processStartedAt: String,
+    val notificationAttempts24h: Long,
+    val notificationDelivered24h: Long,
+    val notificationSuccessRate24h: Double?,
+    val retention: RetentionJobStatusResponse,
+)
+
+data class RetentionJobStatusResponse(
+    val status: String,
+    val lastStartedAt: String? = null,
+    val lastFinishedAt: String? = null,
+    val lastSuccessAt: String? = null,
+    val lastFailureAt: String? = null,
+    val consecutiveFailures: Long = 0,
+    val lastFailureType: String? = null,
+)
+
+internal fun classifyPlatformHealth(
+    staleChecks: Long,
+    oldestScheduleDelaySeconds: Long,
+    retentionStatus: String,
+): String = if (
+    staleChecks > 0 || oldestScheduleDelaySeconds > 30 || retentionStatus == "FAILED"
+) "DEGRADED" else "HEALTHY"
 
 data class BackupStatusResponse(
     val status: String,

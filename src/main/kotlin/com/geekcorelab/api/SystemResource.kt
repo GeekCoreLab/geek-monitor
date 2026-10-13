@@ -24,6 +24,7 @@ class SystemResource {
     @Inject lateinit var dataSource: DataSource
     @Inject lateinit var authenticator: SessionAuthenticator
     @Inject lateinit var objectMapper: ObjectMapper
+    @Inject lateinit var platformTelemetry: PlatformTelemetry
 
     @GET
     @Path("/system/status")
@@ -59,7 +60,87 @@ class SystemResource {
                     }
                 }
             }
-            Response.ok(SystemStatusResponse(now.toString(), schemaVersion, databaseSizeBytes, RetentionPolicyCatalog.policies, backup)).build()
+            val process = platformTelemetry.snapshot()
+            val schedule = connection.prepareStatement(
+                """SELECT
+                       count(*) FILTER (WHERE enabled AND deleted_at IS NULL AND next_run_at <= now()) AS due_checks,
+                       COALESCE(floor(EXTRACT(EPOCH FROM (now() - min(next_run_at) FILTER (
+                           WHERE enabled AND deleted_at IS NULL AND next_run_at <= now()
+                       ))))::bigint, 0) AS oldest_schedule_delay_seconds,
+                       count(*) FILTER (WHERE enabled AND deleted_at IS NULL) AS enabled_checks,
+                       count(*) FILTER (WHERE enabled AND deleted_at IS NULL AND (
+                           last_result_at IS NULL OR last_result_at < now() - (interval_seconds * 2) * INTERVAL '1 second'
+                       )) AS stale_checks
+                   FROM monitor""",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    ScheduleHealth(
+                        dueChecks = rows.getLong("due_checks"),
+                        oldestScheduleDelaySeconds = rows.getLong("oldest_schedule_delay_seconds"),
+                        enabledChecks = rows.getLong("enabled_checks"),
+                        staleChecks = rows.getLong("stale_checks"),
+                    )
+                }
+            }
+            val runningChecks = connection.prepareStatement(
+                "SELECT count(*) FROM check_execution WHERE result_status = 'RUNNING'",
+            ).use { statement -> statement.executeQuery().use { rows -> rows.next(); rows.getLong(1) } }
+            val recentChecks = connection.prepareStatement(
+                """SELECT count(*) AS sample_count, avg(duration_ms) AS average_duration_ms,
+                          percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_duration_ms,
+                          avg(GREATEST(0, EXTRACT(EPOCH FROM (finished_at - scheduled_at)) * 1000)) AS average_result_latency_ms,
+                          percentile_cont(0.95) WITHIN GROUP (
+                              ORDER BY GREATEST(0, EXTRACT(EPOCH FROM (finished_at - scheduled_at)) * 1000)
+                          ) AS p95_result_latency_ms
+                   FROM check_execution
+                   WHERE result_status <> 'RUNNING' AND finished_at >= now() - INTERVAL '1 hour'""",
+            ).use { statement ->
+                statement.executeQuery().use { rows ->
+                    rows.next()
+                    RecentCheckHealth(
+                        sampleCount = rows.getLong("sample_count"),
+                        averageDurationMs = rows.getDouble("average_duration_ms").let { if (rows.wasNull()) null else it },
+                        p95DurationMs = rows.getDouble("p95_duration_ms").let { if (rows.wasNull()) null else it.toLong() },
+                        averageResultLatencyMs = rows.getDouble("average_result_latency_ms").let { if (rows.wasNull()) null else it },
+                        p95ResultLatencyMs = rows.getDouble("p95_result_latency_ms").let { if (rows.wasNull()) null else it.toLong() },
+                    )
+                }
+            }
+            val deliveries = connection.prepareStatement(
+                """SELECT count(*) AS attempts,
+                          count(*) FILTER (WHERE status = 'DELIVERED') AS delivered
+                   FROM notification_delivery WHERE finished_at >= now() - INTERVAL '24 hours'""",
+            ).use { statement ->
+                statement.executeQuery().use { rows -> rows.next(); rows.getLong("attempts") to rows.getLong("delivered") }
+            }
+            val status = classifyPlatformHealth(
+                schedule.staleChecks,
+                schedule.oldestScheduleDelaySeconds,
+                process.retention.status,
+            )
+            val platformHealth = PlatformHealthResponse(
+                status = status,
+                dueChecks = schedule.dueChecks,
+                oldestScheduleDelaySeconds = schedule.oldestScheduleDelaySeconds,
+                runningChecks = runningChecks,
+                enabledChecks = schedule.enabledChecks,
+                staleChecks = schedule.staleChecks,
+                recentCheckCount = recentChecks.sampleCount,
+                recentCheckAverageDurationMs = recentChecks.averageDurationMs,
+                recentCheckP95DurationMs = recentChecks.p95DurationMs,
+                recentResultAverageLatencyMs = recentChecks.averageResultLatencyMs,
+                recentResultP95LatencyMs = recentChecks.p95ResultLatencyMs,
+                rejectedAgentBatchesSinceStart = process.rejectedAgentBatches,
+                processStartedAt = process.processStartedAt,
+                notificationAttempts24h = deliveries.first,
+                notificationDelivered24h = deliveries.second,
+                notificationSuccessRate24h = if (deliveries.first == 0L) null else deliveries.second * 100.0 / deliveries.first,
+                retention = process.retention,
+            )
+            Response.ok(SystemStatusResponse(
+                now.toString(), schemaVersion, databaseSizeBytes, RetentionPolicyCatalog.policies, backup, platformHealth,
+            )).build()
         }
     }
 
@@ -140,4 +221,19 @@ class SystemResource {
         private const val BACKUP_FRESH_HOURS = 24L
         private val SENSITIVE_FIELD_MARKERS = setOf("password", "secret", "token", "apikey", "authorization", "cookie", "credential", "ciphertext")
     }
+
+    private data class ScheduleHealth(
+        val dueChecks: Long,
+        val oldestScheduleDelaySeconds: Long,
+        val enabledChecks: Long,
+        val staleChecks: Long,
+    )
+
+    private data class RecentCheckHealth(
+        val sampleCount: Long,
+        val averageDurationMs: Double?,
+        val p95DurationMs: Long?,
+        val averageResultLatencyMs: Double?,
+        val p95ResultLatencyMs: Long?,
+    )
 }
