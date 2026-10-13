@@ -2,6 +2,14 @@
 
 The Agent is a small Linux-only Go program that collects CPU usage, load, memory, swap, disk space/inodes, and network throughput. It uses only the Go standard library and makes outbound requests to Geek Monitor; the center never connects back to the host.
 
+## One-command installation
+
+In the Admin console, add a resource with type **HOST**, open **Agent 节点**, and choose **注册主机 Agent**. After issuing a one-time token, the node appears in the list as **等待安装** and the console displays a copyable install command. Run that command on the target Linux host, then enter the token when the installer prompts; input is hidden and the token is not embedded in shell history. Once registration succeeds, that pending row is replaced by the Agent's normal online status. Expired tokens stay visible as **令牌已过期** until a new token is issued.
+
+The command downloads `install-agent.sh` from the latest GitHub Release. The script downloads the matching Linux amd64 or arm64 binary and `SHA256SUMS`, verifies the binary, creates a restricted `geek-monitor` service account, registers the node, and enables its systemd service. It removes the one-time token after registration and refuses to overwrite an existing Agent state file.
+
+Agent releases are published by pushing a `agent-vX.Y.Z` tag. GitHub Actions runs the Agent tests and attaches `install-agent.sh`, `geek-monitor-agent-linux-amd64`, `geek-monitor-agent-linux-arm64`, and `SHA256SUMS` to the Release. The Admin command always resolves the latest Release.
+
 ## Build
 
 Use Go 1.24 or newer:
@@ -34,11 +42,11 @@ The collector reads Linux `/proc` data and filesystem statistics. It needs no ro
      -enrollment-token-file /etc/geek-monitor/enrollment.token
    ```
 
-   After the console shows the node online, stop the foreground process and remove the consumed token file. The Agent stores its long-lived credential in `agent.json` with mode `0600` inside a directory restricted to mode `0700`.
+   After the console shows the node online, stop the foreground process before starting the systemd service. The Agent removes the consumed token file after successful registration and stores its long-lived credential in `agent.json` with mode `0600` inside a directory restricted to mode `0700`.
 
 ## systemd
 
-After the first enrollment and token removal, use this unit as `/etc/systemd/system/geek-monitor-agent.service`:
+After the first enrollment, use this unit as `/etc/systemd/system/geek-monitor-agent.service`:
 
 ```ini
 [Unit]
@@ -66,6 +74,25 @@ WantedBy=multi-user.target
 ```
 
 Enable it with `sudo systemctl daemon-reload && sudo systemctl enable --now geek-monitor-agent`. Re-enrollment is required after an administrator revokes the node credential.
+
+## Uninstall
+
+First revoke the Agent credential from **Agent 节点** in the Admin console. This prevents a copied state file from reconnecting. Then stop and remove the local service and files:
+
+```sh
+sudo systemctl disable --now geek-monitor-agent.service
+sudo rm -f /etc/systemd/system/geek-monitor-agent.service
+sudo systemctl daemon-reload
+sudo rm -f /usr/local/bin/geek-monitor-agent
+sudo rm -rf /var/lib/geek-monitor /etc/geek-monitor
+```
+
+Removing `/var/lib/geek-monitor` also deletes the local retry queue and any samples that had not reached the server. Remove the `geek-monitor` system user and group only if no other local Agent installation uses them:
+
+```sh
+sudo userdel geek-monitor
+sudo groupdel geek-monitor
+```
 
 ## Collection and delivery behavior
 
