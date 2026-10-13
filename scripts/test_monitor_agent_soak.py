@@ -41,6 +41,29 @@ class RunnerDetectionTests(unittest.TestCase):
         ))
 
 
+class CompletionBoundaryTests(unittest.TestCase):
+    def test_monitor_deadline_accepts_a_live_runner_after_required_duration(self) -> None:
+        self.assertIsNone(MONITOR.runner_deadline_problem(1, 604801.0, 604800))
+
+    def test_monitor_deadline_rejects_a_live_runner_short_of_required_duration(self) -> None:
+        self.assertIn("required duration", MONITOR.runner_deadline_problem(1, 604799.0, 604800))
+
+    def test_runner_exit_before_monitor_deadline_is_rejected(self) -> None:
+        self.assertIn("exited before monitor", MONITOR.runner_exit_before_deadline_problem(604799.0, 604800))
+
+    def test_runner_exit_after_full_monitor_window_is_accepted(self) -> None:
+        self.assertIsNone(MONITOR.runner_exit_before_deadline_problem(604800.0, 604800))
+
+    def test_terminal_snapshot_uses_final_database_without_live_process_checks(self) -> None:
+        self.assertEqual(MONITOR.cohort_runtime_problems(0, 0, 100, terminal_runner_snapshot=True), [])
+
+    def test_regular_snapshot_still_requires_the_full_live_cohort(self) -> None:
+        self.assertEqual(
+            MONITOR.cohort_runtime_problems(99, 98, 100),
+            ["Agent processes=99/100", "online Agents=98/100"],
+        )
+
+
 class ObservationContinuityTests(unittest.TestCase):
     def test_new_or_single_checkpoint_log_is_not_a_restarted_soak(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -94,6 +117,20 @@ class AgentIdentityTests(unittest.TestCase):
         replacement = {12: {"start_ticks": 101}, 21: {"start_ticks": 200}}
         self.assertEqual(MONITOR.agent_identity_fingerprint(first), MONITOR.agent_identity_fingerprint(reordered))
         self.assertNotEqual(MONITOR.agent_identity_fingerprint(first), MONITOR.agent_identity_fingerprint(replacement))
+
+
+class AgentCommandDetectionTests(unittest.TestCase):
+    def test_agent_detection_does_not_depend_on_binary_install_path(self) -> None:
+        for binary in (
+            b"/tmp/geek-monitor-agent-soak",
+            b"/home/hhjmk/.local/state/geek-monitor/geek-monitor-agent-soak-v5",
+        ):
+            command_line = binary + b"\x00-server\x00http://127.0.0.1:18084\x00-config\x00/agent.json"
+            self.assertTrue(MONITOR.is_agent_commandline(command_line))
+
+    def test_agent_detection_requires_the_soak_server_address(self) -> None:
+        command_line = b"/usr/bin/geek-monitor-agent\x00-server\x00http://127.0.0.1:18085\x00"
+        self.assertFalse(MONITOR.is_agent_commandline(command_line))
 
 
 if __name__ == "__main__":

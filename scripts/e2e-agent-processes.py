@@ -21,6 +21,7 @@ import uuid
 
 ADMIN_EMAIL = "admin@biliwind.com"
 ADMIN_PASSWORD = "admin@biliwind.com"
+MAX_DURATION_SECONDS = 608400
 
 
 def api_request(base: urllib.parse.SplitResult, method: str, path: str,
@@ -76,8 +77,8 @@ def main() -> int:
         parser.error("base URL must be plain HTTP on 127.0.0.1, localhost, or ::1")
     if not (1 <= args.hosts <= 100):
         parser.error("hosts must be between 1 and 100")
-    if not (65 <= args.duration_seconds <= 604800):
-        parser.error("duration-seconds must be between 65 and 604800")
+    if not (65 <= args.duration_seconds <= MAX_DURATION_SECONDS):
+        parser.error(f"duration-seconds must be between 65 and {MAX_DURATION_SECONDS}")
     binary = args.agent_binary.expanduser().resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("agent-binary must point to an executable file")

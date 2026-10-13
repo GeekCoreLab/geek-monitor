@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 
 
-AGENT_COMMAND = b"/tmp/geek-monitor-agent-soak\x00-server\x00"
+AGENT_COMMAND = b"-server\x00http://127.0.0.1:18084\x00"
 RUNNER_COMMAND = b"scripts/e2e-agent-processes.py"
 RUNNER_ARGUMENTS = b"--base-url\x00http://127.0.0.1:18084"
 
@@ -102,6 +102,35 @@ def missing_runner_problem(
     return "Agent soak runner process was not detected"
 
 
+def runner_deadline_problem(runner_count: int, runner_elapsed: float | None, duration_seconds: int) -> str | None:
+    if runner_count == 0 or (runner_elapsed is not None and runner_elapsed >= duration_seconds):
+        return None
+    elapsed = "unknown" if runner_elapsed is None else f"{runner_elapsed:.1f}s"
+    return f"Agent soak runner was observed for {elapsed}; required duration is {duration_seconds}s"
+
+
+def runner_exit_before_deadline_problem(monitor_elapsed: float, duration_seconds: int) -> str | None:
+    if monitor_elapsed >= duration_seconds:
+        return None
+    return f"Agent soak runner exited before monitor completed {duration_seconds}s"
+
+
+def cohort_runtime_problems(
+    process_count: int,
+    online_count: int,
+    expected_agents: int,
+    terminal_runner_snapshot: bool = False,
+) -> list[str]:
+    if terminal_runner_snapshot:
+        return []
+    problems = []
+    if process_count != expected_agents:
+        problems.append(f"Agent processes={process_count}/{expected_agents}")
+    if online_count != expected_agents:
+        problems.append(f"online Agents={online_count}/{expected_agents}")
+    return problems
+
+
 def incomplete_observation_problem(log_file: Path, once: bool = False) -> str | None:
     if once or not log_file.is_file():
         return None
@@ -140,6 +169,10 @@ def agent_identity_fingerprint(processes: dict[int, dict[str, int]]) -> str:
     return hashlib.sha256(identity.encode("ascii")).hexdigest()
 
 
+def is_agent_commandline(contents: bytes) -> bool:
+    return AGENT_COMMAND in contents
+
+
 def agent_process_metrics() -> tuple[dict[int, dict[str, int]], float]:
     processes: dict[int, dict[str, int]] = {}
     for command_line in Path("/proc").glob("[0-9]*/cmdline"):
@@ -150,7 +183,7 @@ def agent_process_metrics() -> tuple[dict[int, dict[str, int]], float]:
             stat = (command_line.parent / "stat").read_text()
         except OSError:
             continue
-        if AGENT_COMMAND not in contents:
+        if not is_agent_commandline(contents):
             continue
         rss_line = next((line for line in status.splitlines() if line.startswith("VmRSS:")), None)
         if rss_line is None:
@@ -208,7 +241,12 @@ def database_snapshot(container: str, detailed: bool) -> dict[str, object]:
     return result
 
 
-def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -> dict[str, object]:
+def snapshot(
+    args: argparse.Namespace,
+    elapsed: float,
+    detailed: bool = False,
+    terminal_runner_snapshot: bool = False,
+) -> dict[str, object]:
     app_state = run(["podman", "inspect", "--format", "{{.State.Status}}", args.app_container])
     db_state = run(["podman", "inspect", "--format", "{{.State.Status}}", args.db_container])
     if app_state != "running" or db_state != "running":
@@ -235,6 +273,7 @@ def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -
         "agent_processes": process_count,
         "agent_process_identity_sha256": agent_identity_fingerprint(agent_processes),
         "observation_mode": "attached-agent-cohort" if args.observe_existing_agent_cohort else "runner",
+        "terminal_runner_snapshot": terminal_runner_snapshot,
         "agent_rss_mib": round(rss_kib / 1024, 2),
         "agent_rss_mib_per_agent_average": round(sum(rss_mib_per_agent) / process_count, 2) if process_count else 0,
         "agent_rss_mib_per_agent_p95": round(sorted(rss_mib_per_agent)[math.ceil(len(rss_mib_per_agent) * 0.95) - 1], 2) if process_count else 0,
@@ -248,11 +287,14 @@ def snapshot(args: argparse.Namespace, elapsed: float, detailed: bool = False) -
     }
 
     problems = []
-    workload_observed = runner_count > 0 or args.observe_existing_agent_cohort
-    if workload_observed and process_count != args.expected_agents:
-        problems.append(f"Agent processes={process_count}/{args.expected_agents}")
-    if workload_observed and int(database["online_agents"]) != args.expected_agents:
-        problems.append(f"online Agents={database['online_agents']}/{args.expected_agents}")
+    workload_observed = runner_count > 0 or args.observe_existing_agent_cohort or terminal_runner_snapshot
+    if workload_observed:
+        problems.extend(cohort_runtime_problems(
+            process_count,
+            int(database["online_agents"]),
+            args.expected_agents,
+            terminal_runner_snapshot,
+        ))
     if int(database["agents"]) != args.expected_agents:
         problems.append(f"database Agents={database['agents']}/{args.expected_agents}")
     if detailed and int(database["untrusted_batches"]) != 0:
@@ -348,13 +390,24 @@ def main() -> int:
                     elif identity != agent_identity_baseline:
                         record["problems"].append("Agent process cohort changed during observation")
                 if runner_seen and not runner_count and not args.once:
-                    record = snapshot(args, elapsed, detailed=True)
+                    completion_elapsed = max(elapsed, time.monotonic() - started)
+                    record = snapshot(
+                        args,
+                        completion_elapsed,
+                        detailed=True,
+                        terminal_runner_snapshot=completion_elapsed >= args.duration_seconds,
+                    )
                     record["runner_max_observed_elapsed_seconds"] = round(runner_max_elapsed_seconds, 1)
+                    exit_problem = runner_exit_before_deadline_problem(completion_elapsed, args.duration_seconds)
+                    if exit_problem:
+                        record["problems"].append(exit_problem)
                     if runner_max_elapsed_seconds < args.duration_seconds:
                         record["problems"].append(
                             f"Agent soak runner was last observed at {runner_max_elapsed_seconds:.1f}s; "
                             f"monitor did not observe the required {args.duration_seconds}s duration"
                         )
+                    else:
+                        record["observation_completed"] = completion_elapsed >= args.duration_seconds
             except Exception as exception:
                 record = {
                     "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -377,7 +430,11 @@ def main() -> int:
                     }
                 final_record["problems"] = previous_problems + final_record.get("problems", [])
                 record = final_record
-                if agent_identity_baseline is not None and record.get("agent_process_identity_sha256") != agent_identity_baseline:
+                if (
+                    agent_identity_baseline is not None
+                    and not record.get("terminal_runner_snapshot")
+                    and record.get("agent_process_identity_sha256") != agent_identity_baseline
+                ):
                     record["problems"].append("Agent process cohort changed before final checkpoint")
                 record["observation_completed"] = True
             if previous_loop_monotonic is not None and previous_loop_boottime is not None and loop_boottime is not None:
@@ -438,7 +495,15 @@ def main() -> int:
                     f"{args.maximum_agent_rss_mib} MiB"
                 )
             if not args.once and time.monotonic() >= deadline and record.get("runner_processes"):
-                record["problems"].append("monitor duration elapsed while Agent soak runner remained active")
+                runner_problem = runner_deadline_problem(
+                    int(record["runner_processes"]),
+                    record.get("runner_elapsed_seconds"),
+                    args.duration_seconds,
+                )
+                if runner_problem:
+                    record["problems"].append(runner_problem)
+                else:
+                    record["observation_completed"] = True
             if record["problems"]:
                 problem_count += len(record["problems"])
             record["cumulative_problem_count"] = problem_count
