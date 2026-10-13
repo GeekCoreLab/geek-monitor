@@ -32,6 +32,7 @@ class MonitorScheduler {
 
     private val instanceId = UUID.randomUUID()
     private val threadNumber = AtomicInteger()
+    private val targetConcurrencyLimiter = TargetConcurrencyLimiter(TARGET_CONCURRENCY_LIMIT)
     private val executor = ThreadPoolExecutor(
         16,
         16,
@@ -47,9 +48,33 @@ class MonitorScheduler {
         val capacity = executor.queue.remainingCapacity().coerceAtMost(MAX_CLAIM_PER_TICK)
         if (capacity <= 0) return
         claimDueChecks(capacity).forEach { task ->
+            val targetKey = runCatching {
+                TargetConcurrencyKey.of(task.type, objectMapper.readTree(task.config), task.id.toString())
+            }.getOrDefault("${task.type}:monitor:${task.id}")
+            if (!targetConcurrencyLimiter.tryAcquire(targetKey)) {
+                persistResult(
+                    task,
+                    CheckResponse(
+                        "UNKNOWN",
+                        null,
+                        "TARGET_CONCURRENCY_LIMIT",
+                        "目标并发上限已满，本次检查未执行",
+                        0,
+                        Instant.now().toString(),
+                    ),
+                )
+                return@forEach
+            }
             try {
-                executor.execute { execute(task) }
+                executor.execute {
+                    try {
+                        execute(task)
+                    } finally {
+                        targetConcurrencyLimiter.release(targetKey)
+                    }
+                }
             } catch (_: RejectedExecutionException) {
+                targetConcurrencyLimiter.release(targetKey)
                 persistResult(task, CheckResponse("UNKNOWN", null, "EXECUTOR_BUSY", "检查执行队列已满", 0, Instant.now().toString()))
             }
         }
@@ -779,6 +804,7 @@ class MonitorScheduler {
     companion object {
         private const val INTERRUPTED_EXECUTION_GRACE_SECONDS = 30
         private const val MAX_CLAIM_PER_TICK = 500
+        private const val TARGET_CONCURRENCY_LIMIT = 4
         private val DATABASE_MONITOR_TYPES = setOf("POSTGRESQL", "MYSQL", "REDIS")
     }
 }

@@ -28,6 +28,8 @@ from urllib.parse import urlsplit
 class ProbeState:
     def __init__(self) -> None:
         self.healthy = False
+        self.active_slow = 0
+        self.max_active_slow = 0
         self.lock = threading.Lock()
 
     def set_healthy(self, healthy: bool) -> None:
@@ -38,14 +40,28 @@ class ProbeState:
         with self.lock:
             return self.healthy
 
+    def begin_slow(self) -> None:
+        with self.lock:
+            self.active_slow += 1
+            self.max_active_slow = max(self.max_active_slow, self.active_slow)
+
+    def end_slow(self) -> None:
+        with self.lock:
+            self.active_slow -= 1
+
+    def slow_snapshot(self) -> tuple[int, int]:
+        with self.lock:
+            return self.active_slow, self.max_active_slow
+
 
 class ProbeServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], state: ProbeState):
+    def __init__(self, address: tuple[str, int], state: ProbeState, slow_delay_seconds: float = 6.0):
         super().__init__(address, ProbeHandler)
         self.state = state
+        self.slow_delay_seconds = slow_delay_seconds
 
 
 class ProbeHandler(http.server.BaseHTTPRequestHandler):
@@ -55,12 +71,24 @@ class ProbeHandler(http.server.BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
-        if self.path != "/probe":
+        if self.path == "/slow":
+            self.server.state.begin_slow()  # type: ignore[attr-defined]
+            try:
+                time.sleep(self.server.slow_delay_seconds)  # type: ignore[attr-defined]
+            finally:
+                self.server.state.end_slow()  # type: ignore[attr-defined]
+            body = b"slow probe healthy"
+        elif self.path == "/fast":
+            body = b"fast probe healthy"
+        elif self.path == "/probe":
+            healthy = self.server.state.is_healthy()  # type: ignore[attr-defined]
+            body = b"probe healthy" if healthy else b"probe intentionally failing"
+            self.send_response(200 if healthy else 503)
+        else:
             self.send_error(404)
             return
-        healthy = self.server.state.is_healthy()  # type: ignore[attr-defined]
-        body = b"probe healthy" if healthy else b"probe intentionally failing"
-        self.send_response(200 if healthy else 503)
+        if self.path != "/probe":
+            self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -199,6 +227,7 @@ def main() -> int:
     parser.add_argument("--service-address", default="172.16.87.1")
     parser.add_argument("--probe-port", type=int, default=28281)
     parser.add_argument("--webhook-port", type=int, default=28282)
+    parser.add_argument("--slow-probe-port", type=int, default=28283)
     parser.add_argument("--failure-timeout", type=float, default=45)
     parser.add_argument("--notification-timeout", type=float, default=45)
     parser.add_argument("--recovery-timeout", type=float, default=45)
@@ -216,11 +245,12 @@ def main() -> int:
         parser.error("db-name must be geek_monitor_incident_lifecycle")
     if not os.environ.get("PGPASSWORD") and not os.environ.get("PGPASSFILE"):
         parser.error("set PGPASSWORD or PGPASSFILE for the disposable test database")
-    if args.probe_port == args.webhook_port or any(port not in range(1, 65536) for port in (args.probe_port, args.webhook_port)):
-        parser.error("probe-port and webhook-port must be distinct valid ports")
+    ports = (args.probe_port, args.webhook_port, args.slow_probe_port)
+    if len(set(ports)) != len(ports) or any(port not in range(1, 65536) for port in ports):
+        parser.error("probe, webhook, and slow-probe ports must be distinct valid ports")
     try:
-        local_address(args.service_address, args.probe_port)
-        local_address(args.service_address, args.webhook_port)
+        for port in ports:
+            local_address(args.service_address, port)
     except RuntimeError as error:
         parser.error(str(error))
 
@@ -246,8 +276,9 @@ def main() -> int:
     started = time.monotonic()
     state = ProbeState()
     probe = ProbeServer((args.service_address, args.probe_port), state)
+    slow_probe = ProbeServer((args.service_address, args.slow_probe_port), state)
     sink = WebhookServer((args.service_address, args.webhook_port))
-    servers = [probe, sink]
+    servers = [probe, slow_probe, sink]
     threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
     for thread in threads:
         thread.start()
@@ -530,6 +561,108 @@ def main() -> int:
                 args.notification_timeout,
                 lambda: _has_webhook_incident(sink, "incident.resolved", maintenance_incident_id),
             )
+
+        status, concurrency_resource = api.request(
+            "POST",
+            "/api/v1/resources",
+            {"projectId": project_id, "name": "目标并发隔离目标", "type": "WEBSITE", "environment": "test"},
+        )
+        if status != 201 or not isinstance(concurrency_resource, dict):
+            raise RuntimeError(f"could not create the isolated concurrency-test resource (HTTP {status})")
+        concurrency_resource_id = str(concurrency_resource["id"])
+        slow_monitor_ids: list[str] = []
+        slow_target_url = f"http://{args.service_address}:{args.slow_probe_port}/slow"
+        for index in range(20):
+            slow_monitor_id = _create_http_monitor(
+                api,
+                concurrency_resource_id,
+                f"慢目标并发检查-{index + 1}",
+                slow_target_url,
+                interval_seconds=60,
+                timeout_seconds=10,
+            )
+            slow_monitor_ids.append(slow_monitor_id)
+        wait_until(
+            "four slow checks admitted for one target",
+            12,
+            lambda: state.slow_snapshot() if state.slow_snapshot()[0] >= 4 else None,
+        )
+
+        fast_started = time.monotonic()
+        fast_monitor_id = _create_http_monitor(
+            api,
+            concurrency_resource_id,
+            "慢目标运行期间的快速目标检查",
+            f"http://{args.service_address}:{args.probe_port}/fast",
+            interval_seconds=60,
+            timeout_seconds=3,
+        )
+        fast_result = wait_until(
+            "fast target result while slow checks remain active",
+            4.5,
+            lambda: _monitor_state(api, fast_monitor_id, "UP")
+            if _latest_result(api, fast_monitor_id, "UP", 200) else None,
+        )
+        fast_elapsed = time.monotonic() - fast_started
+        active_slow, _ = state.slow_snapshot()
+        if active_slow < 4:
+            raise RuntimeError("the fast target completed after the slow-target load had already cleared")
+
+        limit_result = wait_until(
+            "persisted TARGET_CONCURRENCY_LIMIT result",
+            10,
+            lambda: next((
+                (monitor_id, row)
+                for monitor_id in slow_monitor_ids
+                for row in _monitor_results(api, monitor_id)
+                if row.get("errorCode") == "TARGET_CONCURRENCY_LIMIT"
+            ), None),
+        )
+        active_snapshot = wait_until(
+            "slow target requests to finish",
+            10,
+            lambda: state.slow_snapshot() if state.slow_snapshot()[0] == 0 else None,
+        )
+        if active_snapshot[1] != 4:
+            raise RuntimeError(f"the slow target exceeded or failed to use its concurrency limit: max={active_snapshot[1]}")
+        slow_states = wait_until(
+            "all slow-target outcomes to be persisted",
+            10,
+            lambda: _monitor_states(api, concurrency_resource_id, set(slow_monitor_ids)),
+        )
+        slow_results = {
+            monitor_id: _monitor_results(api, monitor_id)[0]
+            for monitor_id in slow_monitor_ids
+        }
+        accepted_slow = [
+            monitor_id for monitor_id, result in slow_results.items()
+            if result.get("status") == "UP" and slow_states[monitor_id].get("state") == "UP"
+        ]
+        limited_slow = [
+            monitor_id for monitor_id, result in slow_results.items()
+            if result.get("status") == "UNKNOWN"
+            and result.get("errorCode") == "TARGET_CONCURRENCY_LIMIT"
+            and slow_states[monitor_id].get("state") == "UNKNOWN"
+        ]
+        if len(accepted_slow) != 4 or len(limited_slow) != len(slow_monitor_ids) - 4:
+            raise RuntimeError(
+                f"the slow-target admission results were unexpected: accepted={len(accepted_slow)}, limited={len(limited_slow)}"
+            )
+
+        released_monitor_id = _create_http_monitor(
+            api,
+            concurrency_resource_id,
+            "慢目标并发名额释放检查",
+            slow_target_url,
+            interval_seconds=60,
+            timeout_seconds=10,
+        )
+        wait_until(
+            "slow target check after a permit was released",
+            10,
+            lambda: _monitor_state(api, released_monitor_id, "UP")
+            if _latest_result(api, released_monitor_id, "UP", 200) else None,
+        )
         with sink.lock:
             payloads = list(sink.received)
         webhook_types = sorted({
@@ -568,6 +701,15 @@ def main() -> int:
                 "first_post_cancel_failure": first_failure_after_cancel.get("lastResultAt"),
                 "second_post_cancel_failure": second_failure_after_cancel.get("lastResultAt"),
                 "incident_id": maintenance_incident_id,
+            },
+            "target_concurrency": {
+                "configured_limit": 4,
+                "slow_target_monitors": len(slow_monitor_ids),
+                "max_simultaneous_slow_requests": active_snapshot[1],
+                "fast_target_elapsed_seconds": round(fast_elapsed, 3),
+                "fast_target_state": fast_result.get("state"),
+                "limit_result": limit_result[1].get("errorCode"),
+                "released_permit_check": "UP",
             },
             "elapsed_seconds": round(time.monotonic() - started, 2),
         }, separators=(",", ":")))
@@ -640,6 +782,63 @@ def _has_webhook_incident(sink: WebhookServer, event_type: str, incident_id: str
             and payload["notification"].get("incidentId") == incident_id
             for payload in sink.received
         )
+
+
+def _create_http_monitor(
+    api: ApiClient,
+    resource_id: str,
+    name: str,
+    target_url: str,
+    *,
+    interval_seconds: int,
+    timeout_seconds: int,
+) -> str:
+    status, monitor = api.request(
+        "POST",
+        "/api/v1/monitors",
+        {
+            "resourceId": resource_id,
+            "name": name,
+            "type": "HTTP",
+            "targetUrl": target_url,
+            "method": "GET",
+            "intervalSeconds": interval_seconds,
+            "timeoutSeconds": timeout_seconds,
+            "failureThreshold": 20,
+            "recoveryThreshold": 1,
+            "expectedStatusCodes": [200],
+            "critical": False,
+            "enabled": True,
+        },
+    )
+    if status != 201 or not isinstance(monitor, dict):
+        raise RuntimeError(f"could not create test monitor '{name}' (HTTP {status})")
+    return str(monitor["id"])
+
+
+def _monitor_results(api: ApiClient, monitor_id: str) -> list[dict[str, object]]:
+    status, rows = api.request("GET", f"/api/v1/monitors/{monitor_id}/results?limit=20")
+    if status != 200 or not isinstance(rows, list):
+        return []
+    return rows
+
+
+def _monitor_states(
+    api: ApiClient,
+    resource_id: str,
+    expected_monitor_ids: set[str],
+) -> dict[str, dict[str, object]] | None:
+    status, rows = api.request("GET", f"/api/v1/monitors?resourceId={urllib.parse.quote(resource_id)}")
+    if status != 200 or not isinstance(rows, list):
+        return None
+    matched = {
+        str(row.get("id")): row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("id")) in expected_monitor_ids
+    }
+    if set(matched) != expected_monitor_ids or any(not row.get("lastResultAt") for row in matched.values()):
+        return None
+    return matched
 
 
 if __name__ == "__main__":
