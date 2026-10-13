@@ -10,6 +10,7 @@ machine (172.16.87.1 by default). No external service is contacted.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import http.server
 import ipaddress
 import json
@@ -23,6 +24,10 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
+
+SCHEDULED_STORM_MONITOR_COUNT = 100
+SCHEDULED_STORM_TARGETS_PER_PORT = 4
+SCHEDULED_STORM_PORT_BASE = 28300
 
 
 class ProbeState:
@@ -245,9 +250,11 @@ def main() -> int:
         parser.error("db-name must be geek_monitor_incident_lifecycle")
     if not os.environ.get("PGPASSWORD") and not os.environ.get("PGPASSFILE"):
         parser.error("set PGPASSWORD or PGPASSFILE for the disposable test database")
-    ports = (args.probe_port, args.webhook_port, args.slow_probe_port)
+    storm_target_count = (SCHEDULED_STORM_MONITOR_COUNT + SCHEDULED_STORM_TARGETS_PER_PORT - 1) // SCHEDULED_STORM_TARGETS_PER_PORT
+    storm_ports = tuple(range(SCHEDULED_STORM_PORT_BASE, SCHEDULED_STORM_PORT_BASE + storm_target_count))
+    ports = (args.probe_port, args.webhook_port, args.slow_probe_port, *storm_ports)
     if len(set(ports)) != len(ports) or any(port not in range(1, 65536) for port in ports):
-        parser.error("probe, webhook, and slow-probe ports must be distinct valid ports")
+        parser.error("all test ports must be distinct valid ports")
     try:
         for port in ports:
             local_address(args.service_address, port)
@@ -663,6 +670,14 @@ def main() -> int:
             lambda: _monitor_state(api, released_monitor_id, "UP")
             if _latest_result(api, released_monitor_id, "UP", 200) else None,
         )
+        scheduled_alert_storm = _run_scheduled_alert_storm(
+            api,
+            state,
+            sink,
+            args.service_address,
+            servers,
+            threads,
+        )
         with sink.lock:
             payloads = list(sink.received)
         webhook_types = sorted({
@@ -711,6 +726,7 @@ def main() -> int:
                 "limit_result": limit_result[1].get("errorCode"),
                 "released_permit_check": "UP",
             },
+            "scheduler_generated_alert_storm": scheduled_alert_storm,
             "elapsed_seconds": round(time.monotonic() - started, 2),
         }, separators=(",", ":")))
         return 0
@@ -792,6 +808,8 @@ def _create_http_monitor(
     *,
     interval_seconds: int,
     timeout_seconds: int,
+    failure_threshold: int = 20,
+    critical: bool = False,
 ) -> str:
     status, monitor = api.request(
         "POST",
@@ -804,16 +822,205 @@ def _create_http_monitor(
             "method": "GET",
             "intervalSeconds": interval_seconds,
             "timeoutSeconds": timeout_seconds,
-            "failureThreshold": 20,
+            "failureThreshold": failure_threshold,
             "recoveryThreshold": 1,
             "expectedStatusCodes": [200],
-            "critical": False,
+            "critical": critical,
             "enabled": True,
         },
     )
     if status != 201 or not isinstance(monitor, dict):
         raise RuntimeError(f"could not create test monitor '{name}' (HTTP {status})")
     return str(monitor["id"])
+
+
+def _run_scheduled_alert_storm(
+    api: ApiClient,
+    state: ProbeState,
+    sink: WebhookServer,
+    service_address: str,
+    servers: list[http.server.ThreadingHTTPServer],
+    threads: list[threading.Thread],
+) -> dict[str, object]:
+    status, project = api.request(
+        "POST",
+        "/api/v1/projects",
+        {
+            "name": f"调度告警风暴验收-{int(time.time())}",
+            "description": "隔离验证真实调度器生成事件和分组 Webhook 投递。",
+        },
+    )
+    if status != 201 or not isinstance(project, dict):
+        raise RuntimeError(f"could not create an isolated alert-storm project (HTTP {status})")
+    project_id = str(project["id"])
+    status, channel = api.request(
+        "POST",
+        "/api/v1/notification-channels",
+        {
+            "projectId": project_id,
+            "name": f"scheduler-alert-storm-{int(time.time())}",
+            "type": "WEBHOOK",
+            "webhookUrl": f"http://{service_address}:{sink.server_address[1]}/webhook",
+            "enabled": True,
+            "rateLimitPerMinute": 600,
+        },
+    )
+    if status != 201 or not isinstance(channel, dict):
+        raise RuntimeError(f"could not create the isolated alert-storm Webhook (HTTP {status})")
+    channel_id = str(channel["id"])
+
+    target_count = (SCHEDULED_STORM_MONITOR_COUNT + SCHEDULED_STORM_TARGETS_PER_PORT - 1) // SCHEDULED_STORM_TARGETS_PER_PORT
+    storm_ports = range(SCHEDULED_STORM_PORT_BASE, SCHEDULED_STORM_PORT_BASE + target_count)
+    for port in storm_ports:
+        probe = ProbeServer((service_address, port), state)
+        thread = threading.Thread(target=probe.serve_forever, daemon=True)
+        servers.append(probe)
+        threads.append(thread)
+        thread.start()
+
+    with sink.lock:
+        first_storm_request_index = len(sink.received)
+    state.set_healthy(False)
+    started = time.monotonic()
+    monitor_ids: list[str] = []
+    for target_index, port in enumerate(storm_ports):
+        status, resource = api.request(
+            "POST",
+            "/api/v1/resources",
+            {
+                "projectId": project_id,
+                "name": f"scheduler-storm-target-{target_index + 1:02d}",
+                "type": "WEBSITE",
+                "environment": "acceptance",
+            },
+        )
+        if status != 201 or not isinstance(resource, dict):
+            raise RuntimeError(f"could not create alert-storm resource {target_index + 1} (HTTP {status})")
+        resource_id = str(resource["id"])
+        monitors_for_target = min(
+            SCHEDULED_STORM_TARGETS_PER_PORT,
+            SCHEDULED_STORM_MONITOR_COUNT - len(monitor_ids),
+        )
+        for _ in range(monitors_for_target):
+            monitor_ids.append(_create_http_monitor(
+                api,
+                resource_id,
+                f"scheduler-storm-{len(monitor_ids) + 1:03d}",
+                f"http://{service_address}:{port}/probe",
+                interval_seconds=60,
+                timeout_seconds=3,
+                failure_threshold=1,
+                critical=True,
+            ))
+
+    monitor_id_set = set(monitor_ids)
+
+    def open_storm_incidents() -> list[dict[str, object]] | None:
+        status, incidents = api.request("GET", "/api/v1/incidents?status=OPEN&limit=500")
+        if status != 200 or not isinstance(incidents, list):
+            return None
+        matched = [row for row in incidents if row.get("monitorId") in monitor_id_set]
+        if len(matched) != SCHEDULED_STORM_MONITOR_COUNT:
+            return None
+        return matched
+
+    storm_incidents = wait_until(
+        "100 scheduler-generated OPEN incidents",
+        90,
+        open_storm_incidents,
+    )
+    storm_incident_ids = {str(row["id"]) for row in storm_incidents}
+    if len(storm_incident_ids) != SCHEDULED_STORM_MONITOR_COUNT or {
+        str(row.get("monitorId")) for row in storm_incidents
+    } != monitor_id_set:
+        raise RuntimeError("the scheduler did not create exactly one active incident for each failed monitor")
+
+    status, monitors = api.request("GET", "/api/v1/monitors")
+    observed_monitors = {
+        str(row.get("id")): row
+        for row in monitors
+        if isinstance(row, dict) and str(row.get("id")) in monitor_id_set
+    } if status == 200 and isinstance(monitors, list) else {}
+    if set(observed_monitors) != monitor_id_set or any(
+        row.get("state") != "DOWN" or not row.get("lastResultAt")
+        for row in observed_monitors.values()
+    ):
+        raise RuntimeError("the scheduler did not persist DOWN state and a result for every storm monitor")
+    for monitor_id in monitor_ids:
+        status, results = api.request("GET", f"/api/v1/monitors/{monitor_id}/results?limit=1")
+        if (
+            status != 200 or not isinstance(results, list) or not results
+            or results[0].get("status") != "DOWN" or results[0].get("statusCode") != 503
+        ):
+            raise RuntimeError(f"alert-storm monitor {monitor_id} did not persist a scheduled DOWN/503 result")
+
+    def delivered_storm_rows() -> list[dict[str, object]] | None:
+        query = urllib.parse.urlencode({"channelId": channel_id, "limit": 500})
+        status, rows = api.request("GET", f"/api/v1/notification-deliveries?{query}")
+        if status != 200 or not isinstance(rows, list):
+            return None
+        delivered = [
+            row for row in rows
+            if row.get("status") == "DELIVERED" and row.get("incidentId") in storm_incident_ids
+        ]
+        counts = Counter(str(row.get("incidentId")) for row in delivered)
+        if set(counts) != storm_incident_ids or any(count != 1 for count in counts.values()):
+            return None
+        return delivered
+
+    storm_deliveries = wait_until(
+        "all scheduler-generated alert notifications delivered",
+        120,
+        delivered_storm_rows,
+    )
+    with sink.lock:
+        webhook_payloads = list(sink.received[first_storm_request_index:])
+    notified_incident_ids: list[str] = []
+    grouped_requests = 0
+    for payload in webhook_payloads:
+        notification = payload.get("notification")
+        if not isinstance(notification, dict):
+            raise RuntimeError("the alert-storm Webhook payload did not contain a notification")
+        if notification.get("eventType") == "notification.grouped":
+            events = notification.get("events")
+            if not isinstance(events, list) or notification.get("groupCount") != len(events) or len(events) < 2:
+                raise RuntimeError("the alert-storm Webhook group metadata did not match its events")
+            grouped_requests += 1
+            grouped_events = events
+        else:
+            grouped_events = [notification]
+        for event in grouped_events:
+            if not isinstance(event, dict) or event.get("eventType") != "incident.opened":
+                raise RuntimeError("the alert-storm Webhook contained a non-OPENED event")
+            notified_incident_ids.append(str(event.get("incidentId")))
+
+    notification_counts = Counter(notified_incident_ids)
+    if set(notification_counts) != storm_incident_ids or any(count != 1 for count in notification_counts.values()):
+        raise RuntimeError(
+            f"the grouped Webhook did not deliver every scheduler-created incident exactly once: "
+            f"received={len(notified_incident_ids)} unique={len(notification_counts)}"
+        )
+    if grouped_requests == 0:
+        raise RuntimeError("the scheduler-generated alert burst did not exercise grouped Webhook delivery")
+    expected_grouped_requests = (SCHEDULED_STORM_MONITOR_COUNT + 49) // 50
+    if grouped_requests != expected_grouped_requests:
+        raise RuntimeError(
+            f"expected {expected_grouped_requests} Webhook groups for the scheduled alert burst, got {grouped_requests}"
+        )
+    group_counts = sorted({int(row.get("groupCount") or 1) for row in storm_deliveries})
+    group_distribution = Counter(int(row.get("groupCount") or 1) for row in storm_deliveries)
+    if group_distribution != Counter({50: SCHEDULED_STORM_MONITOR_COUNT}):
+        raise RuntimeError(f"the scheduled alert Webhook delivery recorded invalid group sizes: {group_counts}")
+
+    return {
+        "failed_monitors": len(monitor_ids),
+        "open_incidents": len(storm_incidents),
+        "delivered_incident_notifications": len(storm_deliveries),
+        "grouped_webhook_requests": grouped_requests,
+        "delivery_group_sizes": group_counts,
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "delivery_result": "every scheduler-created OPENED event delivered exactly once",
+    }
 
 
 def _monitor_results(api: ApiClient, monitor_id: str) -> list[dict[str, object]]:
