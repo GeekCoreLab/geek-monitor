@@ -201,7 +201,7 @@ jobs:
 
       - name: Validate Agent release workflow and installer syntax
         run: |
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/release-agent.yml
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11 .github/workflows/release-agent.yml
           bash -n scripts/install-agent.sh
 
       - name: Run Agent tests with race detector
