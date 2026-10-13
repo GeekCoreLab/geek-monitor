@@ -1,8 +1,12 @@
 import datetime as dt
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
 import unittest
 
 import importlib.util
-from pathlib import Path
 
 
 MODULE_PATH = Path(__file__).with_name("verify-agent-cadence.py")
@@ -92,6 +96,20 @@ class CadenceReportTests(unittest.TestCase):
     def test_timezone_is_required(self):
         with self.assertRaises(ValueError):
             CADENCE.parse_timestamp("2026-10-12T04:56:03")
+
+    def test_jsonl_report_is_private_when_created_and_appended(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "cadence.jsonl"
+            first = {"passed": True, "sequence": 1}
+            second = {"passed": False, "sequence": 2}
+
+            CADENCE.append_record(path, first)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            os.chmod(path, 0o644)
+            CADENCE.append_record(path, second)
+
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], [first, second])
 
 
 if __name__ == "__main__":

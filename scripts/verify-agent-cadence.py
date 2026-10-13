@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -230,7 +231,11 @@ def query_report(args: argparse.Namespace) -> dict[str, object]:
 
 def append_record(path: Path, record: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as output:
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    with os.fdopen(os.open(path, flags, 0o600), "a", encoding="utf-8") as output:
+        os.fchmod(output.fileno(), 0o600)
         output.write(json.dumps(record, sort_keys=True) + "\n")
 
 
