@@ -199,6 +199,11 @@ jobs:
           go-version-file: agent/go.mod
           cache-dependency-path: agent/go.sum
 
+      - name: Validate Agent release workflow and installer syntax
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/release-agent.yml
+          bash -n scripts/install-agent.sh
+
       - name: Run Agent tests with race detector
         working-directory: agent
         run: go test -race -count=1 ./...
