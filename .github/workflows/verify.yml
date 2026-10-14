@@ -35,6 +35,7 @@ jobs:
           - 55438:5432
           - 55439:5432
           - 55440:5432
+          - 55441:5432
           - 55442:5432
           - 55443:5432
         options: >-
@@ -286,6 +287,63 @@ jobs:
           python3 scripts/e2e-notification-smtp-retry.py \
             --base-url http://127.0.0.1:18087 \
             --smtp-port 2526 \
+            --first-failure-timeout 35 \
+            --retry-timeout 60
+
+      - name: Verify Webhook failure and outbox recovery
+        env:
+          DB_URL: jdbc:postgresql://127.0.0.1:55441/geek_monitor_webhook_retry
+          DB_USERNAME: geek_monitor
+          DB_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          GEEK_MONITOR_NETWORK_ALLOW_PRIVATE_TARGETS: 'true'
+          GEEK_MONITOR_SECURITY_SECURE_COOKIE: 'false'
+          QUARKUS_HTTP_HOST: 127.0.0.1
+          QUARKUS_HTTP_PORT: '18089'
+          QUARKUS_MAILER_MOCK: 'true'
+          PGPASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          createdb --host 127.0.0.1 --port 55441 --username geek_monitor \
+            --maintenance-db geek_monitor_status_stream geek_monitor_webhook_retry
+
+          export GEEK_MONITOR_ENCRYPTION_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
+          app_log="$RUNNER_TEMP/geek-monitor-webhook-retry.log"
+          java -Xms128m -Xmx768m -jar build/quarkus-app/quarkus-run.jar >"$app_log" 2>&1 &
+          app_pid=$!
+          cleanup() {
+            status=$?
+            trap - EXIT
+            kill "$app_pid" 2>/dev/null || true
+            wait "$app_pid" 2>/dev/null || true
+            if [[ "$status" -ne 0 ]]; then
+              tail -n 120 "$app_log"
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          ready=false
+          for _ in $(seq 1 120); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              tail -n 120 "$app_log"
+              exit 1
+            fi
+            if curl --fail --silent http://127.0.0.1:18089/q/health/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            tail -n 120 "$app_log"
+            exit 1
+          fi
+
+          service_address="$(ip -4 route get 1.1.1.1 | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+          python3 scripts/e2e-notification-webhook-retry.py \
+            --base-url http://127.0.0.1:18089 \
+            --sink-address "$service_address" \
+            --sink-port 2527 \
             --first-failure-timeout 35 \
             --retry-timeout 60
 
