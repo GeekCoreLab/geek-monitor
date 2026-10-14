@@ -3934,9 +3934,15 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
                   value: '${platform['runningChecks'] ?? '—'}',
                 ),
                 _SystemValue(
-                  label: '近 1 小时规则处理 P95',
+                  label: '近 1 小时检查执行 P95',
+                  value: platform['recentCheckP95DurationMs'] is num
+                      ? '${(platform['recentCheckP95DurationMs'] as num).toStringAsFixed(0)} ms（${platform['recentCheckCount'] ?? 0} 次）'
+                      : '暂无样本',
+                ),
+                _SystemValue(
+                  label: '近 1 小时调度至完成 P95',
                   value: platform['recentResultP95LatencyMs'] is num
-                      ? '${(platform['recentResultP95LatencyMs'] as num).toStringAsFixed(0)} ms'
+                      ? '${(platform['recentResultP95LatencyMs'] as num).toStringAsFixed(0)} ms（${platform['recentCheckCount'] ?? 0} 次）'
                       : '暂无样本',
                 ),
                 _SystemValue(

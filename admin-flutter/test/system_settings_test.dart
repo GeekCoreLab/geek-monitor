@@ -16,8 +16,10 @@ void main() {
     expect(find.text('平台采集正常'), findsOneWidget);
     expect(find.text('到期检查积压'), findsOneWidget);
     expect(find.text('4'), findsOneWidget);
-    expect(find.text('近 1 小时规则处理 P95'), findsOneWidget);
-    expect(find.text('83 ms'), findsOneWidget);
+    expect(find.text('近 1 小时检查执行 P95'), findsOneWidget);
+    expect(find.text('70 ms（50 次）'), findsOneWidget);
+    expect(find.text('近 1 小时调度至完成 P95'), findsOneWidget);
+    expect(find.text('83 ms（50 次）'), findsOneWidget);
     expect(find.textContaining('62.5%（5 / 8）'), findsOneWidget);
 
     await tester.tap(find.text('刷新状态'));
