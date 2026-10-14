@@ -337,14 +337,21 @@ def main() -> int:
         if len({row["idempotency_key"] for row in storm_deliveries}) != 100:
             raise RuntimeError("storm groups did not have unique idempotency keys")
         channel_literals = ",".join(f"'{storm_channel_id}'::uuid" for storm_channel_id in storm_channel_ids)
-        storm_statuses = scalar_query(
-            args,
-            f"""SELECT count(*) FILTER (WHERE n.status = 'DELIVERED') || ':' ||
-                count(*) FILTER (WHERE d.status = 'DELIVERED') || ':' ||
-                string_agg(DISTINCT d.group_count::text, ',' ORDER BY d.group_count::text)
-                FROM notification_outbox n JOIN notification_delivery d ON d.outbox_id = n.id
-                WHERE n.channel_id IN ({channel_literals})""",
-        )
+        storm_status_query = f"""SELECT count(*) FILTER (WHERE n.status = 'DELIVERED') || ':' ||
+            count(*) FILTER (WHERE d.status = 'DELIVERED') || ':' ||
+            string_agg(DISTINCT d.group_count::text, ',' ORDER BY d.group_count::text)
+            FROM notification_outbox n JOIN notification_delivery d ON d.outbox_id = n.id
+            WHERE n.channel_id IN ({channel_literals})"""
+        # The sink records a request before the dispatcher commits its delivery
+        # transaction, so wait for durable delivery history after all 100 HTTP
+        # requests arrive instead of racing the final database updates.
+        status_deadline = time.monotonic() + 30
+        storm_statuses = ""
+        while time.monotonic() < status_deadline:
+            storm_statuses = scalar_query(args, storm_status_query)
+            if storm_statuses == "5000:5000:50":
+                break
+            time.sleep(0.2)
         if storm_statuses != "5000:5000:50":
             raise RuntimeError(f"the database did not preserve all storm events and grouped deliveries: {storm_statuses}")
         storm_elapsed_seconds = time.monotonic() - storm_started_at
