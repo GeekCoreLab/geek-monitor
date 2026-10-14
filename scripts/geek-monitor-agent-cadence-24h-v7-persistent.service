@@ -1,0 +1,10 @@
+[Unit]
+Description=Verify the v7 Geek Monitor Agent 24-hour cadence window
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -u %h/codes/geek-monitor/scripts/verify-agent-cadence.py --since=2026-10-14T00:03:21.688646+00:00 --duration-seconds=86400 --expected-agents=100 --db-container=geek-monitor-agent-soak-db-v7 --jsonl-file=%h/.local/state/geek-monitor/agent-cadence-24h-v7.jsonl
+TimeoutStartSec=10min
+UMask=0077
+StandardOutput=journal
+StandardError=journal
