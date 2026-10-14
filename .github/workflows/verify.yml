@@ -31,8 +31,10 @@ jobs:
           - 55435:5432
           - 55436:5432
           - 55437:5432
-          - 55442:5432
+          - 55438:5432
+          - 55439:5432
           - 55440:5432
+          - 55442:5432
         options: >-
           --health-cmd "pg_isready -U geek_monitor -d geek_monitor_status_stream"
           --health-interval 5s
@@ -150,6 +152,26 @@ jobs:
           createdb --host 127.0.0.1 --port 55440 --username geek_monitor \
             --maintenance-db geek_monitor_status_stream geek_monitor_partition_test
           python3 scripts/e2e-time-partition-migration.py
+
+      - name: Verify rollup failure preserves raw telemetry
+        env:
+          GEEK_MONITOR_E2E_DB_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          PGPASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          createdb --host 127.0.0.1 --port 55438 --username geek_monitor \
+            --maintenance-db geek_monitor_status_stream geek_monitor_retention_atomicity
+          python3 scripts/e2e-retention-atomicity.py
+
+      - name: Verify history reads across raw and rollup resolutions
+        env:
+          GEEK_MONITOR_E2E_DB_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          PGPASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          createdb --host 127.0.0.1 --port 55439 --username geek_monitor \
+            --maintenance-db geek_monitor_status_stream geek_monitor_metric_resolution
+          python3 scripts/e2e-metric-resolution-query.py
 
       - name: Verify SSE authentication, project isolation, and replay on V27
         env:
