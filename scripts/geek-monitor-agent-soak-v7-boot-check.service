@@ -1,0 +1,16 @@
+[Unit]
+Description=Record an interrupted Geek Monitor Agent v7 soak after reboot
+After=podman-restart.service
+Wants=podman-restart.service
+ConditionPathExists=%h/.local/state/geek-monitor/agent-soak-v7.jsonl
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -u %h/codes/geek-monitor/scripts/monitor-agent-soak.py --base-url=http://127.0.0.1:18084 --app-container=geek-monitor-agent-soak-app-v7 --db-container=geek-monitor-agent-soak-db-v7 --expected-agents=100 --interval-seconds=300 --duration-seconds=0 --minimum-free-gib=20 --maximum-agent-rss-mib=50 --maximum-agent-average-cpu-percent=1 --log-file=%h/.local/state/geek-monitor/agent-soak-v7.jsonl
+TimeoutStartSec=5min
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
