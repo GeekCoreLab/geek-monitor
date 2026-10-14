@@ -1612,75 +1612,109 @@ class _TopBar extends StatelessWidget {
   final Future<void> Function() onLogout;
 
   @override
-  Widget build(BuildContext context) => Container(
-    height: 78,
-    padding: const EdgeInsets.symmetric(horizontal: 28),
-    decoration: const BoxDecoration(
-      color: Colors.white,
-      border: Border(bottom: BorderSide(color: Color(0xFFE7EBF0))),
-    ),
-    child: Row(
-      children: [
-        const Expanded(
-          child: Text(
-            '运维控制台',
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w600,
-              color: _ink,
-            ),
-          ),
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final width = constraints.maxWidth;
+      final compact = width < 420;
+      final narrow = width < 600;
+      final email = user['email'] as String? ?? '管理员';
+      final role = switch (user['role']) {
+        'ADMIN' => '系统管理员',
+        'READ_ONLY' => '只读成员',
+        _ => '运维人员',
+      };
+      final accountLabel = '账户：$email，$role';
+
+      return Container(
+        height: compact ? 64 : 78,
+        padding: EdgeInsets.symmetric(horizontal: compact ? 12 : 28),
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          border: Border(bottom: BorderSide(color: Color(0xFFE7EBF0))),
         ),
-        IconButton(
-          tooltip: '刷新数据',
-          onPressed: onRefresh,
-          icon: const Icon(Icons.refresh_rounded, color: _muted),
-        ),
-        const SizedBox(width: 8),
-        Container(
-          width: 34,
-          height: 34,
-          decoration: BoxDecoration(
-            color: const Color(0xFFE8EEF8),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: const Icon(
-            Icons.person_outline_rounded,
-            color: _blue,
-            size: 19,
-          ),
-        ),
-        const SizedBox(width: 10),
-        Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.start,
+        child: Row(
           children: [
-            Text(
-              user['email'] as String? ?? '管理员',
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                color: _ink,
+            const Expanded(
+              child: Text(
+                '运维控制台',
+                maxLines: 1,
+                softWrap: false,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: _ink,
+                ),
               ),
             ),
-            const SizedBox(height: 2),
-            Text(switch (user['role']) {
-              'ADMIN' => '系统管理员',
-              'READ_ONLY' => '只读成员',
-              _ => '运维人员',
-            }, style: const TextStyle(fontSize: 10, color: _muted)),
+            IconButton(
+              tooltip: '刷新数据',
+              onPressed: onRefresh,
+              icon: const Icon(Icons.refresh_rounded, color: _muted),
+            ),
+            SizedBox(width: compact ? 2 : 8),
+            Tooltip(
+              message: accountLabel,
+              child: Semantics(
+                label: accountLabel,
+                child: Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFE8EEF8),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Icon(
+                    Icons.person_outline_rounded,
+                    color: _blue,
+                    size: 19,
+                  ),
+                ),
+              ),
+            ),
+            if (!compact) ...[
+              const SizedBox(width: 10),
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: narrow ? 112 : double.infinity,
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      email,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: _ink,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      role,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 10, color: _muted),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (MediaQuery.sizeOf(context).width < 940) ...[
+              SizedBox(width: compact ? 2 : 12),
+              IconButton(
+                tooltip: '退出登录',
+                onPressed: onLogout,
+                icon: const Icon(Icons.logout_rounded, color: _muted),
+              ),
+            ],
           ],
         ),
-        if (MediaQuery.sizeOf(context).width < 940) ...[
-          const SizedBox(width: 12),
-          IconButton(
-            tooltip: '退出登录',
-            onPressed: onLogout,
-            icon: const Icon(Icons.logout_rounded, color: _muted),
-          ),
-        ],
-      ],
-    ),
+      );
+    },
   );
 }
 
