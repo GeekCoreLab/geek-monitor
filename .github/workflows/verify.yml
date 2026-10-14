@@ -100,7 +100,7 @@ jobs:
           "$browser_venv/bin/pip" install --requirement scripts/requirements-browser-e2e.txt
           "$browser_venv/bin/python" -m playwright install --with-deps chromium
 
-          export GEEK_MONITOR_SECURITY_ENCRYPTION_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
+          export GEEK_MONITOR_ENCRYPTION_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
           app_log="$RUNNER_TEMP/geek-monitor-browser-install.log"
           java -Xms128m -Xmx768m -jar build/quarkus-app/quarkus-run.jar >"$app_log" 2>&1 &
           app_pid=$!
@@ -359,7 +359,7 @@ jobs:
           PGPASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          export GEEK_MONITOR_SECURITY_ENCRYPTION_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
+          export GEEK_MONITOR_ENCRYPTION_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
           java -Xms128m -Xmx768m -jar build/quarkus-app/quarkus-run.jar \
             >"$RUNNER_TEMP/geek-monitor-status-stream.log" 2>&1 &
           app_pid=$!
@@ -398,7 +398,7 @@ jobs:
           set -euo pipefail
           createdb --host 127.0.0.1 --port 55435 --username geek_monitor \
             --maintenance-db geek_monitor_status_stream geek_monitor_incident_lifecycle
-          export GEEK_MONITOR_SECURITY_ENCRYPTION_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
+          export GEEK_MONITOR_ENCRYPTION_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
           java -Xms128m -Xmx768m -jar build/quarkus-app/quarkus-run.jar \
             >"$RUNNER_TEMP/geek-monitor-incident-lifecycle.log" 2>&1 &
           app_pid=$!
