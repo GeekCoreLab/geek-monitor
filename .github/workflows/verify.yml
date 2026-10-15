@@ -46,6 +46,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Configure ephemeral key for isolated applications
+        run: |
+          key="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
+          echo "GEEK_MONITOR_ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
