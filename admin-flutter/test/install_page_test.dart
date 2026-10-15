@@ -29,6 +29,21 @@ void main() {
     expect(api.submittedPassword, 'admin@biliwind.com');
     expect(api.submittedProjectName, '默认项目');
   });
+
+  testWidgets('shows an actionable error when login returns an empty session', (
+    tester,
+  ) async {
+    final api = _EmptyLoginSessionApi();
+    await tester.pumpWidget(GeekMonitorApp(api: api));
+    await tester.pumpAndSettle();
+
+    expect(find.text('欢迎回来'), findsOneWidget);
+    await tester.tap(find.text('登录控制台'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('服务返回的会话信息不完整，请更新服务后重试。'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }
 
 class _SetupApi extends ApiClient {
@@ -52,4 +67,29 @@ class _SetupApi extends ApiClient {
     submittedProjectName = projectName;
     throw const ApiException('test submission captured');
   }
+}
+
+class _EmptyLoginSessionApi extends ApiClient {
+  @override
+  Future<Map<String, dynamic>> getInstallStatus() async => {
+    'initialized': true,
+  };
+
+  @override
+  Future<Map<String, dynamic>> me() async => throw const ApiException(
+    '请先登录',
+    statusCode: 401,
+  );
+
+  @override
+  Future<String?> lastEmail() async => null;
+
+  @override
+  Future<void> saveSession(Map<String, dynamic> session) async {}
+
+  @override
+  Future<Map<String, dynamic>> login({
+    required String email,
+    required String password,
+  }) async => {};
 }

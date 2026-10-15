@@ -66,8 +66,15 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
   }
 
   void _authenticated(Map<String, dynamic> session) {
+    final user = session['user'];
+    if (user is! Map ||
+        user['id'] is! String ||
+        user['email'] is! String ||
+        user['role'] is! String) {
+      throw const ApiException('服务返回的会话信息不完整，请更新服务后重试。');
+    }
     setState(() {
-      _user = Map<String, dynamic>.from(session['user'] as Map);
+      _user = Map<String, dynamic>.from(user);
       _gate = _GateState.dashboard;
       _startupError = null;
     });

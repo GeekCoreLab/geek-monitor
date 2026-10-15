@@ -505,6 +505,20 @@ jobs:
     permissions:
       contents: read
       packages: write
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: geek_monitor
+          POSTGRES_USER: geek_monitor
+          POSTGRES_PASSWORD: native-aot-smoke-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U geek_monitor -d geek_monitor"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v7
 
@@ -534,6 +548,63 @@ jobs:
 
       - name: Verify native executable
         run: test "$(find build -maxdepth 1 -type f -name '*-runner' | wc -l)" -eq 1
+
+      - name: Verify Native AOT authentication responses
+        env:
+          DB_URL: jdbc:postgresql://127.0.0.1:5432/geek_monitor
+          DB_USERNAME: geek_monitor
+          DB_PASSWORD: native-aot-smoke-password
+          GEEK_MONITOR_SECURITY_SECURE_COOKIE: 'false'
+        run: |
+          set -euo pipefail
+          export GEEK_MONITOR_ENCRYPTION_KEY="$(openssl rand -base64 32 | tr -d '\n')"
+          ./build/geek-monitor-0.1.0-runner >"$RUNNER_TEMP/native-aot-smoke.log" 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true; wait "$app_pid" 2>/dev/null || true' EXIT
+
+          ready=false
+          for _ in $(seq 1 90); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              tail -n 100 "$RUNNER_TEMP/native-aot-smoke.log"
+              exit 1
+            fi
+            if curl --fail --silent http://127.0.0.1:8080/q/health/ready >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            tail -n 100 "$RUNNER_TEMP/native-aot-smoke.log"
+            exit 1
+          fi
+
+          request='{"email":"native-smoke@example.test","password":"native-aot-smoke-password","projectName":"Native AOT Smoke"}'
+          curl --fail-with-body --silent --show-error \
+            -H 'Content-Type: application/json' -d "$request" \
+            http://127.0.0.1:8080/api/v1/install/setup \
+            -o "$RUNNER_TEMP/native-aot-setup.json"
+          jq -e '(.expiresAt | type == "string") and (.user.id | type == "string") and .user.email == "native-smoke@example.test" and .user.role == "ADMIN"' \
+            "$RUNNER_TEMP/native-aot-setup.json"
+
+          curl --fail-with-body --silent --show-error -c "$RUNNER_TEMP/native-aot-cookies" \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"native-smoke@example.test","password":"native-aot-smoke-password"}' \
+            http://127.0.0.1:8080/api/v1/auth/login \
+            -o "$RUNNER_TEMP/native-aot-login.json"
+          jq -e '(.expiresAt | type == "string") and (.user.id | type == "string") and .user.email == "native-smoke@example.test" and .user.role == "ADMIN"' \
+            "$RUNNER_TEMP/native-aot-login.json"
+
+          curl --fail-with-body --silent --show-error -b "$RUNNER_TEMP/native-aot-cookies" \
+            http://127.0.0.1:8080/api/v1/auth/me \
+            -o "$RUNNER_TEMP/native-aot-me.json"
+          jq -e '.id | type == "string"' "$RUNNER_TEMP/native-aot-me.json"
+
+          curl --fail-with-body --silent --show-error -b "$RUNNER_TEMP/native-aot-cookies" \
+            http://127.0.0.1:8080/api/v1/system/status \
+            -o "$RUNNER_TEMP/native-aot-system.json"
+          jq -e '.backup.status == "NOT_RECORDED" and .platformHealth.retention.status == "CURRENT"' \
+            "$RUNNER_TEMP/native-aot-system.json"
 
       - uses: docker/setup-buildx-action@v4
 
