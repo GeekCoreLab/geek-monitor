@@ -3682,7 +3682,11 @@ class _ProjectMemberDialogState extends State<_ProjectMemberDialog> {
 }
 
 class SystemSettingsPage extends StatefulWidget {
-  const SystemSettingsPage({super.key, required this.api, required this.isAdmin});
+  const SystemSettingsPage({
+    super.key,
+    required this.api,
+    required this.isAdmin,
+  });
 
   final ApiClient api;
   final bool isAdmin;
@@ -3692,13 +3696,17 @@ class SystemSettingsPage extends StatefulWidget {
 }
 
 class _SystemSettingsPageState extends State<SystemSettingsPage> {
+  static const _auditPageSize = 20;
+
   Map<String, dynamic>? _status;
   List<Map<String, dynamic>> _auditEntries = [];
   Map<String, dynamic>? _nextCursor;
+  final List<Map<String, dynamic>?> _auditPageCursors = [null];
+  int _auditPage = 1;
   String? _error;
-  String? _moreError;
+  String? _auditPageError;
   bool _loading = false;
-  bool _loadingMore = false;
+  bool _loadingAuditPage = false;
 
   @override
   void initState() {
@@ -3707,15 +3715,16 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
   }
 
   Future<void> _reload() async {
+    if (_loading || _loadingAuditPage) return;
     setState(() {
       _loading = true;
       _error = null;
-      _moreError = null;
+      _auditPageError = null;
     });
     try {
       final values = await Future.wait<Object>([
         widget.api.systemStatus(),
-        widget.api.auditLog(),
+        widget.api.auditLog(limit: _auditPageSize),
       ]);
       final page = Map<String, dynamic>.from(values[1] as Map);
       if (!mounted) return;
@@ -3729,6 +3738,10 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
         _nextCursor = page['next'] is Map
             ? Map<String, dynamic>.from(page['next'] as Map)
             : null;
+        _auditPage = 1;
+        _auditPageCursors
+          ..clear()
+          ..add(null);
       });
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
@@ -3737,17 +3750,20 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
     }
   }
 
-  Future<void> _loadMore() async {
-    final cursor = _nextCursor;
-    if (cursor == null || _loadingMore) return;
+  Future<void> _loadAuditPage({
+    required int pageNumber,
+    required Map<String, dynamic>? cursor,
+  }) async {
+    if (_loading || _loadingAuditPage) return;
     setState(() {
-      _loadingMore = true;
-      _moreError = null;
+      _loadingAuditPage = true;
+      _auditPageError = null;
     });
     try {
       final page = await widget.api.auditLog(
-        beforeCreatedAt: cursor['createdAt'] as String,
-        beforeId: cursor['id'] as String,
+        limit: _auditPageSize,
+        beforeCreatedAt: cursor?['createdAt'] as String?,
+        beforeId: cursor?['id'] as String?,
       );
       final entries = List<Map<String, dynamic>>.from(
         (page['items'] as List).map(
@@ -3756,17 +3772,54 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
       );
       if (!mounted) return;
       setState(() {
-        _auditEntries = [..._auditEntries, ...entries];
+        _auditEntries = entries;
         _nextCursor = page['next'] is Map
             ? Map<String, dynamic>.from(page['next'] as Map)
             : null;
+        _auditPage = pageNumber;
+        if (pageNumber > 1) {
+          final cursorIndex = pageNumber - 1;
+          if (_auditPageCursors.length == cursorIndex) {
+            _auditPageCursors.add(cursor);
+          } else if (!_sameAuditCursor(
+            _auditPageCursors[cursorIndex],
+            cursor,
+          )) {
+            _auditPageCursors[cursorIndex] = cursor;
+            if (_auditPageCursors.length > pageNumber) {
+              _auditPageCursors.removeRange(
+                pageNumber,
+                _auditPageCursors.length,
+              );
+            }
+          }
+        }
       });
     } catch (error) {
-      if (mounted) setState(() => _moreError = error.toString());
+      if (mounted) setState(() => _auditPageError = error.toString());
     } finally {
-      if (mounted) setState(() => _loadingMore = false);
+      if (mounted) setState(() => _loadingAuditPage = false);
     }
   }
+
+  Future<void> _loadPreviousAuditPage() async {
+    if (_auditPage <= 1 || _loading || _loadingAuditPage) return;
+    await _loadAuditPage(
+      pageNumber: _auditPage - 1,
+      cursor: _auditPageCursors[_auditPage - 2],
+    );
+  }
+
+  Future<void> _loadNextAuditPage() async {
+    final cursor = _nextCursor;
+    if (cursor == null || _loading || _loadingAuditPage) return;
+    await _loadAuditPage(pageNumber: _auditPage + 1, cursor: cursor);
+  }
+
+  bool _sameAuditCursor(
+    Map<String, dynamic>? left,
+    Map<String, dynamic>? right,
+  ) => left?['createdAt'] == right?['createdAt'] && left?['id'] == right?['id'];
 
   @override
   Widget build(BuildContext context) {
@@ -3781,7 +3834,7 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
             actions: [
               if (widget.isAdmin)
                 OutlinedButton.icon(
-                  onPressed: _loading ? null : _reload,
+                  onPressed: _loading || _loadingAuditPage ? null : _reload,
                   icon: const Icon(Icons.refresh_rounded),
                   label: const Text('刷新状态'),
                 ),
@@ -3989,10 +4042,7 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
                       ? '暂无投递（$delivered / $attempts）'
                       : '${notificationRate.toStringAsFixed(1)}%（$delivered / $attempts）',
                 ),
-                _SystemValue(
-                  label: '数据清理任务',
-                  value: retentionDetails,
-                ),
+                _SystemValue(label: '数据清理任务', value: retentionDetails),
               ],
             ),
             const Divider(height: 30),
@@ -4088,7 +4138,7 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
                 ),
               ),
               Text(
-                '${_auditEntries.length} 条',
+                '第 $_auditPage 页 · ${_auditEntries.length} 条',
                 style: const TextStyle(color: _muted, fontSize: 12),
               ),
             ],
@@ -4125,27 +4175,45 @@ class _SystemSettingsPageState extends State<SystemSettingsPage> {
               ),
               const Divider(height: 1),
             ],
-          if (_moreError != null)
+          if (_auditPageError != null)
             Padding(
               padding: const EdgeInsets.only(top: 10),
               child: Text(
-                _moreError!,
+                _auditPageError!,
                 style: const TextStyle(color: _red, fontSize: 12),
               ),
             ),
-          if (_nextCursor != null)
-            Align(
-              alignment: Alignment.center,
-              child: TextButton.icon(
-                onPressed: _loadingMore ? null : _loadMore,
-                icon: _loadingMore
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.expand_more_rounded),
-                label: const Text('加载更早记录'),
+          if (_auditPage > 1 || _nextCursor != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: Wrap(
+                alignment: WrapAlignment.center,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                spacing: 10,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: _auditPage > 1 && !_loading && !_loadingAuditPage
+                        ? _loadPreviousAuditPage
+                        : null,
+                    icon: const Icon(Icons.chevron_left_rounded),
+                    label: const Text('上一页'),
+                  ),
+                  if (_loadingAuditPage)
+                    const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  OutlinedButton.icon(
+                    onPressed:
+                        _nextCursor != null && !_loading && !_loadingAuditPage
+                        ? _loadNextAuditPage
+                        : null,
+                    icon: const Icon(Icons.chevron_right_rounded),
+                    label: const Text('下一页'),
+                    iconAlignment: IconAlignment.end,
+                  ),
+                ],
               ),
             ),
         ],
