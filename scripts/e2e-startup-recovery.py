@@ -449,11 +449,48 @@ def main() -> int:
                 if row.get("id") == execution_id and row.get("status") == "UNKNOWN" and row.get("errorCode") == "EXECUTION_INTERRUPTED"
             ), None))
 
-            def delivered_outbox_status() -> str | None:
-                value = psql(["-c", f"SELECT status || ':' || attempt_count::text || ':' || coalesce(last_http_status::text, '') FROM notification_outbox WHERE id='{outbox_id}'::uuid"], database_env)
-                return value if value.startswith("DELIVERED:") else None
+            last_outbox_state: dict[str, object] | None = None
 
-            outbox_status = wait_until("stale notification Outbox to deliver after restart", args.timeout, delivered_outbox_status)
+            def delivered_outbox_status() -> str | None:
+                nonlocal last_outbox_state
+                value = psql(["-c", f"""
+                    SELECT json_build_object(
+                        'status', outbox.status,
+                        'attemptCount', outbox.attempt_count,
+                        'nextAttemptAt', outbox.next_attempt_at,
+                        'claimedAt', outbox.claimed_at,
+                        'lastHttpStatus', outbox.last_http_status,
+                        'lastErrorCode', outbox.last_error_code,
+                        'lastErrorSummary', outbox.last_error_summary,
+                        'channelNextDeliveryAt', channel.next_delivery_at
+                    )::text
+                    FROM notification_outbox outbox
+                    JOIN notification_channel channel ON channel.id = outbox.channel_id
+                    WHERE outbox.id='{outbox_id}'::uuid
+                """], database_env)
+                last_outbox_state = json.loads(value)
+                if last_outbox_state.get("status") != "DELIVERED":
+                    return None
+                return f"DELIVERED:{last_outbox_state.get('attemptCount')}:{last_outbox_state.get('lastHttpStatus')}"
+
+            try:
+                outbox_status = wait_until("stale notification Outbox to deliver after restart", args.timeout, delivered_outbox_status)
+            except TimeoutError as error:
+                delivery_state = psql(["-c", f"""
+                    SELECT COALESCE(json_agg(json_build_object(
+                        'status', status,
+                        'httpStatus', http_status,
+                        'errorCode', error_code,
+                        'summary', error_summary
+                    ))::text, '[]')
+                    FROM notification_delivery WHERE outbox_id='{outbox_id}'::uuid
+                """], database_env)
+                with sink.lock:
+                    webhook_requests = len(sink.received)
+                raise RuntimeError(
+                    f"{error}; last outbox state={json.dumps(last_outbox_state, ensure_ascii=False)}; "
+                    f"delivery attempts={delivery_state}; local webhook requests={webhook_requests}"
+                ) from error
             delivery_status = psql(["-c", f"SELECT count(*)::text || ':' || min(status) || ':' || min(http_status)::text FROM notification_delivery WHERE outbox_id='{outbox_id}'::uuid"], database_env)
             if outbox_status != "DELIVERED:1:202" or delivery_status != "1:DELIVERED:202":
                 raise RuntimeError(f"restart notification delivery was not exactly once in this test: {outbox_status}, {delivery_status}")
