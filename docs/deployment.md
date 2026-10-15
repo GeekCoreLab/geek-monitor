@@ -19,7 +19,13 @@ chmod 600 .env
 podman compose up -d --build
 ```
 
-容器将应用绑定到 `127.0.0.1:8080`，PostgreSQL 只发布到本机 `127.0.0.1:55432`；对公网提供服务时，在前面配置带 TLS 的反向代理并限制数据库端口访问。应用启动时执行 Flyway 迁移。首次打开站点后使用安装页创建管理员和默认项目；生产构建不会预填开发测试账号。
+容器默认将应用绑定到 `127.0.0.1:8080`，PostgreSQL 只发布到本机 `127.0.0.1:55432`。要直接通过主机 IP 和端口访问，可在 `.env` 中设置 `GEEK_MONITOR_BIND=0.0.0.0` 和 `GEEK_MONITOR_HOST_PORT=18082`；若 `55432` 已被占用，将 `POSTGRES_HOST_PORT` 改为其他本机端口。应用启动时执行 Flyway 迁移。首次打开站点后使用安装页创建管理员和默认项目；生产构建不会预填开发测试账号。
+
+## GitHub Actions Native 镜像
+
+`.github/workflows/verify.yml` 在完整验证通过后，使用 Quarkus Mandrel 容器构建 Linux x86_64 Native AOT 可执行文件，再用 `Dockerfile.native` 制作镜像。推送到 `master` 时发布 `latest` 和 `sha-<短提交号>`；推送 `v*` 标签时还发布版本标签。镜像发布至 `ghcr.io/<GitHub 用户名>/geek-monitor`。GHCR 使用工作流的 `GITHUB_TOKEN`，不需要额外 Secret。
+
+若要同时推送到 Docker Hub，在仓库的 **Settings → Secrets and variables → Actions** 添加 `DOCKERHUB_USERNAME`（镜像命名空间/账号）和 `DOCKERHUB_TOKEN`（具备推送权限的 Docker Hub access token）。缺少其中任一项时，工作流仍会发布 GHCR 镜像并明确跳过 Docker Hub。Compose 可通过 `GEEK_MONITOR_IMAGE` 拉取发布镜像，并使用 `docker compose pull app` 与 `docker compose up -d --no-build app` 更新服务。
 
 ## SMTP 配置
 
