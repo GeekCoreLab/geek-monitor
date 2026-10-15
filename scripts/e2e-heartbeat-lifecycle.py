@@ -28,7 +28,7 @@ APP_PORT = 18094
 ADMIN_EMAIL = "admin@biliwind.com"
 ADMIN_PASSWORD = "admin@biliwind.com"
 POSTGRES_IMAGE = "docker.io/library/postgres:17-alpine"
-EXPECTED_FLYWAY_VERSION = "27"
+EXPECTED_FLYWAY_VERSION = "28"
 
 
 def podman(*args: str, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:

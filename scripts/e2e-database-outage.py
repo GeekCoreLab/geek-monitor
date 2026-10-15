@@ -30,7 +30,7 @@ ADMIN_PASSWORD = "admin@biliwind.com"
 POSTGRES_IMAGE = "docker.io/library/postgres:17-alpine"
 REDIS_IMAGE = "docker.io/library/redis:7-alpine"
 PYTHON_IMAGE = "docker.io/library/python:3.13-alpine"
-EXPECTED_FLYWAY_VERSION = "27"
+EXPECTED_FLYWAY_VERSION = "28"
 
 
 def podman(*args: str, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:

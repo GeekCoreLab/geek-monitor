@@ -30,7 +30,7 @@ DB_CONTAINER = "geek-monitor-disk-pressure-db"
 PRESSURE_FILE = "/var/lib/postgresql/data/.geek-monitor-capacity-pressure"
 APP_PORT = 18091
 POSTGRES_IMAGE = "docker.io/library/postgres:17-alpine"
-EXPECTED_FLYWAY_VERSION = "27"
+EXPECTED_FLYWAY_VERSION = "28"
 
 
 def podman(*args: str, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
