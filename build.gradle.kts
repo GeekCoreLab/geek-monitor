@@ -12,6 +12,7 @@ repositories {
 val quarkusPlatformGroupId: String by project
 val quarkusPlatformArtifactId: String by project
 val quarkusPlatformVersion: String by project
+val nativeAotBuild = providers.systemProperty("quarkus.native.enabled").orNull == "true"
 
 dependencies {
     implementation(enforcedPlatform("${quarkusPlatformGroupId}:${quarkusPlatformArtifactId}:${quarkusPlatformVersion}"))
@@ -27,9 +28,19 @@ dependencies {
     implementation("io.quarkus:quarkus-scheduler")
     implementation("io.quarkus:quarkus-mailer")
     implementation("dnsjava:dnsjava:3.6.5")
+    if (nativeAotBuild) {
+        runtimeOnly("net.java.dev.jna:jna:5.19.1")
+        runtimeOnly("net.java.dev.jna:jna-platform:5.19.1")
+        runtimeOnly("org.robolectric:android-all:6.0.1_r3-robolectric-0")
+    }
     implementation("com.squareup.okhttp3:okhttp:5.5.0")
     testImplementation("io.quarkus:quarkus-junit")
     testImplementation("io.rest-assured:rest-assured")
+}
+
+configurations.named("testRuntimeClasspath") {
+    exclude(group = "net.java.dev.jna")
+    exclude(group = "org.robolectric")
 }
 
 val flutterResourceRoot = layout.buildDirectory.dir("generated/flutter-web")

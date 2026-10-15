@@ -12,6 +12,8 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.nio.file.Files
+import java.nio.file.Path
 import java.sql.Timestamp
 import java.time.Duration
 import java.time.Instant
@@ -433,15 +435,26 @@ class NetworkCheckService {
             val queryName = Name.fromString("$normalizedHost.")
             val queryRecord = Record.newRecord(queryName, dnsType, DClass.IN)
             val query = Message.newQuery(queryRecord)
-            val dnsResolver = if (customResolver == null) SimpleResolver() else SimpleResolver(customResolver)
-            dnsResolver.setTimeout(Duration.ofSeconds(timeoutSeconds.toLong()))
-            val response = dnsResolver.send(query)
-            val records = response.getSection(Section.ANSWER).filter { it.type == dnsType }
-            if (response.header.rcode == Rcode.NXDOMAIN || (response.header.rcode == Rcode.NOERROR && records.isEmpty())) {
+            val dnsServers = customResolver?.let(::listOf) ?: systemDnsServers()
+            var response: Message? = null
+            var lastFailure: Exception? = null
+            for (dnsServer in dnsServers) {
+                try {
+                    val dnsResolver = SimpleResolver(InetSocketAddress(dnsServer, SimpleResolver.DEFAULT_PORT))
+                    dnsResolver.setTimeout(Duration.ofSeconds(timeoutSeconds.toLong()))
+                    response = dnsResolver.send(query)
+                    break
+                } catch (exception: Exception) {
+                    lastFailure = exception
+                }
+            }
+            val dnsResponse = response ?: throw (lastFailure ?: IllegalStateException("No DNS resolver is configured"))
+            val records = dnsResponse.getSection(Section.ANSWER).filter { it.type == dnsType }
+            if (dnsResponse.header.rcode == Rcode.NXDOMAIN || (dnsResponse.header.rcode == Rcode.NOERROR && records.isEmpty())) {
                 return result("DOWN", "DNS_NO_RECORD", "没有找到 $type 记录", started, checkedAt)
             }
-            if (response.header.rcode != Rcode.NOERROR) {
-                return result("DOWN", "DNS_FAILURE", "DNS 解析器返回 ${Rcode.string(response.header.rcode)}", started, checkedAt)
+            if (dnsResponse.header.rcode != Rcode.NOERROR) {
+                return result("DOWN", "DNS_FAILURE", "DNS 解析器返回 ${Rcode.string(dnsResponse.header.rcode)}", started, checkedAt)
             }
             val values = records.map { it.rdataToString().trim().trim('"') }
             when {
@@ -558,6 +571,19 @@ class NetworkCheckService {
         require(ascii.length <= 253)
         ascii
     }.getOrNull()
+
+    internal fun systemDnsServers(resolvConf: Path = Path.of("/etc/resolv.conf")): List<InetAddress> {
+        val servers = runCatching { Files.readAllLines(resolvConf) }
+            .getOrDefault(emptyList())
+            .mapNotNull { line ->
+                val fields = line.substringBefore('#').substringBefore(';').trim().split(Regex("\\s+"))
+                val address = fields.getOrNull(1)?.takeIf { fields.firstOrNull() == "nameserver" && isIpLiteral(it) }
+                    ?: return@mapNotNull null
+                runCatching { InetAddress.getByName(address) }.getOrNull()
+            }
+            .distinctBy { it.hostAddress }
+        return servers.ifEmpty { listOf(InetAddress.getLoopbackAddress()) }
+    }
 
     private fun canonicalRecord(value: String, type: String) = when (type) {
         "A" -> {
