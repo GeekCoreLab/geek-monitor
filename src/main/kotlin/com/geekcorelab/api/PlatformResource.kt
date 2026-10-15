@@ -219,7 +219,7 @@ class PlatformResource {
         if (projectId != null && parsedProjectId == null) return error(Response.Status.BAD_REQUEST, "INVALID_PROJECT", "项目编号无效")
         val resources = mutableListOf<ResourceResponse>()
         val query = """SELECT r.id, r.project_id, p.name AS project_name, r.name, r.type, r.environment, r.tags::text AS tags,
-            r.owner_email, r.health_status, r.paused, r.created_at
+            r.owner_email, r.health_status, r.paused, r.public_enabled, r.created_at
             FROM monitored_resource r JOIN project p ON p.id = r.project_id
             JOIN project_membership pm ON pm.project_id = p.id
             WHERE pm.user_id = ? AND r.deleted_at IS NULL AND (?::uuid IS NULL OR r.project_id = ?::uuid)
@@ -272,6 +272,28 @@ class PlatformResource {
     }
 
     @PATCH
+    @Path("/resources/{id}/public")
+    fun setResourcePublic(@PathParam("id") idText: String, request: ResourcePublicRequest, @Context headers: HttpHeaders): Response {
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        if (user.role == "READ_ONLY") return error(Response.Status.FORBIDDEN, "READ_ONLY", "只读成员不能公开资源")
+        val id = runCatching { UUID.fromString(idText) }.getOrNull()
+            ?: return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "资源编号无效")
+        val enabled = request.enabled ?: return error(Response.Status.BAD_REQUEST, "INVALID_PUBLIC_STATE", "请指定公开状态")
+        val updated = dataSource.connection.use { connection ->
+            connection.prepareStatement("""UPDATE monitored_resource r SET public_enabled = ?, updated_at = now()
+                WHERE r.id = ? AND r.deleted_at IS NULL AND EXISTS
+                (SELECT 1 FROM project_membership pm WHERE pm.project_id = r.project_id AND pm.user_id = ? AND pm.role = 'ADMIN')""").use { statement ->
+                statement.setBoolean(1, enabled)
+                statement.setObject(2, id)
+                statement.setObject(3, user.id)
+                statement.executeUpdate()
+            }
+        }
+        if (updated != 1) return error(Response.Status.FORBIDDEN, "PROJECT_FORBIDDEN", "只有项目管理员可以修改公开状态")
+        return Response.ok(getResource(id, user.id)).build()
+    }
+
+    @PATCH
     @Path("/resources/{id}/pause")
     fun setResourcePaused(
         @PathParam("id") idText: String,
@@ -321,7 +343,7 @@ class PlatformResource {
 
     private fun getResource(id: UUID, userId: UUID): ResourceResponse? = dataSource.connection.use { connection ->
         connection.prepareStatement(
-            "SELECT r.id, r.project_id, p.name AS project_name, r.name, r.type, r.environment, r.tags::text AS tags, r.owner_email, r.health_status, r.paused, r.created_at FROM monitored_resource r JOIN project p ON p.id = r.project_id JOIN project_membership pm ON pm.project_id = p.id WHERE r.id = ? AND pm.user_id = ? AND r.deleted_at IS NULL",
+            "SELECT r.id, r.project_id, p.name AS project_name, r.name, r.type, r.environment, r.tags::text AS tags, r.owner_email, r.health_status, r.paused, r.public_enabled, r.created_at FROM monitored_resource r JOIN project p ON p.id = r.project_id JOIN project_membership pm ON pm.project_id = p.id WHERE r.id = ? AND pm.user_id = ? AND r.deleted_at IS NULL",
         ).use { statement ->
             statement.setObject(1, id)
             statement.setObject(2, userId)
@@ -366,7 +388,7 @@ class PlatformResource {
     private fun ResultSet.toResource(): ResourceResponse = ResourceResponse(
         getObject("id").toString(), getObject("project_id").toString(), getString("project_name"), getString("name"), getString("type"),
         getString("environment"), objectMapper.readValue(getString("tags"), objectMapper.typeFactory.constructCollectionType(List::class.java, String::class.java)) as List<String>,
-        getString("owner_email"), getString("health_status"), getBoolean("paused"), getTimestamp("created_at").toInstant().toString(),
+        getString("owner_email"), getString("health_status"), getBoolean("paused"), getTimestamp("created_at").toInstant().toString(), getBoolean("public_enabled"),
     )
 
     private data class LoginUser(val id: UUID, val email: String, val passwordHash: String, val role: String)

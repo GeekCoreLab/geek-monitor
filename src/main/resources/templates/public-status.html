@@ -1,0 +1,30 @@
+{@java.util.List<com.geekcorelab.api.PublicGroup> groups}
+{@java.lang.String updatedAt}
+{@java.lang.Integer count}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>服务运行状态 · Geek Monitor</title>
+<style>
+{|
+:root{font-family:system-ui,sans-serif;color:#182433;background:#f4f6f9}*{box-sizing:border-box}body{margin:0}main{max-width:960px;margin:auto;padding:48px 20px}header{margin-bottom:40px}small,footer{color:#657487}h1{font-size:clamp(26px,5vw,38px);margin:12px 0}h2{font-size:20px;margin-top:32px}.card{background:white;border:1px solid #dde4ec;border-radius:14px;padding:20px;margin:12px 0}.row{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap}h3{margin:0;overflow-wrap:anywhere;max-width:100%}.status{font-size:13px;border-radius:20px;background:#edf0f4;padding:6px 12px;white-space:nowrap}.UP{color:#116347;background:#e6f5ed}.DOWN{color:#a51d19;background:#fff0ee}.DEGRADED{color:#8a5700;background:#fff3d9}.methods{padding:12px 0 0;margin:12px 0 0;border-top:1px solid #edf0f4;list-style:none}.methods li{padding:6px 0;display:flex;justify-content:space-between;gap:12px}footer{margin-top:36px;font-size:12px;overflow-wrap:anywhere}
+|}
+</style>
+</head>
+<body><main>
+<header><small>GEEK MONITOR / PUBLIC STATUS</small><h1>服务运行状态</h1><p>{count} 个公开资源 · 每 60 秒自动刷新</p></header>
+{#for group in groups}
+<section><h2>{group.name}</h2>
+{#for resource in group.resources}
+<article class="card"><div class="row"><h3>{resource.name}</h3><span class="status {resource.state}">{resource.status}</span></div>
+<ul class="methods">
+{#for method in resource.methods}<li><span>{method.name}</span><span class="status {method.state}">{method.status}</span></li>{/for}
+{#if resource.methods.isEmpty}<li>尚未配置监控方式</li>{/if}
+</ul></article>
+{/for}</section>
+{/for}
+<footer>更新于 {updatedAt} · Powered by Geek Monitor</footer>
+</main></body></html>

@@ -76,3 +76,11 @@ openssl rand -base64 32
 部署交付文档还包括[指标与状态字典](docs/metrics-and-states.md)、[告警配置说明](docs/alert-configuration.md)、[Agent 安装与卸载指南](agent/README.md)和[数据库监控最小权限说明](docs/database-monitoring-permissions.md)。
 
 可用率统计、数据库备份与空库恢复已实现。真实 SMTP 投递、异机备份恢复、目标硬件与规模压测、至少 7 天连续试运行仍待验收，详见[产品与技术规划](docs/产品与技术规划.md)和[部署手册](docs/deployment.md)。
+
+### 对公监控状态页
+
+在“监控资源”中点击资源行的地球图标，开启“公开此资源的监控状态”并保存。仅项目管理员可修改公开设置，所有资源默认关闭。同一项目的公开资源共用 `/public/{projectId}`，可在设置弹窗复制完整链接，无需登录即可访问。
+
+公共页面使用服务端 Qute 模板渲染，每 60 秒刷新，按资源 tag 自动分组；多标签资源会在各对应组展示，无标签资源归入“未分组”。展示资源名称、汇总状态、监控方式名称和各方式的状态；暂停的资源或监控方式显示“已暂停”。监控方式使用 HTTP、TCP、DNS 等类型名称，不公开自定义监控名称、目标地址、检查逻辑、原始结果、负责人或凭据。关闭公开、删除资源后，该资源不再出现在页面中；没有公开资源的页面返回 404。公开响应禁止缓存。
+
+升级时 Flyway 自动执行 `V28__public_status_pages.sql`。新增接口 `PATCH /api/v1/resources/{id}/public` 接收 `{"enabled":true}` 或 `{"enabled":false}`，沿用登录会话并检查项目管理员权限。

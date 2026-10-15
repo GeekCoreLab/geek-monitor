@@ -24,6 +24,7 @@ data class ResourceRequest(
     val tags: List<String>? = emptyList(),
     val ownerEmail: String? = null,
 )
+data class ResourcePublicRequest(val enabled: Boolean?)
 data class ResourcePauseRequest(val paused: Boolean?)
 data class ResourceResponse(
     val id: String,
@@ -37,5 +38,6 @@ data class ResourceResponse(
     val healthStatus: String,
     val paused: Boolean,
     val createdAt: String,
+    val publicEnabled: Boolean = false,
 )
 data class ErrorResponse(val code: String, val message: String)

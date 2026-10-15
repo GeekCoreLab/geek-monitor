@@ -1180,6 +1180,65 @@ class _DashboardShellState extends State<_DashboardShell> {
     }
   }
 
+  Future<void> _configureResourcePublic(Map<String, dynamic> resource) async {
+    var enabled = resource['publicEnabled'] == true;
+    final url = widget.api.publicStatusUrl(resource['projectId'] as String);
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('对公监控页面'),
+          content: SizedBox(
+            width: 460,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('公开此资源的监控状态'),
+                  value: enabled,
+                  onChanged: (value) => update(() => enabled = value),
+                ),
+                const Text(
+                  '同一项目的公开资源共用一个页面，按 tag 自动分组。公开资源名称、tag、状态及监控方式名称。任何人均可访问。',
+                ),
+                const SizedBox(height: 16),
+                SelectableText(url),
+                TextButton.icon(
+                  onPressed: () async {
+                    await Clipboard.setData(ClipboardData(text: url));
+                    if (mounted) _notice('公开页面链接已复制');
+                  },
+                  icon: const Icon(Icons.copy),
+                  label: const Text('复制链接'),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (saved != true) return;
+    try {
+      await widget.api.setResourcePublic(resource['id'] as String, enabled);
+      await _reload();
+      if (mounted) _notice(enabled ? '已开启公开展示' : '已关闭公开展示');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
   Future<void> _toggleResourcePause(Map<String, dynamic> resource) async {
     final paused = resource['paused'] == true;
     try {
@@ -1349,6 +1408,7 @@ class _DashboardShellState extends State<_DashboardShell> {
         onDelete: _deleteResource,
         onMetrics: _showResourceMetrics,
         onTogglePause: _toggleResourcePause,
+        onPublic: _configureResourcePublic,
       ),
       _Section.monitors => _MonitorsPage(
         monitors: _monitors,
@@ -2334,6 +2394,7 @@ class _ResourcesPage extends StatelessWidget {
     required this.onDelete,
     required this.onMetrics,
     required this.onTogglePause,
+    required this.onPublic,
   });
 
   final List<Map<String, dynamic>> resources;
@@ -2343,6 +2404,7 @@ class _ResourcesPage extends StatelessWidget {
   final ValueChanged<Map<String, dynamic>> onDelete;
   final ValueChanged<Map<String, dynamic>> onMetrics;
   final ValueChanged<Map<String, dynamic>> onTogglePause;
+  final ValueChanged<Map<String, dynamic>> onPublic;
 
   @override
   Widget build(BuildContext context) => _PageScroll(
@@ -2460,6 +2522,21 @@ class _ResourcesPage extends StatelessWidget {
                                   Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
+                                      IconButton(
+                                        tooltip:
+                                            resource['publicEnabled'] == true
+                                            ? '对公页面（已开启）'
+                                            : '对公页面（未开启）',
+                                        onPressed: () => onPublic(resource),
+                                        icon: Icon(
+                                          Icons.public,
+                                          color:
+                                              resource['publicEnabled'] == true
+                                              ? _green
+                                              : _muted,
+                                          size: 18,
+                                        ),
+                                      ),
                                       IconButton(
                                         tooltip: resource['paused'] == true
                                             ? '恢复监控'

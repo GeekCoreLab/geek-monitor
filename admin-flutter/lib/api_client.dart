@@ -304,6 +304,17 @@ class ApiClient {
           ))
           as Map<String, dynamic>;
 
+  String publicStatusUrl(String projectId) =>
+      _baseUri.resolve('/public/${Uri.encodeComponent(projectId)}').toString();
+
+  Future<void> setResourcePublic(String id, bool enabled) async {
+    await _send(
+      'PATCH',
+      '/api/v1/resources/${Uri.encodeComponent(id)}/public',
+      body: {'enabled': enabled},
+    );
+  }
+
   Future<void> deleteResource(String id) async {
     await _send('DELETE', '/api/v1/resources/${Uri.encodeComponent(id)}');
   }
