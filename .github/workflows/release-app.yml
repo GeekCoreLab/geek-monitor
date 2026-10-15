@@ -1,0 +1,107 @@
+name: Release Geek Monitor
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-app-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.9'
+          cache: true
+
+      - name: Verify release tag and project versions
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          [[ "$TAG_NAME" == v* && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          gradle_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' build.gradle.kts)"
+          flutter_version="$(sed -n 's/^version: \([^+]*\)+.*$/\1/p' admin-flutter/pubspec.yaml)"
+          test "$version" = "$gradle_version"
+          test "$version" = "$flutter_version"
+
+      - name: Resolve Flutter dependencies
+        working-directory: admin-flutter
+        run: flutter pub get
+
+      - name: Analyze and test Flutter admin
+        working-directory: admin-flutter
+        run: |
+          flutter analyze
+          flutter test
+
+      - name: Test and package JVM server with Flutter Web
+        run: ./gradlew clean test quarkusBuild --no-daemon --console=plain
+
+      - name: Package release assets
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          test -f build/quarkus-app/quarkus-run.jar
+          test -f "build/quarkus-app/app/geek-monitor-$version.jar"
+          app_jar_count="$(find build/quarkus-app/app -maxdepth 1 -type f -name '*.jar' | wc -l)"
+          test "$app_jar_count" -eq 1
+          bundle="geek-monitor-$version"
+          mkdir -p "dist/$bundle/docs" "dist/$bundle/scripts"
+          cp -a build/quarkus-app "dist/$bundle/"
+          cp docs/release-package.md "dist/$bundle/README.md"
+          cp docs/deployment.md "dist/$bundle/docs/"
+          cp scripts/backup-postgres.sh scripts/restore-postgres.sh "dist/$bundle/scripts/"
+          archive="geek-monitor-$version-server-jvm.tar.gz"
+          tar -C dist -czf "dist/$archive" "$bundle"
+          (cd dist && sha256sum "$archive" >SHA256SUMS && sha256sum --check SHA256SUMS)
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          notes="docs/releases/$TAG_NAME.md"
+          if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/geek-monitor-*-server-jvm.tar.gz dist/SHA256SUMS \
+              --repo "$REPOSITORY" --clobber
+          else
+            title="Geek Monitor $version"
+            release_args=()
+            if [[ "$version" == 0.* ]]; then
+              title="$title Preview"
+              release_args+=(--prerelease)
+            fi
+            if [[ -f "$notes" ]]; then
+              gh release create "$TAG_NAME" dist/geek-monitor-*-server-jvm.tar.gz dist/SHA256SUMS \
+                --repo "$REPOSITORY" --verify-tag --title "$title" \
+                --notes-file "$notes" "${release_args[@]}"
+            else
+              gh release create "$TAG_NAME" dist/geek-monitor-*-server-jvm.tar.gz dist/SHA256SUMS \
+                --repo "$REPOSITORY" --verify-tag --title "$title" \
+                --generate-notes "${release_args[@]}"
+            fi
+          fi

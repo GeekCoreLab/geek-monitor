@@ -1543,7 +1543,7 @@ class _SideNavigation extends StatelessWidget {
         const Padding(
           padding: EdgeInsets.symmetric(horizontal: 10),
           child: Text(
-            'GEEK MONITOR  ·  1.0',
+            'GEEK MONITOR  ·  0.1.0',
             style: TextStyle(color: Color(0xFF778CA3), fontSize: 10),
           ),
         ),

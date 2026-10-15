@@ -144,6 +144,7 @@ jobs:
           set -euo pipefail
           createdb --host 127.0.0.1 --port 55442 --username geek_monitor \
             --maintenance-db geek_monitor_status_stream geek_monitor_metric_threshold
+          export GEEK_MONITOR_ENCRYPTION_KEY="$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
           python3 scripts/e2e-agent-metric-threshold.py
 
       - name: Verify V1 to V27 telemetry partition migration
