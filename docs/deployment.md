@@ -21,6 +21,8 @@ podman compose up -d --build
 
 容器默认将应用绑定到 `127.0.0.1:8080`，PostgreSQL 只发布到本机 `127.0.0.1:55432`。要直接通过主机 IP 和端口访问，可在 `.env` 中设置 `GEEK_MONITOR_BIND=0.0.0.0` 和 `GEEK_MONITOR_HOST_PORT=18082`；若 `55432` 已被占用，将 `POSTGRES_HOST_PORT` 改为其他本机端口。应用启动时执行 Flyway 迁移。首次打开站点后使用安装页创建管理员和默认项目；生产构建不会预填开发测试账号。
 
+Compose 默认将 `GEEK_MONITOR_SECURE_COOKIE` 设为 `false`，以支持直接通过 HTTP IP:端口访问。配置 HTTPS 反向代理后，应在 `.env` 中设为 `true`，让会话 Cookie 只通过 HTTPS 发送；修改后重建应用容器使配置生效。
+
 ## GitHub Actions Native 镜像
 
 `.github/workflows/verify.yml` 在完整验证通过后，使用 Quarkus Mandrel 容器构建 Linux x86_64 Native AOT 可执行文件，再用 `Dockerfile.native` 制作镜像。推送到 `master` 时发布 `latest` 和 `sha-<短提交号>`；推送 `v*` 标签时还发布版本标签。镜像发布至 `ghcr.io/<GitHub 用户名>/geek-monitor`。GHCR 使用工作流的 `GITHUB_TOKEN`，不需要额外 Secret。

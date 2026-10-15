@@ -37,7 +37,10 @@ class PlatformResourceSetupTest {
         val session = response.entity as SessionResponse
         assertEquals("admin@biliwind.com", session.user.email)
         assertEquals("ADMIN", session.user.role)
-        assertTrue(response.getHeaderString("Set-Cookie").contains("HttpOnly"))
+        val sessionCookie = response.getHeaderString("Set-Cookie")
+        assertTrue(sessionCookie.contains("HttpOnly"))
+        assertTrue(sessionCookie.contains("SameSite=Strict"))
+        assertFalse(sessionCookie.contains("Secure"))
         assertEquals(1, database.commitCount)
 
         val adminInsert = database.statements.single { it.sql.startsWith("INSERT INTO app_user") }
