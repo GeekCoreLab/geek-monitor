@@ -74,16 +74,21 @@ Stream<StatusStreamEvent> parseServerSentEvents(Stream<List<int>> bytes) async* 
 }
 
 class ApiClient {
-  ApiClient();
+  ApiClient({http.Client? client, Uri? baseUri})
+    : _client = client ?? http_client_factory.createHttpClient(),
+      _baseUriOverride = baseUri;
 
   static const _emailKey = 'geek-monitor.last-email';
   static const _configuredBaseUrl = String.fromEnvironment('API_BASE_URL');
 
-  final http.Client _client = http_client_factory.createHttpClient();
+  final http.Client _client;
+  final Uri? _baseUriOverride;
 
-  Uri get _baseUri => Uri.parse(
-    _configuredBaseUrl.isEmpty ? Uri.base.origin : _configuredBaseUrl,
-  );
+  Uri get _baseUri =>
+      _baseUriOverride ??
+      Uri.parse(
+        _configuredBaseUrl.isEmpty ? Uri.base.origin : _configuredBaseUrl,
+      );
 
   Future<String?> lastEmail() async =>
       (await SharedPreferences.getInstance()).getString(_emailKey);
@@ -602,13 +607,33 @@ class ApiClient {
           .send(request)
           .timeout(const Duration(seconds: 20));
       final response = await http.Response.fromStream(streamed);
-      if (response.statusCode == 204 || response.body.isEmpty) return null;
-      final decoded = jsonDecode(response.body);
       if (response.statusCode < 200 || response.statusCode >= 300) {
+        dynamic decoded;
+        if (response.body.isNotEmpty) {
+          try {
+            decoded = jsonDecode(response.body);
+          } catch (_) {
+            decoded = null;
+          }
+        }
         final message = decoded is Map && decoded['message'] is String
             ? decoded['message'] as String
             : '请求失败（${response.statusCode}）';
         throw ApiException(message, statusCode: response.statusCode);
+      }
+      if (response.statusCode == 204) return null;
+      if (response.body.isEmpty) {
+        throw ApiException(
+          '服务返回空响应（HTTP ${response.statusCode}）',
+          statusCode: response.statusCode,
+        );
+      }
+      final decoded = jsonDecode(response.body);
+      if (decoded == null) {
+        throw ApiException(
+          '服务返回空 JSON 响应（HTTP ${response.statusCode}）',
+          statusCode: response.statusCode,
+        );
       }
       return decoded;
     } on ApiException {

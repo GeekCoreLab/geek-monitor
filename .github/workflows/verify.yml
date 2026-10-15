@@ -606,6 +606,16 @@ jobs:
           jq -e '.backup.status == "NOT_RECORDED" and .platformHealth.retention.status == "CURRENT"' \
             "$RUNNER_TEMP/native-aot-system.json"
 
+          origin_status=$(curl --silent --show-error \
+            -o "$RUNNER_TEMP/native-aot-origin-login.json" \
+            -w '%{http_code}' \
+            -H 'Origin: https://geek-monitor.example.test' \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"no-such-user@example.test","password":"not-a-real-password"}' \
+            http://127.0.0.1:8080/api/v1/auth/login)
+          test "$origin_status" = 401
+          jq -e '.code == "INVALID_CREDENTIALS"' "$RUNNER_TEMP/native-aot-origin-login.json"
+
       - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
