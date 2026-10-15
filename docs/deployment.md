@@ -25,6 +25,17 @@ podman compose up -d --build
 
 `.github/workflows/verify.yml` 在完整验证通过后，使用 Quarkus Mandrel 容器构建 Linux x86_64 Native AOT 可执行文件，再用 `Dockerfile.native` 制作镜像。推送到 `master` 时发布 `latest` 和 `sha-<短提交号>`；推送 `v*` 标签时还发布版本标签。镜像发布至 `ghcr.io/<GitHub 用户名>/geek-monitor`。GHCR 使用工作流的 `GITHUB_TOKEN`，不需要额外 Secret。
 
+本地构建 Native 镜像时，先生成 Linux 可执行文件，再指定 Native Dockerfile：
+
+```sh
+./gradlew clean build \
+  -Dquarkus.native.enabled=true \
+  -Dquarkus.package.jar.enabled=false \
+  -Dquarkus.native.container-build=true
+GEEK_MONITOR_DOCKERFILE=src/main/docker/Dockerfile.native \
+  docker compose up -d --build app
+```
+
 若要同时推送到 Docker Hub，在仓库的 **Settings → Secrets and variables → Actions** 添加 `DOCKERHUB_USERNAME`（镜像命名空间/账号）和 `DOCKERHUB_TOKEN`（具备推送权限的 Docker Hub access token）。缺少其中任一项时，工作流仍会发布 GHCR 镜像并明确跳过 Docker Hub。Compose 可通过 `GEEK_MONITOR_IMAGE` 拉取发布镜像，并使用 `docker compose pull app` 与 `docker compose up -d --no-build app` 更新服务。
 
 ## SMTP 配置
