@@ -211,6 +211,28 @@ class PlatformResource {
         return Response.status(Response.Status.CREATED).entity(ProjectResponse(id.toString(), name, description, Instant.now().toString())).build()
     }
 
+    @PATCH
+    @Path("/projects/{id}")
+    fun updateProject(@PathParam("id") idText: String, request: ProjectRequest, @Context headers: HttpHeaders): Response {
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        if (user.role == "READ_ONLY") return error(Response.Status.FORBIDDEN, "READ_ONLY", "只读成员不能编辑项目")
+        val id = runCatching { UUID.fromString(idText) }.getOrNull()
+            ?: return error(Response.Status.BAD_REQUEST, "INVALID_PROJECT", "项目编号无效")
+        if (!authenticator.canManageProject(user.id, id)) return error(Response.Status.FORBIDDEN, "PROJECT_FORBIDDEN", "只有项目管理员可以编辑项目")
+        val name = request.name?.trim().orEmpty()
+        val description = request.description?.trim().orEmpty()
+        if (name.isBlank() || name.length > 120 || description.length > 1000) return error(Response.Status.BAD_REQUEST, "INVALID_PROJECT", "请检查项目名称和说明")
+        val createdAt = dataSource.connection.use { connection ->
+            connection.prepareStatement("UPDATE project SET name = ?, description = ?, updated_at = now() WHERE id = ? RETURNING created_at").use { statement ->
+                statement.setString(1, name)
+                statement.setString(2, description)
+                statement.setObject(3, id)
+                statement.executeQuery().use { result -> if (result.next()) result.getTimestamp(1).toInstant().toString() else null }
+            }
+        } ?: return error(Response.Status.NOT_FOUND, "PROJECT_NOT_FOUND", "项目不存在")
+        return Response.ok(ProjectResponse(id.toString(), name, description, createdAt, "ADMIN")).build()
+    }
+
     @GET
     @Path("/resources")
     fun listResources(@QueryParam("projectId") projectId: String?, @Context headers: HttpHeaders): Response {
@@ -269,6 +291,37 @@ class PlatformResource {
         }
         val created = getResource(id, user.id) ?: return error(Response.Status.INTERNAL_SERVER_ERROR, "RESOURCE_LOAD_FAILED", "资源已创建，但无法读取")
         return Response.status(Response.Status.CREATED).entity(created).build()
+    }
+
+    @PATCH
+    @Path("/resources/{id}")
+    fun updateResource(@PathParam("id") idText: String, request: ResourceUpdateRequest, @Context headers: HttpHeaders): Response {
+        val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
+        if (user.role == "READ_ONLY") return error(Response.Status.FORBIDDEN, "READ_ONLY", "只读成员不能编辑资源")
+        val id = runCatching { UUID.fromString(idText) }.getOrNull()
+            ?: return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "资源编号无效")
+        if (!authenticator.canAccessResource(user.id, id)) return error(Response.Status.NOT_FOUND, "RESOURCE_NOT_FOUND", "资源不存在或无权访问")
+        val name = request.name?.trim().orEmpty()
+        val environment = request.environment?.trim().orEmpty()
+        val tags = (request.tags ?: emptyList()).map(String::trim).filter(String::isNotEmpty).distinct().take(20)
+        val ownerEmail = request.ownerEmail?.trim()?.lowercase()?.takeIf(String::isNotBlank)
+        if (name.isBlank() || name.length > 160 || environment.isBlank() || environment.length > 80 ||
+            (ownerEmail != null && !EMAIL.matches(ownerEmail))) {
+            return error(Response.Status.BAD_REQUEST, "INVALID_RESOURCE", "请检查资源名称、环境和负责人邮箱")
+        }
+        dataSource.connection.use { connection ->
+            connection.prepareStatement("""UPDATE monitored_resource r SET name = ?, environment = ?, tags = CAST(? AS jsonb),
+                owner_email = ?, updated_at = now() WHERE r.id = ? AND r.deleted_at IS NULL""").use { statement ->
+                statement.setString(1, name)
+                statement.setString(2, environment)
+                statement.setString(3, objectMapper.writeValueAsString(tags))
+                statement.setString(4, ownerEmail)
+                statement.setObject(5, id)
+                if (statement.executeUpdate() != 1) return error(Response.Status.NOT_FOUND, "RESOURCE_NOT_FOUND", "资源不存在或无权访问")
+            }
+        }
+        return getResource(id, user.id)?.let { Response.ok(it).build() }
+            ?: error(Response.Status.NOT_FOUND, "RESOURCE_NOT_FOUND", "资源不存在或无权访问")
     }
 
     @PATCH

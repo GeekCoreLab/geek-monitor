@@ -946,6 +946,46 @@ class _DashboardShellState extends State<_DashboardShell> {
     }
   }
 
+  Future<void> _editProject(Map<String, dynamic> project) async {
+    final result = await showDialog<_ProjectDraft>(
+      context: context,
+      builder: (_) => _ProjectDialog(initial: project),
+    );
+    if (result == null) return;
+    try {
+      await widget.api.updateProject(
+        id: project['id'] as String,
+        name: result.name,
+        description: result.description,
+      );
+      await _reload();
+      if (mounted) _notice('项目已更新');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
+  Future<void> _editResource(Map<String, dynamic> resource) async {
+    final result = await showDialog<_ResourceDraft>(
+      context: context,
+      builder: (_) => _ResourceDialog(projects: _projects, existing: resource),
+    );
+    if (result == null) return;
+    try {
+      await widget.api.updateResource(
+        id: resource['id'] as String,
+        name: result.name,
+        environment: result.environment,
+        tags: result.tags,
+        ownerEmail: result.ownerEmail,
+      );
+      await _reload();
+      if (mounted) _notice('资源已更新');
+    } catch (error) {
+      if (mounted) _notice(error.toString(), isError: true);
+    }
+  }
+
   Future<void> _editMonitor([Map<String, dynamic>? current]) async {
     if (_resources.isEmpty) {
       _notice('请先添加一个监控资源', isError: true);
@@ -1409,6 +1449,7 @@ class _DashboardShellState extends State<_DashboardShell> {
         onMetrics: _showResourceMetrics,
         onTogglePause: _toggleResourcePause,
         onPublic: _configureResourcePublic,
+        onEdit: _editResource,
       ),
       _Section.monitors => _MonitorsPage(
         monitors: _monitors,
@@ -1439,7 +1480,9 @@ class _DashboardShellState extends State<_DashboardShell> {
       _Section.projects => _ProjectsPage(
         projects: _projects,
         canCreate: widget.user['role'] == 'ADMIN',
+        canEdit: widget.user['role'] != 'READ_ONLY',
         onCreate: _createProject,
+        onEdit: _editProject,
       ),
       _Section.members => _ProjectMembersPage(
         api: widget.api,
@@ -2395,6 +2438,7 @@ class _ResourcesPage extends StatelessWidget {
     required this.onMetrics,
     required this.onTogglePause,
     required this.onPublic,
+    required this.onEdit,
   });
 
   final List<Map<String, dynamic>> resources;
@@ -2405,6 +2449,7 @@ class _ResourcesPage extends StatelessWidget {
   final ValueChanged<Map<String, dynamic>> onMetrics;
   final ValueChanged<Map<String, dynamic>> onTogglePause;
   final ValueChanged<Map<String, dynamic>> onPublic;
+  final ValueChanged<Map<String, dynamic>> onEdit;
 
   @override
   Widget build(BuildContext context) => _PageScroll(
@@ -2414,7 +2459,7 @@ class _ResourcesPage extends StatelessWidget {
         _PageHeading(
           eyebrow: 'MONITORED RESOURCES',
           title: '监控资源',
-          subtitle: '按项目管理主机、网站、数据库和基础服务。',
+          subtitle: '按项目管理主机、网站、数据库和基础服务。点击资源行的“公开页面”设置对公展示。',
           actions: [
             FilledButton.icon(
               onPressed: onCreate,
@@ -2523,18 +2568,40 @@ class _ResourcesPage extends StatelessWidget {
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
                                       IconButton(
-                                        tooltip:
-                                            resource['publicEnabled'] == true
-                                            ? '对公页面（已开启）'
-                                            : '对公页面（未开启）',
+                                        tooltip: '编辑资源',
+                                        onPressed: () => onEdit(resource),
+                                        icon: const Icon(
+                                          Icons.edit_outlined,
+                                          color: _muted,
+                                          size: 18,
+                                        ),
+                                      ),
+                                      TextButton.icon(
                                         onPressed: () => onPublic(resource),
                                         icon: Icon(
                                           Icons.public,
+                                          size: 16,
                                           color:
                                               resource['publicEnabled'] == true
                                               ? _green
                                               : _muted,
-                                          size: 18,
+                                        ),
+                                        label: Text(
+                                          resource['publicEnabled'] == true
+                                              ? '公开中'
+                                              : '公开页面',
+                                        ),
+                                        style: TextButton.styleFrom(
+                                          foregroundColor:
+                                              resource['publicEnabled'] == true
+                                              ? _green
+                                              : _ink,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                          ),
+                                          textStyle: const TextStyle(
+                                            fontSize: 11,
+                                          ),
                                         ),
                                       ),
                                       IconButton(
@@ -4369,12 +4436,16 @@ class _ProjectsPage extends StatelessWidget {
   const _ProjectsPage({
     required this.projects,
     required this.canCreate,
+    required this.canEdit,
     required this.onCreate,
+    required this.onEdit,
   });
 
   final List<Map<String, dynamic>> projects;
   final bool canCreate;
+  final bool canEdit;
   final VoidCallback onCreate;
+  final ValueChanged<Map<String, dynamic>> onEdit;
 
   @override
   Widget build(BuildContext context) => _PageScroll(
@@ -4444,9 +4515,26 @@ class _ProjectsPage extends StatelessWidget {
                                       ),
                                     ),
                                     const Spacer(),
-                                    const Icon(
-                                      Icons.more_horiz_rounded,
-                                      color: _muted,
+                                    PopupMenuButton<String>(
+                                      tooltip: '项目操作',
+                                      enabled:
+                                          canEdit &&
+                                          project['membershipRole'] == 'ADMIN',
+                                      onSelected: (_) => onEdit(project),
+                                      itemBuilder: (_) => const [
+                                        PopupMenuItem(
+                                          value: 'edit',
+                                          child: ListTile(
+                                            contentPadding: EdgeInsets.zero,
+                                            leading: Icon(Icons.edit_outlined),
+                                            title: Text('编辑项目'),
+                                          ),
+                                        ),
+                                      ],
+                                      icon: const Icon(
+                                        Icons.more_horiz_rounded,
+                                        color: _muted,
+                                      ),
                                     ),
                                   ],
                                 ),
@@ -8470,7 +8558,8 @@ class _ProjectDraft {
 }
 
 class _ProjectDialog extends StatefulWidget {
-  const _ProjectDialog();
+  const _ProjectDialog({this.initial});
+  final Map<String, dynamic>? initial;
 
   @override
   State<_ProjectDialog> createState() => _ProjectDialogState();
@@ -8482,6 +8571,13 @@ class _ProjectDialogState extends State<_ProjectDialog> {
   final _description = TextEditingController();
 
   @override
+  void initState() {
+    super.initState();
+    _name.text = widget.initial?['name'] as String? ?? '';
+    _description.text = widget.initial?['description'] as String? ?? '';
+  }
+
+  @override
   void dispose() {
     _name.dispose();
     _description.dispose();
@@ -8490,7 +8586,7 @@ class _ProjectDialogState extends State<_ProjectDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-    title: const Text('创建项目'),
+    title: Text(widget.initial == null ? '创建项目' : '编辑项目'),
     content: SizedBox(
       width: 430,
       child: Form(
@@ -8537,7 +8633,7 @@ class _ProjectDialogState extends State<_ProjectDialog> {
             );
           }
         },
-        child: const Text('创建'),
+        child: Text(widget.initial == null ? '创建项目' : '保存更改'),
       ),
     ],
   );
@@ -8561,9 +8657,10 @@ class _ResourceDraft {
 }
 
 class _ResourceDialog extends StatefulWidget {
-  const _ResourceDialog({required this.projects});
+  const _ResourceDialog({required this.projects, this.existing});
 
   final List<Map<String, dynamic>> projects;
+  final Map<String, dynamic>? existing;
 
   @override
   State<_ResourceDialog> createState() => _ResourceDialogState();
@@ -8571,12 +8668,26 @@ class _ResourceDialog extends StatefulWidget {
 
 class _ResourceDialogState extends State<_ResourceDialog> {
   final _formKey = GlobalKey<FormState>();
-  late String _projectId = widget.projects.first['id'] as String;
-  String _type = 'WEBSITE';
+  late String _projectId =
+      widget.existing?['projectId'] as String? ??
+      widget.projects.first['id'] as String;
+  late String _type = widget.existing?['type'] as String? ?? 'WEBSITE';
   final _name = TextEditingController();
   final _environment = TextEditingController(text: 'production');
   final _tags = TextEditingController();
   final _ownerEmail = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    final existing = widget.existing;
+    if (existing != null) {
+      _name.text = existing['name'] as String? ?? '';
+      _environment.text = existing['environment'] as String? ?? 'production';
+      _tags.text = (existing['tags'] as List<dynamic>? ?? const []).join(', ');
+      _ownerEmail.text = existing['ownerEmail'] as String? ?? '';
+    }
+  }
 
   @override
   void dispose() {
@@ -8589,7 +8700,7 @@ class _ResourceDialogState extends State<_ResourceDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-    title: const Text('添加监控资源'),
+    title: Text(widget.existing == null ? '添加监控资源' : '编辑监控资源'),
     content: SizedBox(
       width: 470,
       child: Form(
@@ -8598,19 +8709,28 @@ class _ResourceDialogState extends State<_ResourceDialog> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              DropdownButtonFormField<String>(
-                initialValue: _projectId,
-                decoration: const InputDecoration(labelText: '所属项目'),
-                items: widget.projects
-                    .map(
-                      (project) => DropdownMenuItem(
-                        value: project['id'] as String,
-                        child: Text(project['name'] as String),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (value) => setState(() => _projectId = value!),
-              ),
+              if (widget.existing == null)
+                DropdownButtonFormField<String>(
+                  initialValue: _projectId,
+                  decoration: const InputDecoration(labelText: '所属项目'),
+                  items: widget.projects
+                      .map(
+                        (project) => DropdownMenuItem(
+                          value: project['id'] as String,
+                          child: Text(project['name'] as String),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) => setState(() => _projectId = value!),
+                )
+              else
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('所属项目'),
+                  subtitle: Text(
+                    widget.existing?['projectName'] as String? ?? '',
+                  ),
+                ),
               const SizedBox(height: 12),
               TextFormField(
                 controller: _name,
@@ -8624,18 +8744,25 @@ class _ResourceDialogState extends State<_ResourceDialog> {
                     value == null || value.trim().isEmpty ? '请输入资源名称' : null,
               ),
               const SizedBox(height: 12),
-              DropdownButtonFormField<String>(
-                initialValue: _type,
-                decoration: const InputDecoration(labelText: '资源类型'),
-                items: const [
-                  DropdownMenuItem(value: 'WEBSITE', child: Text('网站')),
-                  DropdownMenuItem(value: 'HOST', child: Text('主机')),
-                  DropdownMenuItem(value: 'DATABASE', child: Text('数据库')),
-                  DropdownMenuItem(value: 'SERVICE', child: Text('基础服务')),
-                  DropdownMenuItem(value: 'HEARTBEAT', child: Text('心跳任务')),
-                ],
-                onChanged: (value) => setState(() => _type = value!),
-              ),
+              if (widget.existing == null)
+                DropdownButtonFormField<String>(
+                  initialValue: _type,
+                  decoration: const InputDecoration(labelText: '资源类型'),
+                  items: const [
+                    DropdownMenuItem(value: 'WEBSITE', child: Text('网站')),
+                    DropdownMenuItem(value: 'HOST', child: Text('主机')),
+                    DropdownMenuItem(value: 'DATABASE', child: Text('数据库')),
+                    DropdownMenuItem(value: 'SERVICE', child: Text('基础服务')),
+                    DropdownMenuItem(value: 'HEARTBEAT', child: Text('心跳任务')),
+                  ],
+                  onChanged: (value) => setState(() => _type = value!),
+                )
+              else
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('资源类型'),
+                  subtitle: Text(_resourceTypeName(_type)),
+                ),
               const SizedBox(height: 12),
               TextFormField(
                 controller: _environment,
@@ -8694,7 +8821,7 @@ class _ResourceDialogState extends State<_ResourceDialog> {
             );
           }
         },
-        child: const Text('添加资源'),
+        child: Text(widget.existing == null ? '添加资源' : '保存更改'),
       ),
     ],
   );

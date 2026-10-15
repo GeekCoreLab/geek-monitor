@@ -275,6 +275,18 @@ class ApiClient {
     );
   }
 
+  Future<Map<String, dynamic>> updateProject({
+    required String id,
+    required String name,
+    required String description,
+  }) async =>
+      (await _send(
+            'PATCH',
+            '/api/v1/projects/${Uri.encodeComponent(id)}',
+            body: {'name': name, 'description': description},
+          ))
+          as Map<String, dynamic>;
+
   Future<List<Map<String, dynamic>>> resources({String? projectId}) async {
     final query = projectId == null
         ? ''
@@ -314,6 +326,25 @@ class ApiClient {
       body: {'enabled': enabled},
     );
   }
+
+  Future<Map<String, dynamic>> updateResource({
+    required String id,
+    required String name,
+    required String environment,
+    required List<String> tags,
+    String? ownerEmail,
+  }) async =>
+      (await _send(
+            'PATCH',
+            '/api/v1/resources/${Uri.encodeComponent(id)}',
+            body: {
+              'name': name,
+              'environment': environment,
+              'tags': tags,
+              'ownerEmail': ownerEmail,
+            },
+          ))
+          as Map<String, dynamic>;
 
   Future<void> deleteResource(String id) async {
     await _send('DELETE', '/api/v1/resources/${Uri.encodeComponent(id)}');

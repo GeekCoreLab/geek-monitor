@@ -6,6 +6,7 @@ data class LoginRequest(val email: String?, val password: String?)
 data class SessionResponse(val expiresAt: String, val user: UserResponse)
 data class UserResponse(val id: String, val email: String, val role: String)
 data class ProjectRequest(val name: String?, val description: String? = "")
+data class ResourceUpdateRequest(val name: String?, val environment: String?, val tags: List<String>? = emptyList(), val ownerEmail: String? = null)
 data class ProjectResponse(
     val id: String,
     val name: String,
