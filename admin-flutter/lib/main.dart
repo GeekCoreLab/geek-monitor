@@ -7,6 +7,11 @@ import 'package:flutter/services.dart';
 
 import 'api_client.dart';
 
+const _buildRef = String.fromEnvironment(
+  'GEEK_MONITOR_BUILD',
+  defaultValue: 'local',
+);
+
 void main() {
   runApp(GeekMonitorApp());
 }
@@ -1653,7 +1658,7 @@ class _SideNavigation extends StatelessWidget {
         const Padding(
           padding: EdgeInsets.symmetric(horizontal: 10),
           child: Text(
-            'GEEK MONITOR  ·  0.1.0',
+            'GEEK MONITOR  ·  0.1.0  ·  $_buildRef',
             style: TextStyle(color: Color(0xFF778CA3), fontSize: 10),
           ),
         ),
@@ -2526,12 +2531,41 @@ class _ResourcesPage extends StatelessWidget {
                             (resource) => DataRow(
                               cells: [
                                 DataCell(
-                                  Text(
-                                    resource['name'] as String? ?? '',
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w600,
-                                      fontSize: 12,
-                                    ),
+                                  Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        resource['name'] as String? ?? '',
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w600,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                      SizedBox(
+                                        height: 32,
+                                        child: TextButton.icon(
+                                          onPressed: () => onEdit(resource),
+                                          icon: const Icon(
+                                            Icons.edit_outlined,
+                                            size: 14,
+                                          ),
+                                          label: const Text('编辑'),
+                                          style: TextButton.styleFrom(
+                                            padding: EdgeInsets.zero,
+                                            minimumSize: const Size(0, 32),
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                            tapTargetSize: MaterialTapTargetSize
+                                                .shrinkWrap,
+                                            textStyle: const TextStyle(
+                                              fontSize: 11,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                                 DataCell(
@@ -2567,15 +2601,6 @@ class _ResourcesPage extends StatelessWidget {
                                   Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
-                                      IconButton(
-                                        tooltip: '编辑资源',
-                                        onPressed: () => onEdit(resource),
-                                        icon: const Icon(
-                                          Icons.edit_outlined,
-                                          color: _muted,
-                                          size: 18,
-                                        ),
-                                      ),
                                       TextButton.icon(
                                         onPressed: () => onPublic(resource),
                                         icon: Icon(

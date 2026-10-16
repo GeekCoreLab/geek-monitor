@@ -47,12 +47,14 @@ configurations.named("testRuntimeClasspath") {
 val flutterResourceRoot = layout.buildDirectory.dir("generated/flutter-web")
 val flutterWebOutput = flutterResourceRoot.map { it.dir("META-INF/resources") }
 val includeFlutterDevCredentials = gradle.startParameter.taskNames.any { it.contains("quarkusDev", ignoreCase = true) }
+val flutterBuildRef = providers.environmentVariable("GITHUB_SHA").map { it.take(7) }.getOrElse("local")
 val buildFlutterWeb by tasks.registering(Exec::class) {
     val flutterSource = layout.projectDirectory.dir("admin-flutter")
     workingDir(flutterSource)
     commandLine(
         "flutter", "build", "web", "--release",
         "--dart-define=GEEK_MONITOR_DEV_CREDENTIALS=$includeFlutterDevCredentials",
+        "--dart-define=GEEK_MONITOR_BUILD=$flutterBuildRef",
         "--output", flutterWebOutput.get().asFile.absolutePath,
     )
     inputs.dir(flutterSource.dir("lib"))
@@ -60,6 +62,7 @@ val buildFlutterWeb by tasks.registering(Exec::class) {
     inputs.file(flutterSource.file("pubspec.yaml"))
     inputs.file(flutterSource.file("pubspec.lock"))
     inputs.property("devCredentials", includeFlutterDevCredentials)
+    inputs.property("buildRef", flutterBuildRef)
     outputs.dir(flutterResourceRoot)
 }
 
