@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 
 import 'api_client.dart';
 
@@ -105,6 +106,9 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
     return MaterialApp(
       title: 'Geek Monitor',
       debugShowCheckedModeBanner: false,
+      locale: const Locale('zh', 'CN'),
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
+      supportedLocales: const [Locale('zh', 'CN')],
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: colorScheme,
@@ -814,6 +818,7 @@ enum _Section {
   monitors,
   incidents,
   notifications,
+  maintenance,
   projects,
   members,
   agents,
@@ -1482,6 +1487,13 @@ class _DashboardShellState extends State<_DashboardShell> {
         readOnly: widget.user['role'] == 'READ_ONLY',
         onNotice: _notice,
       ),
+      _Section.maintenance => _MaintenancePage(
+        api: widget.api,
+        projects: _projects,
+        resources: _resources,
+        readOnly: widget.user['role'] == 'READ_ONLY',
+        onNotice: _notice,
+      ),
       _Section.projects => _ProjectsPage(
         projects: _projects,
         canCreate: widget.user['role'] == 'ADMIN',
@@ -1592,6 +1604,12 @@ class _SideNavigation extends StatelessWidget {
           label: '故障中心',
           selected: section == _Section.incidents,
           onTap: () => onSelect(_Section.incidents),
+        ),
+        _NavItem(
+          icon: Icons.build_circle_outlined,
+          label: '维护窗口',
+          selected: section == _Section.maintenance,
+          onTap: () => onSelect(_Section.maintenance),
         ),
         _NavItem(
           icon: Icons.notifications_outlined,
@@ -1849,6 +1867,7 @@ class _BottomNavigation extends StatelessWidget {
 
   static const _moreSections = [
     (_Section.projects, '项目管理', Icons.folder_outlined),
+    (_Section.maintenance, '维护窗口', Icons.build_circle_outlined),
     (_Section.members, '成员与角色', Icons.group_outlined),
     (_Section.agents, 'Agent 节点', Icons.memory_outlined),
     (_Section.settings, '系统设置与审计', Icons.settings_outlined),
@@ -4627,8 +4646,8 @@ class _ProjectsPage extends StatelessWidget {
   );
 }
 
-class _NotificationsPage extends StatefulWidget {
-  const _NotificationsPage({
+class _MaintenancePage extends StatefulWidget {
+  const _MaintenancePage({
     required this.api,
     required this.projects,
     required this.resources,
@@ -4643,16 +4662,22 @@ class _NotificationsPage extends StatefulWidget {
   final ValueChanged<String> onNotice;
 
   @override
-  State<_NotificationsPage> createState() => _NotificationsPageState();
+  State<_MaintenancePage> createState() => _MaintenancePageState();
 }
 
-class _NotificationsPageState extends State<_NotificationsPage> {
-  List<Map<String, dynamic>> _channels = [];
-  List<Map<String, dynamic>> _deliveries = [];
-  List<Map<String, dynamic>> _maintenanceWindows = [];
-  List<Map<String, dynamic>> _notificationSilences = [];
+class _MaintenancePageState extends State<_MaintenancePage> {
+  static const _pageSize = 10;
+  List<Map<String, dynamic>> _windows = [];
   bool _loading = true;
-  String? _testingId;
+  int _page = 0;
+
+  int get _pageCount =>
+      _windows.isEmpty ? 1 : (_windows.length + _pageSize - 1) ~/ _pageSize;
+
+  List<Map<String, dynamic>> get _visibleWindows {
+    final start = _page * _pageSize;
+    return _windows.skip(start).take(_pageSize).toList();
+  }
 
   @override
   void initState() {
@@ -4663,27 +4688,20 @@ class _NotificationsPageState extends State<_NotificationsPage> {
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final results = await Future.wait([
-        widget.api.notificationChannels(),
-        widget.api.notificationDeliveries(),
-        widget.api.maintenanceWindows(),
-        widget.api.notificationSilences(),
-      ]);
+      final windows = await widget.api.maintenanceWindows();
       if (!mounted) return;
       setState(() {
-        _channels = results[0];
-        _deliveries = results[1];
-        _maintenanceWindows = results[2];
-        _notificationSilences = results[3];
+        _windows = windows;
+        if (_page >= _pageCount) _page = _pageCount - 1;
       });
     } catch (error) {
-      if (mounted) widget.onNotice('加载通知记录失败：$error');
+      if (mounted) widget.onNotice('加载维护窗口失败：$error');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
-  Future<void> _createMaintenanceWindow() async {
+  Future<void> _createWindow() async {
     if (widget.projects.isEmpty) {
       widget.onNotice('请先创建项目');
       return;
@@ -4698,6 +4716,7 @@ class _NotificationsPageState extends State<_NotificationsPage> {
     if (draft == null) return;
     try {
       await widget.api.createMaintenanceWindow(draft.toJson());
+      _page = 0;
       await _load();
       if (mounted) widget.onNotice('维护窗口已创建');
     } catch (error) {
@@ -4705,7 +4724,7 @@ class _NotificationsPageState extends State<_NotificationsPage> {
     }
   }
 
-  Future<void> _cancelMaintenanceWindow(Map<String, dynamic> window) async {
+  Future<void> _cancelWindow(Map<String, dynamic> window) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -4730,6 +4749,189 @@ class _NotificationsPageState extends State<_NotificationsPage> {
       if (mounted) widget.onNotice('维护窗口已取消');
     } catch (error) {
       if (mounted) widget.onNotice('取消维护窗口失败：$error');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => _PageScroll(
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _PageHeading(
+          eyebrow: 'OPERATIONS',
+          title: '维护窗口',
+          subtitle: '安排项目或单个资源的计划维护；维护期间继续采集检查结果并抑制通知。',
+          actions: [
+            OutlinedButton.icon(
+              onPressed: _loading ? null : _load,
+              icon: const Icon(Icons.refresh_rounded, size: 18),
+              label: const Text('刷新'),
+            ),
+            if (!widget.readOnly)
+              FilledButton.icon(
+                onPressed: _createWindow,
+                icon: const Icon(Icons.add_rounded, size: 18),
+                label: const Text('安排维护'),
+              ),
+          ],
+        ),
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                '维护计划',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+              ),
+            ),
+            Text(
+              '${_windows.where((window) => window['status'] == 'ACTIVE' || window['status'] == 'SCHEDULED').length} 个有效窗口 · 共 ${_windows.length} 条',
+              style: const TextStyle(color: _muted, fontSize: 11),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        if (_loading && _windows.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(28),
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          )
+        else if (_windows.isEmpty)
+          const Card(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: _EmptyState(
+                icon: Icons.event_busy_outlined,
+                title: '暂无维护窗口',
+                subtitle: '维护期间继续保存检查结果，并抑制该项目或资源的故障通知。',
+              ),
+            ),
+          )
+        else ...[
+          for (final window in _visibleWindows)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Card(
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(
+                    window['status'] == 'ACTIVE'
+                        ? Icons.build_circle_outlined
+                        : Icons.event_available_outlined,
+                    color: window['status'] == 'ACTIVE'
+                        ? const Color(0xFF4285F4)
+                        : _muted,
+                  ),
+                  title: Text(
+                    window['name'] as String? ?? '维护窗口',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  subtitle: Text(
+                    '${window['projectName']} · ${window['resourceName'] ?? '全部资源'} · ${_dateTime(window['startsAt'] as String?)} 至 ${_dateTime(window['endsAt'] as String?)}${(window['description'] as String? ?? '').isEmpty ? '' : ' · ${window['description']}'}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 10, color: _muted),
+                  ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _MaintenanceWindowStatus(
+                        status: window['status'] as String? ?? 'ENDED',
+                      ),
+                      if (!widget.readOnly &&
+                          (window['status'] == 'ACTIVE' ||
+                              window['status'] == 'SCHEDULED'))
+                        IconButton(
+                          tooltip: '取消维护窗口',
+                          onPressed: () => _cancelWindow(window),
+                          icon: const Icon(Icons.close_rounded, size: 18),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              IconButton(
+                tooltip: '上一页',
+                onPressed: _page > 0 ? () => setState(() => _page--) : null,
+                icon: const Icon(Icons.chevron_left_rounded),
+              ),
+              Text(
+                '第 ${_page + 1} / $_pageCount 页',
+                style: const TextStyle(color: _muted, fontSize: 12),
+              ),
+              IconButton(
+                tooltip: '下一页',
+                onPressed: _page + 1 < _pageCount
+                    ? () => setState(() => _page++)
+                    : null,
+                icon: const Icon(Icons.chevron_right_rounded),
+              ),
+            ],
+          ),
+        ],
+      ],
+    ),
+  );
+}
+
+class _NotificationsPage extends StatefulWidget {
+  const _NotificationsPage({
+    required this.api,
+    required this.projects,
+    required this.resources,
+    required this.readOnly,
+    required this.onNotice,
+  });
+
+  final ApiClient api;
+  final List<Map<String, dynamic>> projects;
+  final List<Map<String, dynamic>> resources;
+  final bool readOnly;
+  final ValueChanged<String> onNotice;
+
+  @override
+  State<_NotificationsPage> createState() => _NotificationsPageState();
+}
+
+class _NotificationsPageState extends State<_NotificationsPage> {
+  List<Map<String, dynamic>> _channels = [];
+  List<Map<String, dynamic>> _deliveries = [];
+  List<Map<String, dynamic>> _notificationSilences = [];
+  bool _loading = true;
+  String? _testingId;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    try {
+      final results = await Future.wait([
+        widget.api.notificationChannels(),
+        widget.api.notificationDeliveries(),
+        widget.api.notificationSilences(),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _channels = results[0];
+        _deliveries = results[1];
+        _notificationSilences = results[2];
+      });
+    } catch (error) {
+      if (mounted) widget.onNotice('加载通知记录失败：$error');
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -4874,7 +5076,7 @@ class _NotificationsPageState extends State<_NotificationsPage> {
         _PageHeading(
           eyebrow: 'ALERT DELIVERY',
           title: '告警与通知',
-          subtitle: '维护窗口保留检查结果并抑制通知；故障和恢复事件通过项目渠道发送。',
+          subtitle: '管理通知渠道、投递记录和通知静默。',
           actions: [
             OutlinedButton.icon(
               onPressed: _loading ? null : _load,
@@ -4889,87 +5091,6 @@ class _NotificationsPageState extends State<_NotificationsPage> {
               ),
           ],
         ),
-        Row(
-          children: [
-            const Expanded(
-              child: Text(
-                '维护窗口',
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
-              ),
-            ),
-            Text(
-              '${_maintenanceWindows.where((window) => window['status'] == 'ACTIVE' || window['status'] == 'SCHEDULED').length} 个有效窗口',
-              style: const TextStyle(color: _muted, fontSize: 11),
-            ),
-            if (!widget.readOnly) ...[
-              const SizedBox(width: 10),
-              FilledButton.tonalIcon(
-                onPressed: _createMaintenanceWindow,
-                icon: const Icon(Icons.schedule_rounded, size: 17),
-                label: const Text('安排维护'),
-              ),
-            ],
-          ],
-        ),
-        const SizedBox(height: 10),
-        if (_maintenanceWindows.isEmpty)
-          const Card(
-            child: Padding(
-              padding: EdgeInsets.all(24),
-              child: _EmptyState(
-                icon: Icons.event_busy_outlined,
-                title: '暂无维护窗口',
-                subtitle: '维护期间继续保存检查结果，并抑制该项目或资源的故障通知。',
-              ),
-            ),
-          )
-        else
-          ..._maintenanceWindows.map(
-            (window) => Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Card(
-                child: ListTile(
-                  dense: true,
-                  leading: Icon(
-                    window['status'] == 'ACTIVE'
-                        ? Icons.pause_circle_outline_rounded
-                        : Icons.event_available_outlined,
-                    color: window['status'] == 'ACTIVE' ? _blue : _muted,
-                  ),
-                  title: Text(
-                    window['name'] as String? ?? '维护窗口',
-                    style: const TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  subtitle: Text(
-                    '${window['projectName']} · ${window['resourceName'] ?? '全部资源'} · ${_dateTime(window['startsAt'] as String?)} 至 ${_dateTime(window['endsAt'] as String?)}${(window['description'] as String? ?? '').isEmpty ? '' : ' · ${window['description']}'}',
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 10, color: _muted),
-                  ),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _MaintenanceWindowStatus(
-                        status: window['status'] as String? ?? 'ENDED',
-                      ),
-                      if (!widget.readOnly &&
-                          (window['status'] == 'ACTIVE' ||
-                              window['status'] == 'SCHEDULED'))
-                        IconButton(
-                          tooltip: '取消维护窗口',
-                          onPressed: () => _cancelMaintenanceWindow(window),
-                          icon: const Icon(Icons.close_rounded, size: 18),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        const SizedBox(height: 20),
         Row(
           children: [
             const Expanded(
@@ -5339,6 +5460,7 @@ class _MaintenanceWindowDialogState extends State<_MaintenanceWindowDialog> {
     final today = DateTime.now();
     final date = await showDatePicker(
       context: context,
+      locale: const Locale('zh', 'CN'),
       initialDate: initial.isBefore(today) ? today : initial,
       firstDate: DateTime(today.year, today.month, today.day),
       lastDate: DateTime(today.year + 5, today.month, today.day),
@@ -5352,8 +5474,14 @@ class _MaintenanceWindowDialogState extends State<_MaintenanceWindowDialog> {
     return DateTime(date.year, date.month, date.day, time.hour, time.minute);
   }
 
-  String _formatDateTime(BuildContext context, DateTime value) =>
-      '${MaterialLocalizations.of(context).formatMediumDate(value)} ${MaterialLocalizations.of(context).formatTimeOfDay(TimeOfDay.fromDateTime(value))}';
+  String _formatDateTime(DateTime value) {
+    const weekdays = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'];
+    final month = value.month.toString().padLeft(2, '0');
+    final day = value.day.toString().padLeft(2, '0');
+    final hour = value.hour.toString().padLeft(2, '0');
+    final minute = value.minute.toString().padLeft(2, '0');
+    return '${value.year}年$month月$day日 ${weekdays[value.weekday - 1]} $hour:$minute';
+  }
 
   @override
   Widget build(BuildContext context) => AlertDialog(
@@ -5428,7 +5556,7 @@ class _MaintenanceWindowDialogState extends State<_MaintenanceWindowDialog> {
                   }
                 },
                 icon: const Icon(Icons.play_arrow_rounded, size: 18),
-                label: Text('开始：${_formatDateTime(context, _startsAt)}'),
+                label: Text('开始：${_formatDateTime(_startsAt)}'),
               ),
               const SizedBox(height: 8),
               OutlinedButton.icon(
@@ -5442,7 +5570,7 @@ class _MaintenanceWindowDialogState extends State<_MaintenanceWindowDialog> {
                   }
                 },
                 icon: const Icon(Icons.stop_rounded, size: 18),
-                label: Text('结束：${_formatDateTime(context, _endsAt)}'),
+                label: Text('结束：${_formatDateTime(_endsAt)}'),
               ),
               if (_timeError != null) ...[
                 const SizedBox(height: 8),

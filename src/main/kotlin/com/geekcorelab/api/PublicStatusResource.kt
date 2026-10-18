@@ -14,7 +14,10 @@ import jakarta.ws.rs.core.Response
 import java.sql.Timestamp
 import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
 import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.UUID
 import javax.sql.DataSource
 
@@ -36,6 +39,7 @@ class PublicStatusResource {
         val historyStartAt = historyStart.atStartOfDay(ZoneOffset.UTC).toInstant()
         val historyEndAt = historyStartAt.plusSeconds(HISTORY_DAYS * SLOTS_PER_DAY * SLOT_SECONDS)
         val historyTotals = mutableMapOf<UUID, MutableMap<Instant, PublicSlotTotals>>()
+        val maintenanceWindows = mutableListOf<PublicMaintenanceWindow>()
         dataSource.connection.use { connection ->
             connection.prepareStatement("""SELECT r.id, r.name, r.tags::text AS tags, r.health_status, r.paused,
                 m.type, m.enabled, m.current_state
@@ -89,16 +93,65 @@ class PublicStatusResource {
                         }
                     }
                 }
+                connection.prepareStatement(
+                    """SELECT w.resource_id, w.name, w.starts_at, w.ends_at, w.canceled_at,
+                              CASE WHEN w.canceled_at IS NOT NULL THEN 'CANCELLED'
+                                   WHEN w.starts_at <= now() AND w.ends_at > now() THEN 'ACTIVE'
+                                   WHEN w.starts_at > now() THEN 'SCHEDULED'
+                                   ELSE 'ENDED' END AS status
+                       FROM maintenance_window w
+                       WHERE w.project_id = ?
+                         AND LEAST(w.ends_at, COALESCE(w.canceled_at, w.ends_at)) > ?
+                         AND w.starts_at < ?
+                       ORDER BY w.starts_at""",
+                ).use { statement ->
+                    statement.setObject(1, projectId)
+                    statement.setTimestamp(2, Timestamp.from(historyStartAt))
+                    statement.setTimestamp(3, Timestamp.from(historyEndAt))
+                    statement.executeQuery().use { result ->
+                        while (result.next()) {
+                            val startsAt = result.getTimestamp("starts_at").toInstant()
+                            val endsAt = result.getTimestamp("ends_at").toInstant()
+                            val canceledAt = result.getTimestamp("canceled_at")?.toInstant()
+                            val effectiveEndsAt = minOf(endsAt, canceledAt ?: endsAt)
+                            maintenanceWindows += PublicMaintenanceWindow(
+                                resourceId = result.getObject("resource_id", UUID::class.java),
+                                name = result.getString("name"),
+                                startsAt = startsAt,
+                                effectiveEndsAt = effectiveEndsAt,
+                                status = result.getString("status"),
+                                period = "${DISPLAY_TIME.format(startsAt)} 至 ${DISPLAY_TIME.format(endsAt)}（北京时间）",
+                            )
+                        }
+                    }
+                }
             }
         }
         if (resources.isEmpty()) return unavailable()
         resources.forEach { (resourceId, resource) ->
             val totals = historyTotals[resourceId].orEmpty()
+            resource.maintenanceWindows = maintenanceWindows.filter { window ->
+                window.status in PUBLIC_WINDOW_STATUSES &&
+                    (window.resourceId == null || window.resourceId == resourceId)
+            }
+            val now = Instant.now()
+            if (resource.maintenanceWindows.any { it.startsAt <= now && it.effectiveEndsAt > now }) {
+                resource.state = "MAINTENANCE"
+                resource.status = "维护中"
+            }
             resource.history = (0 until HISTORY_SLOTS).map { offset ->
                 val slot = historyStartAt.plusSeconds(offset * SLOT_SECONDS)
-                val state = historyState(totals[slot])
                 val slotEnd = slot.plusSeconds(SLOT_SECONDS)
-                PublicHistorySlot("${slot} – ${slotEnd}", state, historyLabel(state))
+                val maintenance = maintenanceWindows.any { window ->
+                    (window.resourceId == null || window.resourceId == resourceId) &&
+                        window.startsAt < slotEnd && window.effectiveEndsAt > slot
+                }
+                val state = if (maintenance) "MAINTENANCE" else historyState(totals[slot])
+                PublicHistorySlot(
+                    "${DISPLAY_TIME.format(slot)} 至 ${DISPLAY_TIME.format(slotEnd)}（北京时间）",
+                    state,
+                    historyLabel(state),
+                )
             }
         }
         val groups = sortedMapOf<String, MutableList<PublicResource>>()
@@ -139,6 +192,7 @@ class PublicStatusResource {
         "UP" -> "运行正常"
         "DEGRADED" -> "高延迟或性能降级"
         "DOWN" -> "服务异常"
+        "MAINTENANCE" -> "维护中"
         else -> "暂无可用数据"
     }
 
@@ -153,15 +207,22 @@ class PublicStatusResource {
         private const val SLOTS_PER_DAY = 12
         private const val HISTORY_SLOTS = HISTORY_DAYS * SLOTS_PER_DAY
         private const val SLOT_SECONDS = 2L * 60 * 60
+        private val PUBLIC_WINDOW_STATUSES = setOf("ACTIVE", "SCHEDULED")
+        private val DISPLAY_TIME = DateTimeFormatter.ofPattern("yyyy年M月d日 HH:mm", Locale.CHINA)
+            .withZone(ZoneId.of("Asia/Shanghai"))
     }
 }
 
 @TemplateData
 data class PublicGroup(val name: String, val resources: List<PublicResource>)
 @TemplateData
-data class PublicResource(val name: String, val tags: List<String>, val state: String, val status: String,
-    val methods: MutableList<PublicMethod> = mutableListOf(), var history: List<PublicHistorySlot> = emptyList())
+data class PublicResource(val name: String, val tags: List<String>, var state: String, var status: String,
+    val methods: MutableList<PublicMethod> = mutableListOf(), var history: List<PublicHistorySlot> = emptyList(),
+    var maintenanceWindows: List<PublicMaintenanceWindow> = emptyList())
 @TemplateData
 data class PublicMethod(val name: String, val state: String, val status: String)
 @TemplateData
 data class PublicHistorySlot(val period: String, val state: String, val status: String)
+@TemplateData
+data class PublicMaintenanceWindow(val resourceId: UUID?, val name: String, val startsAt: Instant,
+    val effectiveEndsAt: Instant, val status: String, val period: String)
