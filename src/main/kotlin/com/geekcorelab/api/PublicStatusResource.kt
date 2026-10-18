@@ -33,10 +33,9 @@ class PublicStatusResource {
             ?: return unavailable()
         val resources = linkedMapOf<UUID, PublicResource>()
         val historyStart = LocalDate.now(ZoneOffset.UTC).minusDays((HISTORY_DAYS - 1).toLong())
-        val historyEnd = historyStart.plusDays(HISTORY_DAYS.toLong())
         val historyStartAt = historyStart.atStartOfDay(ZoneOffset.UTC).toInstant()
-        val historyEndAt = historyEnd.atStartOfDay(ZoneOffset.UTC).toInstant()
-        val dailyTotals = mutableMapOf<UUID, MutableMap<LocalDate, PublicDayTotals>>()
+        val historyEndAt = historyStartAt.plusSeconds(HISTORY_DAYS * SLOTS_PER_DAY * SLOT_SECONDS)
+        val historyTotals = mutableMapOf<UUID, MutableMap<Instant, PublicSlotTotals>>()
         dataSource.connection.use { connection ->
             connection.prepareStatement("""SELECT r.id, r.name, r.tags::text AS tags, r.health_status, r.paused,
                 m.type, m.enabled, m.current_state
@@ -63,7 +62,8 @@ class PublicStatusResource {
             }
             if (resources.isNotEmpty()) {
                 connection.prepareStatement(
-                    """SELECT m.resource_id, (a.bucket_at AT TIME ZONE 'UTC')::date AS day_at,
+                    """SELECT m.resource_id,
+                              date_bin(INTERVAL '2 hours', a.bucket_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS slot_at,
                               SUM(a.up_seconds) AS up_seconds, SUM(a.degraded_seconds) AS degraded_seconds,
                               SUM(a.down_seconds) AS down_seconds
                        FROM availability_rollup a
@@ -71,8 +71,8 @@ class PublicStatusResource {
                        JOIN monitored_resource r ON r.id = m.resource_id
                        WHERE r.project_id = ? AND r.public_enabled AND r.deleted_at IS NULL
                          AND a.bucket_at >= ? AND a.bucket_at < ?
-                       GROUP BY m.resource_id, (a.bucket_at AT TIME ZONE 'UTC')::date
-                       ORDER BY m.resource_id, day_at""",
+                       GROUP BY m.resource_id, slot_at
+                       ORDER BY m.resource_id, slot_at""",
                 ).use { statement ->
                     statement.setObject(1, projectId)
                     statement.setTimestamp(2, Timestamp.from(historyStartAt))
@@ -80,9 +80,9 @@ class PublicStatusResource {
                     statement.executeQuery().use { result ->
                         while (result.next()) {
                             val resourceId = result.getObject("resource_id", UUID::class.java)
-                            val day = result.getDate("day_at").toLocalDate()
-                            val totals = dailyTotals.getOrPut(resourceId) { mutableMapOf() }
-                            val current = totals.getOrPut(day) { PublicDayTotals() }
+                            val slot = result.getTimestamp("slot_at").toInstant()
+                            val totals = historyTotals.getOrPut(resourceId) { mutableMapOf() }
+                            val current = totals.getOrPut(slot) { PublicSlotTotals() }
                             current.upSeconds += result.getLong("up_seconds")
                             current.degradedSeconds += result.getLong("degraded_seconds")
                             current.downSeconds += result.getLong("down_seconds")
@@ -93,11 +93,12 @@ class PublicStatusResource {
         }
         if (resources.isEmpty()) return unavailable()
         resources.forEach { (resourceId, resource) ->
-            val totals = dailyTotals[resourceId].orEmpty()
-            resource.history = (0 until HISTORY_DAYS).map { offset ->
-                val day = historyStart.plusDays(offset.toLong())
-                val state = historyState(totals[day])
-                PublicHistoryDay(day.toString(), state, historyLabel(state))
+            val totals = historyTotals[resourceId].orEmpty()
+            resource.history = (0 until HISTORY_SLOTS).map { offset ->
+                val slot = historyStartAt.plusSeconds(offset * SLOT_SECONDS)
+                val state = historyState(totals[slot])
+                val slotEnd = slot.plusSeconds(SLOT_SECONDS)
+                PublicHistorySlot("${slot} – ${slotEnd}", state, historyLabel(state))
             }
         }
         val groups = sortedMapOf<String, MutableList<PublicResource>>()
@@ -127,7 +128,7 @@ class PublicStatusResource {
         "PAUSED" -> "已暂停"; "PENDING" -> "等待检测"; else -> "状态未知"
     }
 
-    private fun historyState(totals: PublicDayTotals?): String = when {
+    private fun historyState(totals: PublicSlotTotals?): String = when {
         totals == null || totals.upSeconds + totals.downSeconds == 0L -> "UNKNOWN"
         totals.downSeconds > 0 -> "DOWN"
         totals.degradedSeconds > 0 -> "DEGRADED"
@@ -141,7 +142,7 @@ class PublicStatusResource {
         else -> "暂无可用数据"
     }
 
-    private data class PublicDayTotals(
+    private data class PublicSlotTotals(
         var upSeconds: Long = 0,
         var degradedSeconds: Long = 0,
         var downSeconds: Long = 0,
@@ -149,6 +150,9 @@ class PublicStatusResource {
 
     companion object {
         private const val HISTORY_DAYS = 30
+        private const val SLOTS_PER_DAY = 12
+        private const val HISTORY_SLOTS = HISTORY_DAYS * SLOTS_PER_DAY
+        private const val SLOT_SECONDS = 2L * 60 * 60
     }
 }
 
@@ -156,8 +160,8 @@ class PublicStatusResource {
 data class PublicGroup(val name: String, val resources: List<PublicResource>)
 @TemplateData
 data class PublicResource(val name: String, val tags: List<String>, val state: String, val status: String,
-    val methods: MutableList<PublicMethod> = mutableListOf(), var history: List<PublicHistoryDay> = emptyList())
+    val methods: MutableList<PublicMethod> = mutableListOf(), var history: List<PublicHistorySlot> = emptyList())
 @TemplateData
 data class PublicMethod(val name: String, val state: String, val status: String)
 @TemplateData
-data class PublicHistoryDay(val date: String, val state: String, val status: String)
+data class PublicHistorySlot(val period: String, val state: String, val status: String)
