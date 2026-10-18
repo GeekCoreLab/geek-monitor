@@ -555,6 +555,7 @@ jobs:
           DB_USERNAME: geek_monitor
           DB_PASSWORD: native-aot-smoke-password
           GEEK_MONITOR_SECURITY_SECURE_COOKIE: 'false'
+          GEEK_MONITOR_RETENTION_INTERVAL: 1s
         run: |
           set -euo pipefail
           export GEEK_MONITOR_ENCRYPTION_KEY="$(openssl rand -base64 32 | tr -d '\n')"
