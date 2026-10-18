@@ -13,9 +13,7 @@ import jakarta.ws.rs.core.MediaType
 import jakarta.ws.rs.core.Response
 import java.sql.Timestamp
 import java.time.Instant
-import java.time.LocalDate
 import java.time.ZoneId
-import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
@@ -35,9 +33,10 @@ class PublicStatusResource {
         val projectId = runCatching { UUID.fromString(projectIdText) }.getOrNull()
             ?: return unavailable()
         val resources = linkedMapOf<UUID, PublicResource>()
-        val historyStart = LocalDate.now(ZoneOffset.UTC).minusDays((HISTORY_DAYS - 1).toLong())
-        val historyStartAt = historyStart.atStartOfDay(ZoneOffset.UTC).toInstant()
-        val historyEndAt = historyStartAt.plusSeconds(HISTORY_DAYS * SLOTS_PER_DAY * SLOT_SECONDS)
+        val now = Instant.now()
+        val currentSlotStart = Instant.ofEpochSecond(now.epochSecond / SLOT_SECONDS * SLOT_SECONDS)
+        val historyStartAt = currentSlotStart.minusSeconds((HISTORY_SLOTS - 1L) * SLOT_SECONDS)
+        val historyEndAt = currentSlotStart.plusSeconds(SLOT_SECONDS)
         val historyTotals = mutableMapOf<UUID, MutableMap<Instant, PublicSlotTotals>>()
         val maintenanceWindows = mutableListOf<PublicMaintenanceWindow>()
         dataSource.connection.use { connection ->
@@ -80,7 +79,7 @@ class PublicStatusResource {
                 ).use { statement ->
                     statement.setObject(1, projectId)
                     statement.setTimestamp(2, Timestamp.from(historyStartAt))
-                    statement.setTimestamp(3, Timestamp.from(historyEndAt))
+                    statement.setTimestamp(3, Timestamp.from(now))
                     statement.executeQuery().use { result ->
                         while (result.next()) {
                             val resourceId = result.getObject("resource_id", UUID::class.java)
@@ -134,14 +133,13 @@ class PublicStatusResource {
                 window.status in PUBLIC_WINDOW_STATUSES &&
                     (window.resourceId == null || window.resourceId == resourceId)
             }
-            val now = Instant.now()
             if (resource.maintenanceWindows.any { it.startsAt <= now && it.effectiveEndsAt > now }) {
                 resource.state = "MAINTENANCE"
                 resource.status = "维护中"
             }
             resource.history = (0 until HISTORY_SLOTS).map { offset ->
                 val slot = historyStartAt.plusSeconds(offset * SLOT_SECONDS)
-                val slotEnd = slot.plusSeconds(SLOT_SECONDS)
+                val slotEnd = minOf(slot.plusSeconds(SLOT_SECONDS), now)
                 val maintenance = maintenanceWindows.any { window ->
                     (window.resourceId == null || window.resourceId == resourceId) &&
                         window.startsAt < slotEnd && window.effectiveEndsAt > slot
@@ -159,7 +157,10 @@ class PublicStatusResource {
             resource.tags.ifEmpty { listOf("未分组") }.forEach { tag -> groups.getOrPut(tag) { mutableListOf() } += resource }
         }
         val body = template.data("groups", groups.map { PublicGroup(it.key, it.value) })
-            .data("updatedAt", Instant.now().toString()).data("count", resources.size).render()
+            .data("updatedAt", DISPLAY_TIME.format(now))
+            .data("historyStart", SCALE_TIME.format(historyStartAt))
+            .data("historyEnd", SCALE_TIME.format(now))
+            .data("count", resources.size).render()
         return Response.ok(body).header("Cache-Control", "no-store")
             .header("X-Content-Type-Options", "nosniff")
             .header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
@@ -182,7 +183,7 @@ class PublicStatusResource {
     }
 
     private fun historyState(totals: PublicSlotTotals?): String = when {
-        totals == null || totals.upSeconds + totals.downSeconds == 0L -> "UNKNOWN"
+        totals == null || totals.upSeconds + totals.degradedSeconds + totals.downSeconds == 0L -> "UNKNOWN"
         totals.downSeconds > 0 -> "DOWN"
         totals.degradedSeconds > 0 -> "DEGRADED"
         else -> "UP"
@@ -204,11 +205,12 @@ class PublicStatusResource {
 
     companion object {
         private const val HISTORY_DAYS = 30
-        private const val SLOTS_PER_DAY = 12
-        private const val HISTORY_SLOTS = HISTORY_DAYS * SLOTS_PER_DAY
+        private const val HISTORY_SLOTS = HISTORY_DAYS * 12
         private const val SLOT_SECONDS = 2L * 60 * 60
         private val PUBLIC_WINDOW_STATUSES = setOf("ACTIVE", "SCHEDULED")
         private val DISPLAY_TIME = DateTimeFormatter.ofPattern("yyyy年M月d日 HH:mm", Locale.CHINA)
+            .withZone(ZoneId.of("Asia/Shanghai"))
+        private val SCALE_TIME = DateTimeFormatter.ofPattern("M月d日 HH:mm", Locale.CHINA)
             .withZone(ZoneId.of("Asia/Shanghai"))
     }
 }
