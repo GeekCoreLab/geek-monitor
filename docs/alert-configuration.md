@@ -32,6 +32,8 @@ Create an email or HTTPS Webhook channel in the project's **通知渠道** page.
 
 The default channel limit is 60 batches per minute; configure 1–600. Similar events for a channel are grouped during a 15-second window, up to 50 events in one message. Every event keeps its own Outbox and delivery history. Failed attempts retry after 15 seconds, 60 seconds, 5 minutes, and 30 minutes; after the fifth attempt the delivery is marked `FAILED`.
 
+Email incident notifications include a dynamically generated inline status snapshot. It reads the latest completed check when the message is sent and shows the monitor and resource states, last check time, failure reason, HTTP status, duration, consecutive failures, and incident duration where available. Grouped emails show up to eight incidents in the image; the full event and diagnostic list remains in the email body. The image does not include monitor targets or credentials. An HTML/text fallback remains available if a mail client does not display inline SVG.
+
 ## Maintenance windows and notification silence
 
 Use a **maintenance window** for scheduled work: checks and results continue, while notifications are suppressed for the selected project or resource during the window. Use **通知静默** when an event should still be recorded and visible but its notifications should wait until the silence ends. Cancelling a silence resumes queued notifications; cancelling a maintenance window restores normal notification handling. Both controls can be limited to a project or a single resource.

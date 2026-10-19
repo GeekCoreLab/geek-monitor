@@ -30,6 +30,7 @@ class NotificationDispatcher {
     @Inject lateinit var encryption: SecretEncryptionService
     @Inject lateinit var httpChecks: HttpCheckService
     @Inject lateinit var mailer: Mailer
+    @Inject lateinit var statusImageGenerator: StatusImageGenerator
 
     private val threadNumber = AtomicInteger()
     private val executor = ThreadPoolExecutor(
@@ -192,6 +193,16 @@ class NotificationDispatcher {
                 val recipients = configuration.path("recipients").map { it.asText() }.distinct()
                 if (recipients.isEmpty()) return DeliveryResult(false, null, "CHANNEL_INVALID", "邮件收件人配置为空")
                 val subject = if (envelope.eventType == "TEST") "【测试通知】$title" else "【Geek Monitor】$title"
+                val statusEntries = if (envelope.eventType == "TEST") emptyList() else {
+                    val incidentIds = payloads.mapNotNull { payload ->
+                        payload.path("incidentId").asText(null)?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+                    }
+                    val latestStatuses = runCatching { loadLatestStatuses(incidentIds) }.getOrDefault(emptyMap())
+                    payloads.map { payload ->
+                        val incidentId = payload.path("incidentId").asText(null)?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+                        payload.toStatusEntry(latestStatuses[incidentId])
+                    }
+                }
                 val body = buildString {
                     if (envelope.eventType == "TEST") appendLine("这是一次测试通知。")
                     appendLine(message)
@@ -206,9 +217,25 @@ class NotificationDispatcher {
                         payload.path("severity").takeIf { !it.isMissingNode && !it.isNull }?.let { appendLine("级别：${it.asText()}") }
                         payload.path("occurredAt").takeIf { !it.isMissingNode && !it.isNull }?.let { appendLine("时间：${it.asText()}") }
                     }
+                    if (statusEntries.isNotEmpty()) {
+                        appendLine()
+                        appendLine(statusImageGenerator.plainSummary(statusEntries))
+                    }
                     appendLine("通知编号：$idempotencyKey")
                 }
-                val mails = recipients.map { Mail.withText(it, subject, body) }.toTypedArray()
+                val image = statusEntries.takeIf { it.isNotEmpty() }?.let { entries ->
+                    runCatching { statusImageGenerator.render(entries) }.getOrNull()
+                }
+                val htmlBody = buildHtmlBody(title, message, statusEntries, idempotencyKey)
+                val mails = recipients.map { recipient ->
+                    val mail = if (statusEntries.isNotEmpty()) {
+                        Mail.withHtml(recipient, subject, htmlBody).setText(body)
+                    } else {
+                        Mail.withText(recipient, subject, body)
+                    }
+                    image?.let { mail.addInlineAttachment(STATUS_IMAGE_FILENAME, it, STATUS_IMAGE_MIME_TYPE, STATUS_IMAGE_CONTENT_ID) }
+                    mail
+                }.toTypedArray()
                 mailer.send(*mails)
                 DeliveryResult(true, null, null, null)
             }
@@ -225,6 +252,101 @@ class NotificationDispatcher {
             }
             else -> DeliveryResult(false, null, "CHANNEL_INVALID", "通知渠道类型无效")
         }
+    }
+
+    private fun buildHtmlBody(
+        title: String,
+        message: String,
+        statusEntries: List<NotificationStatusEntry>,
+        idempotencyKey: String,
+    ): String = buildString {
+        append("<html><body style=\"margin:0;padding:24px;background:#f1f5f9;color:#0f172a;font:15px Arial,sans-serif\"><main style=\"max-width:760px;margin:0 auto;background:#fff;border:1px solid #dbe4ee;border-radius:12px;padding:24px\">")
+        append("<h1 style=\"font-size:22px;margin:0 0 16px\">${statusImageGenerator.escapeHtml(title)}</h1>")
+        append("<p style=\"line-height:1.65;white-space:pre-line\">${statusImageGenerator.escapeHtml(message)}</p>")
+        if (statusEntries.isNotEmpty()) {
+            append("<h2 style=\"font-size:17px;margin:24px 0 12px\">当前状态快照</h2>")
+            append("<img src=\"cid:$STATUS_IMAGE_CONTENT_ID\" alt=\"Geek Monitor 动态状态快照\" width=\"760\" style=\"display:block;width:100%;max-width:760px;height:auto;border-radius:12px\">")
+            append("<p style=\"color:#64748b;font-size:13px\">如果邮件客户端未显示图片，以下列表包含相同的诊断信息。</p>")
+            append(statusImageGenerator.htmlSummary(statusEntries))
+        }
+        append("<p style=\"margin-top:20px;color:#64748b;font-size:12px\">通知编号：${statusImageGenerator.escapeHtml(idempotencyKey)}</p>")
+        append("</main></body></html>")
+    }
+
+    private fun loadLatestStatuses(incidentIds: List<UUID>): Map<UUID, LatestMonitorStatus> = dataSource.connection.use { connection ->
+        if (incidentIds.isEmpty()) return@use emptyMap()
+        val placeholders = incidentIds.distinct().joinToString(",") { "?" }
+        connection.prepareStatement(
+            """SELECT i.id AS incident_id, i.category AS incident_category, i.status AS incident_status,
+                       i.opened_at AS incident_opened_at, i.occurrence_count,
+                       r.health_status AS resource_state, m.current_state AS monitor_state,
+                       m.consecutive_failures, m.failure_threshold,
+                       latest.result_status AS check_status, latest.finished_at AS check_finished_at,
+                       latest.error_code AS check_error_code, latest.error_summary AS check_error_summary,
+                       latest.http_status AS check_http_status, latest.duration_ms AS check_duration_ms
+                FROM incident i
+                JOIN monitored_resource r ON r.id = i.resource_id
+                JOIN monitor m ON m.id = i.monitor_id
+                LEFT JOIN LATERAL (
+                    SELECT e.result_status, e.finished_at, e.error_code, e.error_summary, e.http_status, e.duration_ms
+                    FROM check_execution e
+                    WHERE e.monitor_id = m.id AND e.finished_at IS NOT NULL
+                    ORDER BY e.scheduled_at DESC, e.id DESC LIMIT 1
+                ) latest ON TRUE
+                WHERE i.id IN ($placeholders)""",
+        ).use { statement ->
+            incidentIds.distinct().forEachIndexed { index, id -> statement.setObject(index + 1, id) }
+            statement.executeQuery().use { rows -> buildMap {
+                while (rows.next()) {
+                    put(rows.getObject("incident_id", UUID::class.java), rows.toLatestMonitorStatus())
+                }
+            } }
+        }
+    }
+
+    private fun ResultSet.toLatestMonitorStatus() = LatestMonitorStatus(
+        category = getString("incident_category"),
+        incidentStatus = getString("incident_status"),
+        incidentOpenedAt = getTimestamp("incident_opened_at")?.toInstant(),
+        occurrenceCount = getInt("occurrence_count"),
+        resourceState = getString("resource_state"),
+        monitorState = getString("monitor_state"),
+        consecutiveFailures = getInt("consecutive_failures"),
+        failureThreshold = getInt("failure_threshold"),
+        checkStatus = getString("check_status"),
+        checkedAt = getTimestamp("check_finished_at")?.toInstant(),
+        errorCode = getString("check_error_code"),
+        errorSummary = getString("check_error_summary"),
+        httpStatus = getObject("check_http_status")?.let { (it as Number).toInt() },
+        durationMs = getObject("check_duration_ms")?.let { (it as Number).toLong() },
+    )
+
+    private fun com.fasterxml.jackson.databind.JsonNode.toStatusEntry(latest: LatestMonitorStatus?): NotificationStatusEntry {
+        val eventType = path("eventType").asText().substringAfterLast('.').uppercase()
+        return NotificationStatusEntry(
+            title = path("title").asText("Geek Monitor 通知"),
+            resourceName = path("resourceName").asText("未命名资源"),
+            monitorName = path("monitorName").asText("监控项"),
+            eventType = eventType,
+            category = latest?.category ?: path("category").asText(null),
+            severity = path("severity").asText(null),
+            eventStatus = path("status").asText(null),
+            incidentStatus = latest?.incidentStatus,
+            currentMonitorState = latest?.monitorState ?: "UNKNOWN",
+            resourceState = latest?.resourceState,
+            latestCheckStatus = latest?.checkStatus,
+            checkedAt = latest?.checkedAt,
+            alertMessage = path("message").asText(null),
+            alertErrorCode = path("errorCode").asText(null),
+            latestErrorCode = latest?.errorCode,
+            latestErrorSummary = latest?.errorSummary,
+            httpStatus = latest?.httpStatus ?: path("statusCode").takeIf { it.isInt }?.asInt(),
+            durationMs = latest?.durationMs,
+            consecutiveFailures = latest?.consecutiveFailures,
+            failureThreshold = latest?.failureThreshold,
+            incidentOpenedAt = latest?.incidentOpenedAt,
+            occurrenceCount = latest?.occurrenceCount ?: path("occurrenceCount").takeIf { it.isInt }?.asInt(),
+        )
     }
 
     private fun loadEnvelopes(ids: List<UUID>): List<NotificationEnvelope> = dataSource.connection.use { connection ->
@@ -350,6 +472,22 @@ class NotificationDispatcher {
     }
 
     private data class NotificationTask(val ids: List<UUID>)
+    private data class LatestMonitorStatus(
+        val category: String?,
+        val incidentStatus: String?,
+        val incidentOpenedAt: Instant?,
+        val occurrenceCount: Int?,
+        val resourceState: String?,
+        val monitorState: String?,
+        val consecutiveFailures: Int?,
+        val failureThreshold: Int?,
+        val checkStatus: String?,
+        val checkedAt: Instant?,
+        val errorCode: String?,
+        val errorSummary: String?,
+        val httpStatus: Int?,
+        val durationMs: Long?,
+    )
     private data class NotificationGroupKey(val channelId: UUID, val eventType: String)
     private data class ChannelDispatchState(
         val enabled: Boolean,
@@ -384,5 +522,8 @@ class NotificationDispatcher {
     companion object {
         private const val MAX_CLAIM_PER_TICK = 20
         private const val MAX_GROUP_SIZE = 50
+        private const val STATUS_IMAGE_FILENAME = "geek-monitor-status.svg"
+        private const val STATUS_IMAGE_MIME_TYPE = "image/svg+xml"
+        private const val STATUS_IMAGE_CONTENT_ID = "geek-monitor-status-image@geek-monitor"
     }
 }
