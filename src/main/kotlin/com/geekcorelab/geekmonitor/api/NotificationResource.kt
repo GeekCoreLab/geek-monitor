@@ -193,6 +193,7 @@ class NotificationResource {
     fun deliveries(
         @QueryParam("channelId") channelIdText: String?,
         @QueryParam("limit") limitText: Int?,
+        @QueryParam("offset") offsetText: Int?,
         @Context headers: HttpHeaders,
     ): Response {
         val user = authenticator.currentUser(headers) ?: return error(Response.Status.UNAUTHORIZED, "UNAUTHENTICATED", "请先登录")
@@ -200,6 +201,7 @@ class NotificationResource {
         if (channelIdText != null && channelId == null) return error(Response.Status.BAD_REQUEST, "INVALID_CHANNEL", "通知渠道编号无效")
         if (channelId != null && !canReadChannelHistory(channelId, user.id)) return error(Response.Status.NOT_FOUND, "CHANNEL_NOT_FOUND", "通知渠道不存在或无权访问")
         val limit = (limitText ?: 100).coerceIn(1, 500)
+        val offset = (offsetText ?: 0).coerceIn(0, 1_000_000)
         val results = mutableListOf<NotificationDeliveryResponse>()
         dataSource.connection.use { connection ->
             connection.prepareStatement(
@@ -210,12 +212,13 @@ class NotificationResource {
                     JOIN notification_channel c ON c.id = n.channel_id
                     JOIN project_membership pm ON pm.project_id = c.project_id
                     WHERE pm.user_id = ? AND (?::uuid IS NULL OR c.id = ?::uuid)
-                    ORDER BY d.started_at DESC LIMIT ?""",
+                    ORDER BY d.started_at DESC, d.id DESC LIMIT ? OFFSET ?""",
             ).use { statement ->
                 statement.setObject(1, user.id)
                 statement.setObject(2, channelId)
                 statement.setObject(3, channelId)
                 statement.setInt(4, limit)
+                statement.setInt(5, offset)
                 statement.executeQuery().use { rows -> while (rows.next()) results += rows.toDelivery() }
             }
         }

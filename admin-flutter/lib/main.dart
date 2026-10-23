@@ -4906,6 +4906,9 @@ class _NotificationsPageState extends State<_NotificationsPage> {
   List<Map<String, dynamic>> _deliveries = [];
   List<Map<String, dynamic>> _notificationSilences = [];
   bool _loading = true;
+  bool _loadingDeliveries = false;
+  bool _hasNextDeliveryPage = false;
+  int _deliveryPage = 0;
   String? _testingId;
 
   @override
@@ -4915,23 +4918,59 @@ class _NotificationsPageState extends State<_NotificationsPage> {
   }
 
   Future<void> _load() async {
-    setState(() => _loading = true);
+    setState(() {
+      _loading = true;
+      _loadingDeliveries = true;
+      _deliveryPage = 0;
+      _hasNextDeliveryPage = false;
+    });
     try {
       final results = await Future.wait([
         widget.api.notificationChannels(),
-        widget.api.notificationDeliveries(),
+        widget.api.notificationDeliveries(limit: 11),
         widget.api.notificationSilences(),
       ]);
       if (!mounted) return;
+      final deliveries = results[1];
       setState(() {
         _channels = results[0];
-        _deliveries = results[1];
+        _deliveries = deliveries.take(10).toList();
+        _hasNextDeliveryPage = deliveries.length > 10;
         _notificationSilences = results[2];
       });
     } catch (error) {
       if (mounted) widget.onNotice('加载通知记录失败：$error');
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _loadingDeliveries = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _changeDeliveryPage(int page) async {
+    if (_loadingDeliveries ||
+        page < 0 ||
+        (page > _deliveryPage && !_hasNextDeliveryPage))
+      return;
+    setState(() => _loadingDeliveries = true);
+    try {
+      final deliveries = await widget.api.notificationDeliveries(
+        limit: 11,
+        offset: page * 10,
+      );
+      if (!mounted) return;
+      setState(() {
+        _deliveryPage = page;
+        _deliveries = deliveries.take(10).toList();
+        _hasNextDeliveryPage = deliveries.length > 10;
+      });
+    } catch (error) {
+      if (mounted) widget.onNotice('加载投递记录失败：$error');
+    } finally {
+      if (mounted) setState(() => _loadingDeliveries = false);
     }
   }
 
@@ -5292,7 +5331,7 @@ class _NotificationsPageState extends State<_NotificationsPage> {
               ),
             ),
             Text(
-              '${_deliveries.length} 条记录',
+              '第 ${_deliveryPage + 1} 页 · ${_deliveries.length} 条',
               style: const TextStyle(color: _muted, fontSize: 11),
             ),
           ],
@@ -5337,6 +5376,42 @@ class _NotificationsPageState extends State<_NotificationsPage> {
                     ),
                   )
                   .toList(),
+            ),
+          ),
+        if (_deliveryPage > 0 || _hasNextDeliveryPage)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _deliveryPage > 0 && !_loadingDeliveries
+                      ? () => _changeDeliveryPage(_deliveryPage - 1)
+                      : null,
+                  icon: const Icon(Icons.chevron_left_rounded, size: 18),
+                  label: const Text('上一页'),
+                ),
+                const SizedBox(width: 12),
+                if (_loadingDeliveries)
+                  const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                else
+                  Text(
+                    '第 ${_deliveryPage + 1} 页',
+                    style: const TextStyle(color: _muted, fontSize: 12),
+                  ),
+                const SizedBox(width: 12),
+                OutlinedButton.icon(
+                  onPressed: _hasNextDeliveryPage && !_loadingDeliveries
+                      ? () => _changeDeliveryPage(_deliveryPage + 1)
+                      : null,
+                  icon: const Icon(Icons.chevron_right_rounded, size: 18),
+                  label: const Text('下一页'),
+                ),
+              ],
             ),
           ),
       ],

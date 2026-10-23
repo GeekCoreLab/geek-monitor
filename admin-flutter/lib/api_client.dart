@@ -579,12 +579,18 @@ class ApiClient {
 
   Future<List<Map<String, dynamic>>> notificationDeliveries({
     String? channelId,
+    int limit = 100,
+    int offset = 0,
   }) async {
-    final query = channelId == null
-        ? ''
-        : '?channelId=${Uri.encodeQueryComponent(channelId)}';
+    final query = Uri(
+      queryParameters: {
+        if (channelId != null) 'channelId': channelId,
+        'limit': '$limit',
+        'offset': '$offset',
+      },
+    ).query;
     return _asMapList(
-      await _send('GET', '/api/v1/notification-deliveries$query'),
+      await _send('GET', '/api/v1/notification-deliveries?$query'),
     );
   }
 
