@@ -4953,8 +4953,9 @@ class _NotificationsPageState extends State<_NotificationsPage> {
   Future<void> _changeDeliveryPage(int page) async {
     if (_loadingDeliveries ||
         page < 0 ||
-        (page > _deliveryPage && !_hasNextDeliveryPage))
+        (page > _deliveryPage && !_hasNextDeliveryPage)) {
       return;
+    }
     setState(() => _loadingDeliveries = true);
     try {
       final deliveries = await widget.api.notificationDeliveries(

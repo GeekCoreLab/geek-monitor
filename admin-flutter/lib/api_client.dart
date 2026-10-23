@@ -584,7 +584,7 @@ class ApiClient {
   }) async {
     final query = Uri(
       queryParameters: {
-        if (channelId != null) 'channelId': channelId,
+        'channelId': ?channelId,
         'limit': '$limit',
         'offset': '$offset',
       },
