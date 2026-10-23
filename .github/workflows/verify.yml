@@ -601,11 +601,19 @@ jobs:
             -o "$RUNNER_TEMP/native-aot-me.json"
           jq -e '.id | type == "string"' "$RUNNER_TEMP/native-aot-me.json"
 
-          curl --fail-with-body --silent --show-error -b "$RUNNER_TEMP/native-aot-cookies" \
-            http://127.0.0.1:8080/api/v1/system/status \
-            -o "$RUNNER_TEMP/native-aot-system.json"
-          jq -e '.backup.status == "NOT_RECORDED" and .platformHealth.retention.status == "CURRENT"' \
-            "$RUNNER_TEMP/native-aot-system.json"
+          retention_current=false
+          for _ in $(seq 1 30); do
+            curl --fail-with-body --silent --show-error -b "$RUNNER_TEMP/native-aot-cookies" \
+              http://127.0.0.1:8080/api/v1/system/status \
+              -o "$RUNNER_TEMP/native-aot-system.json"
+            if jq -e '.backup.status == "NOT_RECORDED" and .platformHealth.retention.status == "CURRENT"' \
+              "$RUNNER_TEMP/native-aot-system.json" >/dev/null; then
+              retention_current=true
+              break
+            fi
+            sleep 1
+          done
+          test "$retention_current" = true
 
           origin_status=$(curl --silent --show-error \
             -o "$RUNNER_TEMP/native-aot-origin-login.json" \
