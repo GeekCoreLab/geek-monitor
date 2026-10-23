@@ -6,7 +6,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="60">
 <title>服务运行状态 · Geek Monitor</title>
 <style>
 {|
@@ -15,8 +14,9 @@
 |}
 </style>
 </head>
-<body><main>
-<header><small>GEEK MONITOR / PUBLIC STATUS</small><h1>服务运行状态</h1><p>{count} 个公开资源 · 每 60 秒自动刷新</p><div class="legend" aria-label="历史状态图例"><span class="legend-item"><i class="legend-dot UP"></i>运行正常</span><span class="legend-item"><i class="legend-dot DEGRADED"></i>高延迟或性能降级</span><span class="legend-item"><i class="legend-dot DOWN"></i>服务异常</span><span class="legend-item"><i class="legend-dot MAINTENANCE"></i>维护中</span><span class="legend-item"><i class="legend-dot UNKNOWN"></i>暂无数据</span></div></header>
+<body><main data-json-url="/public/{projectId}/data">
+<header><small>GEEK MONITOR / PUBLIC STATUS</small><h1>服务运行状态</h1><p><span id="resource-count">{count}</span> 个公开资源 · 每 60 秒自动更新数据</p><div class="legend" aria-label="历史状态图例"><span class="legend-item"><i class="legend-dot UP"></i>运行正常</span><span class="legend-item"><i class="legend-dot DEGRADED"></i>高延迟或性能降级</span><span class="legend-item"><i class="legend-dot DOWN"></i>服务异常</span><span class="legend-item"><i class="legend-dot MAINTENANCE"></i>维护中</span><span class="legend-item"><i class="legend-dot UNKNOWN"></i>暂无数据</span></div></header>
+<div id="status-groups">
 {#for group in groups}
 <section><h2>{group.name}</h2>
 {#for resource in group.resources}
@@ -31,5 +31,6 @@
 </ul></article>
 {/for}</section>
 {/for}
-<footer>更新于 {updatedAt} · Powered by Geek Monitor</footer>
-</main></body></html>
+</div>
+<footer><span id="updated-at">更新于 {updatedAt}</span> · Powered by Geek Monitor <span id="refresh-status" role="status" aria-live="polite">自动更新已启用</span></footer>
+</main><script src="/public-status.js" defer></script></body></html>

@@ -1,5 +1,6 @@
 package com.geekcorelab.geekmonitor.api
 
+import com.fasterxml.jackson.annotation.JsonIgnore
 import com.fasterxml.jackson.databind.ObjectMapper
 import io.quarkus.qute.Location
 import io.quarkus.qute.Template
@@ -32,6 +33,36 @@ class PublicStatusResource {
     fun page(@PathParam("projectId") projectIdText: String): Response {
         val projectId = runCatching { UUID.fromString(projectIdText) }.getOrNull()
             ?: return unavailable()
+        val snapshot = loadStatus(projectId) ?: return unavailable()
+        val body = template.data("groups", snapshot.groups)
+            .data("projectId", projectId.toString())
+            .data("updatedAt", snapshot.updatedAt)
+            .data("historyStart", snapshot.historyStart)
+            .data("historyEnd", snapshot.historyEnd)
+            .data("count", snapshot.count).render()
+        return publicResponse(body, MediaType.TEXT_HTML)
+    }
+
+    @GET
+    @Path("/{projectId}/data")
+    @Produces(MediaType.APPLICATION_JSON)
+    fun data(@PathParam("projectId") projectIdText: String): Response {
+        val projectId = runCatching { UUID.fromString(projectIdText) }.getOrNull()
+            ?: return unavailableJson()
+        val snapshot = loadStatus(projectId) ?: return unavailableJson()
+        return publicResponse(objectMapper.writeValueAsString(snapshot), MediaType.APPLICATION_JSON)
+    }
+
+    private fun publicResponse(body: String, mediaType: String): Response = Response.ok(body)
+        .type(mediaType)
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+        .header("Referrer-Policy", "no-referrer")
+        .header("X-Robots-Tag", "noindex, nofollow")
+        .build()
+
+    private fun loadStatus(projectId: UUID): PublicStatusData? {
         val resources = linkedMapOf<UUID, PublicResource>()
         val now = Instant.now()
         val currentSlotStart = Instant.ofEpochSecond(now.epochSecond / SLOT_SECONDS * SLOT_SECONDS)
@@ -126,7 +157,7 @@ class PublicStatusResource {
                 }
             }
         }
-        if (resources.isEmpty()) return unavailable()
+        if (resources.isEmpty()) return null
         resources.forEach { (resourceId, resource) ->
             val totals = historyTotals[resourceId].orEmpty()
             resource.maintenanceWindows = maintenanceWindows.filter { window ->
@@ -156,19 +187,21 @@ class PublicStatusResource {
         resources.values.forEach { resource ->
             resource.tags.ifEmpty { listOf("未分组") }.forEach { tag -> groups.getOrPut(tag) { mutableListOf() } += resource }
         }
-        val body = template.data("groups", groups.map { PublicGroup(it.key, it.value) })
-            .data("updatedAt", DISPLAY_TIME.format(now))
-            .data("historyStart", SCALE_TIME.format(historyStartAt))
-            .data("historyEnd", SCALE_TIME.format(now))
-            .data("count", resources.size).render()
-        return Response.ok(body).header("Cache-Control", "no-store")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
-            .header("Referrer-Policy", "no-referrer").header("X-Robots-Tag", "noindex, nofollow").build()
+        return PublicStatusData(
+            groups = groups.map { PublicGroup(it.key, it.value) },
+            updatedAt = DISPLAY_TIME.format(now),
+            historyStart = SCALE_TIME.format(historyStartAt),
+            historyEnd = SCALE_TIME.format(now),
+            count = resources.size,
+        )
     }
 
     private fun unavailable() = Response.status(Response.Status.NOT_FOUND).type(MediaType.TEXT_HTML)
         .entity("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>页面未公开</title><h1>页面不存在或尚未公开</h1></html>")
+        .header("Cache-Control", "no-store").build()
+
+    private fun unavailableJson() = Response.status(Response.Status.NOT_FOUND).type(MediaType.APPLICATION_JSON)
+        .entity("{\"message\":\"页面不存在或尚未公开\"}")
         .header("Cache-Control", "no-store").build()
 
     private fun methodName(type: String) = when (type) {
@@ -218,6 +251,14 @@ class PublicStatusResource {
 @TemplateData
 data class PublicGroup(val name: String, val resources: List<PublicResource>)
 @TemplateData
+data class PublicStatusData(
+    val groups: List<PublicGroup>,
+    val updatedAt: String,
+    val historyStart: String,
+    val historyEnd: String,
+    val count: Int,
+)
+@TemplateData
 data class PublicResource(val name: String, val tags: List<String>, var state: String, var status: String,
     val methods: MutableList<PublicMethod> = mutableListOf(), var history: List<PublicHistorySlot> = emptyList(),
     var maintenanceWindows: List<PublicMaintenanceWindow> = emptyList())
@@ -226,5 +267,11 @@ data class PublicMethod(val name: String, val state: String, val status: String)
 @TemplateData
 data class PublicHistorySlot(val period: String, val state: String, val status: String)
 @TemplateData
-data class PublicMaintenanceWindow(val resourceId: UUID?, val name: String, val startsAt: Instant,
-    val effectiveEndsAt: Instant, val status: String, val period: String)
+data class PublicMaintenanceWindow(
+    @get:JsonIgnore val resourceId: UUID?,
+    val name: String,
+    @get:JsonIgnore val startsAt: Instant,
+    @get:JsonIgnore val effectiveEndsAt: Instant,
+    val status: String,
+    val period: String,
+)

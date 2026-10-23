@@ -34,6 +34,12 @@ import io.quarkus.runtime.annotations.RegisterForReflection
         AuditLogEntry::class,
         AuditLogPageResponse::class,
         RetentionPolicy::class,
+        PublicStatusData::class,
+        PublicGroup::class,
+        PublicResource::class,
+        PublicMethod::class,
+        PublicHistorySlot::class,
+        PublicMaintenanceWindow::class,
     ],
 )
 class NativeResponseReflectionConfig
