@@ -32,6 +32,7 @@ class IncidentReminderScheduler {
                        JOIN monitor m ON m.id = i.monitor_id
                        JOIN monitored_resource r ON r.id = i.resource_id
                        WHERE i.status IN ('OPEN', 'ACKNOWLEDGED')
+                         AND i.category <> 'TLS_CERTIFICATE'
                          AND m.reminder_interval_minutes > 0
                          AND m.deleted_at IS NULL AND r.deleted_at IS NULL
                          AND i.last_notified_at <= now() - (m.reminder_interval_minutes * INTERVAL '1 minute')
