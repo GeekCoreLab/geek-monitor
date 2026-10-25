@@ -43,7 +43,9 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('欢迎回来'), findsOneWidget);
-    await tester.tap(find.text('登录控制台'));
+    final loginButton = find.text('登录控制台');
+    await tester.ensureVisible(loginButton);
+    await tester.tap(loginButton);
     await tester.pumpAndSettle();
 
     expect(find.text('服务返回的会话信息不完整，请更新服务后重试。'), findsOneWidget);
