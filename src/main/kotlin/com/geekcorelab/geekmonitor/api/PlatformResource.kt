@@ -414,13 +414,15 @@ class PlatformResource {
 
     private fun sessionCookie(token: String, expiresAt: Instant): String = buildString {
         append(cookieName).append('=').append(token)
-        append("; Path=/; HttpOnly; SameSite=Strict; Max-Age=")
+        append("; Path=/; HttpOnly; SameSite=").append(if (secureCookie) "None" else "Strict")
+        append("; Max-Age=")
         append(ChronoUnit.SECONDS.between(Instant.now(), expiresAt).coerceAtLeast(0))
         if (secureCookie) append("; Secure")
     }
 
     private fun expiredSessionCookie(): String = buildString {
-        append(cookieName).append("=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+        append(cookieName).append("=; Path=/; HttpOnly; SameSite=").append(if (secureCookie) "None" else "Strict")
+        append("; Max-Age=0")
         if (secureCookie) append("; Secure")
     }
 

@@ -1,6 +1,6 @@
 # Geek Monitor
 
-面向自托管运维的监控平台，中心服务使用 Kotlin、Quarkus 和 PostgreSQL，管理端使用 Flutter Web。
+面向自托管运维的监控平台，中心服务使用 Kotlin、Quarkus 和 PostgreSQL，管理端使用 Flutter Web、Android 和 Linux 桌面端。
 
 产品范围和首版验收要求见[产品与技术规划](docs/产品与技术规划.md)。
 
@@ -28,6 +28,10 @@ flutter run -d web-server --web-hostname 0.0.0.0 --web-port 8081
 ```
 
 Flutter 开发服务器的地址已加入开发 CORS 白名单。执行 `./gradlew build` 会构建并将 Flutter Web 静态文件打入 Quarkus 应用。
+
+Android 和 Linux 桌面客户端首次打开时默认连接 `https://geek-mintor.geekcorelab.cn`；登录页也可切换到 `.com` 地址或填写自定义 API 根地址。地址保存在当前设备。连接本地 API 时，可通过 `--dart-define=API_BASE_URL=http://localhost:8080` 覆盖默认地址。
+
+推送与版本号一致的 `v*` 标签会并行构建 Linux `.deb`、`.rpm`、AppImage 和 Android APK，全部成功后统一附加到 GitHub Release。
 
 ## 数据库连接配置
 

@@ -6,16 +6,16 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-app-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  build-server:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
 
@@ -56,7 +56,7 @@ jobs:
       - name: Test and package JVM server with Flutter Web
         run: ./gradlew clean test quarkusBuild --no-daemon --console=plain
 
-      - name: Package release assets
+      - name: Package server release assets
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
@@ -76,6 +76,221 @@ jobs:
           tar -C dist -czf "dist/$archive" "$bundle"
           (cd dist && sha256sum "$archive" >SHA256SUMS && sha256sum --check SHA256SUMS)
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-release-assets
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux-admin:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.9'
+          cache: true
+
+      - name: Validate release version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          [[ "$TAG_NAME" == v* && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          flutter_version="$(sed -n 's/^version: \([^+]*\)+.*$/\1/p' admin-flutter/pubspec.yaml)"
+          test "$version" = "$flutter_version"
+
+      - name: Install Linux build and package dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev \
+            libstdc++-12-dev libgirepository1.0-dev librsvg2-dev \
+            rpm dpkg-dev desktop-file-utils
+
+      - name: Resolve Flutter dependencies
+        working-directory: admin-flutter
+        run: flutter pub get
+
+      - name: Build Flutter Linux desktop app
+        working-directory: admin-flutter
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          version="${TAG_NAME#v}"
+          flutter build linux --release \
+            --build-name="$version" \
+            --build-number="$BUILD_NUMBER"
+
+      - name: Download Linux packaging tools
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
+            --output "$RUNNER_TEMP/appimagetool.AppImage"
+          curl --fail --location --retry 3 \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+            --output "$RUNNER_TEMP/linuxdeploy.AppImage"
+          curl --fail --location --retry 3 \
+            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/7a3fbc31a9e5075073ff8790f26effbac5f84453/linuxdeploy-plugin-gtk.sh \
+            --output "$RUNNER_TEMP/linuxdeploy-plugin-gtk.sh"
+          chmod +x "$RUNNER_TEMP/appimagetool.AppImage" \
+            "$RUNNER_TEMP/linuxdeploy.AppImage" \
+            "$RUNNER_TEMP/linuxdeploy-plugin-gtk.sh"
+
+      - name: Package deb, rpm, and AppImage
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          bash scripts/package-admin-linux.sh \
+            "${TAG_NAME#v}" dist/linux \
+            "$RUNNER_TEMP/appimagetool.AppImage" \
+            "$RUNNER_TEMP/linuxdeploy.AppImage" \
+            "$RUNNER_TEMP/linuxdeploy-plugin-gtk.sh"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-admin-release-assets
+          path: dist/linux/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-android-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.9'
+          cache: true
+
+      - name: Validate release version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          [[ "$TAG_NAME" == v* && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          flutter_version="$(sed -n 's/^version: \([^+]*\)+.*$/\1/p' admin-flutter/pubspec.yaml)"
+          test "$version" = "$flutter_version"
+
+      - name: Resolve Flutter dependencies
+        working-directory: admin-flutter
+        run: flutter pub get
+
+      - name: Configure Android release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_KEYSTORE_BASE64" || { echo "Missing Actions secret: ANDROID_KEYSTORE_BASE64" >&2; exit 1; }
+          test -n "$ANDROID_KEYSTORE_PASSWORD" || { echo "Missing Actions secret: ANDROID_KEYSTORE_PASSWORD" >&2; exit 1; }
+          test -n "$ANDROID_KEY_ALIAS" || { echo "Missing Actions secret: ANDROID_KEY_ALIAS" >&2; exit 1; }
+          test -n "$ANDROID_KEY_PASSWORD" || { echo "Missing Actions secret: ANDROID_KEY_PASSWORD" >&2; exit 1; }
+
+          keystore_path="$RUNNER_TEMP/geek-monitor-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          chmod 600 "$keystore_path"
+          keytool -list -keystore "$keystore_path" \
+            -storepass:env ANDROID_KEYSTORE_PASSWORD \
+            -alias "$ANDROID_KEY_ALIAS" >/dev/null
+
+          cat > admin-flutter/android/key.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=$keystore_path
+          EOF
+          chmod 600 admin-flutter/android/key.properties
+
+      - name: Build Android release APK
+        working-directory: admin-flutter
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          flutter build apk --release \
+            --build-name="$version" \
+            --build-number="$BUILD_NUMBER"
+          mkdir -p ../dist/android
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "../dist/android/geek-monitor-admin-${version}-android.apk"
+          (cd ../dist/android && sha256sum ./*.apk >SHA256SUMS-android && sha256sum --check SHA256SUMS-android)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-admin-release-assets
+          path: dist/android/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    needs:
+      - build-server
+      - build-linux-admin
+      - build-android-apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: server-release-assets
+          path: dist/server
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-admin-release-assets
+          path: dist/linux
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: android-admin-release-assets
+          path: dist/android
+
+      - name: Verify and prepare release assets
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mv dist/server/SHA256SUMS dist/SHA256SUMS-server
+          mv dist/linux/SHA256SUMS dist/SHA256SUMS-linux
+          chmod +x dist/linux/*.AppImage
+          (
+            cd dist
+            find server linux android -type f ! -name 'SHA256SUMS*' -printf '%P\0' \
+              | sort -z \
+              | xargs -0 sha256sum >SHA256SUMS
+            sha256sum --check SHA256SUMS
+            (cd server && sha256sum --check ../SHA256SUMS-server)
+            (cd linux && sha256sum --check ../SHA256SUMS-linux)
+            (cd android && sha256sum --check SHA256SUMS-android)
+          )
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -84,9 +299,20 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG_NAME#v}"
+          assets=(
+            dist/server/*.tar.gz
+            dist/linux/*.deb
+            dist/linux/*.rpm
+            dist/linux/*.AppImage
+            dist/android/*.apk
+            dist/SHA256SUMS
+            dist/SHA256SUMS-server
+            dist/SHA256SUMS-linux
+            dist/android/SHA256SUMS-android
+          )
           notes="docs/releases/$TAG_NAME.md"
           if gh release view "$TAG_NAME" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" dist/geek-monitor-*-server-jvm.tar.gz dist/SHA256SUMS \
+            gh release upload "$TAG_NAME" "${assets[@]}" \
               --repo "$REPOSITORY" --clobber
           else
             title="Geek Monitor $version"
@@ -96,11 +322,11 @@ jobs:
               release_args+=(--prerelease)
             fi
             if [[ -f "$notes" ]]; then
-              gh release create "$TAG_NAME" dist/geek-monitor-*-server-jvm.tar.gz dist/SHA256SUMS \
+              gh release create "$TAG_NAME" "${assets[@]}" \
                 --repo "$REPOSITORY" --verify-tag --title "$title" \
                 --notes-file "$notes" "${release_args[@]}"
             else
-              gh release create "$TAG_NAME" dist/geek-monitor-*-server-jvm.tar.gz dist/SHA256SUMS \
+              gh release create "$TAG_NAME" "${assets[@]}" \
                 --repo "$REPOSITORY" --verify-tag --title "$title" \
                 --generate-notes "${release_args[@]}"
             fi

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -29,7 +30,9 @@ class StatusStreamEvent {
   final Map<String, dynamic> data;
 }
 
-Stream<StatusStreamEvent> parseServerSentEvents(Stream<List<int>> bytes) async* {
+Stream<StatusStreamEvent> parseServerSentEvents(
+  Stream<List<int>> bytes,
+) async* {
   var lastEventId = '';
   var eventName = 'message';
   final dataLines = <String>[];
@@ -45,7 +48,8 @@ Stream<StatusStreamEvent> parseServerSentEvents(Stream<List<int>> bytes) async* 
     );
   }
 
-  await for (final line in bytes.transform(utf8.decoder).transform(const LineSplitter())) {
+  await for (final line
+      in bytes.transform(utf8.decoder).transform(const LineSplitter())) {
     if (line.isEmpty) {
       final event = dispatch();
       if (event != null) yield event;
@@ -79,16 +83,64 @@ class ApiClient {
       _baseUriOverride = baseUri;
 
   static const _emailKey = 'geek-monitor.last-email';
+  static const _apiBaseUrlKey = 'geek-monitor.api-base-url';
   static const _configuredBaseUrl = String.fromEnvironment('API_BASE_URL');
+  static const defaultBaseUrl = 'https://geek-mintor.geekcorelab.cn';
 
   final http.Client _client;
   final Uri? _baseUriOverride;
+  Uri? _selectedBaseUri;
+  String? _sessionToken;
 
   Uri get _baseUri =>
       _baseUriOverride ??
+      _selectedBaseUri ??
       Uri.parse(
-        _configuredBaseUrl.isEmpty ? Uri.base.origin : _configuredBaseUrl,
+        _configuredBaseUrl.isNotEmpty
+            ? _configuredBaseUrl
+            : kIsWeb
+            ? Uri.base.origin
+            : defaultBaseUrl,
       );
+
+  String get baseUrl => _baseUri.toString();
+
+  Future<void> restoreBaseUrl() async {
+    if (_baseUriOverride != null) return;
+    final preferences = await SharedPreferences.getInstance();
+    final saved = preferences.getString(_apiBaseUrlKey);
+    if (saved != null && saved.isNotEmpty) {
+      _selectedBaseUri = normalizeBaseUri(saved);
+    }
+  }
+
+  Future<void> setBaseUrl(String value) async {
+    if (_baseUriOverride != null) return;
+    final uri = normalizeBaseUri(value);
+    _selectedBaseUri = uri;
+    await (await SharedPreferences.getInstance()).setString(
+      _apiBaseUrlKey,
+      uri.toString(),
+    );
+  }
+
+  static Uri normalizeBaseUri(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if (uri == null ||
+        !const {'http', 'https'}.contains(uri.scheme.toLowerCase()) ||
+        uri.host.isEmpty ||
+        uri.userInfo.isNotEmpty ||
+        (uri.path.isNotEmpty && uri.path != '/') ||
+        uri.hasQuery ||
+        uri.hasFragment) {
+      throw const FormatException('请输入有效的 API 根地址，例如 https://api.example.com');
+    }
+    return Uri(
+      scheme: uri.scheme.toLowerCase(),
+      host: uri.host,
+      port: uri.hasPort ? uri.port : null,
+    );
+  }
 
   Future<String?> lastEmail() async =>
       (await SharedPreferences.getInstance()).getString(_emailKey);
@@ -140,6 +192,7 @@ class ApiClient {
 
   Future<void> logout() async {
     await _send('POST', '/api/v1/auth/logout');
+    _sessionToken = null;
   }
 
   Future<List<Map<String, dynamic>>> projects() async =>
@@ -479,14 +532,16 @@ class ApiClient {
     String? lastEventId;
     while (true) {
       try {
-        final request = http.Request('GET', _baseUri.resolve('/api/v1/events/stream'))
-          ..headers['Accept'] = 'text/event-stream';
+        final request = http.Request(
+          'GET',
+          _baseUri.resolve('/api/v1/events/stream'),
+        )..headers['Accept'] = 'text/event-stream';
         if (lastEventId != null && lastEventId.isNotEmpty) {
           request.headers['Last-Event-ID'] = lastEventId;
         }
-        final response = await _client.send(request).timeout(
-          const Duration(seconds: 20),
-        );
+        final response = await _client
+            .send(request)
+            .timeout(const Duration(seconds: 20));
         if (response.statusCode < 200 || response.statusCode >= 300) {
           final body = await response.stream.bytesToString();
           var message = '实时状态连接失败（${response.statusCode}）';
@@ -506,7 +561,9 @@ class ApiClient {
           yield event;
         }
       } on ApiException catch (error) {
-        if (error.statusCode != null && error.statusCode! >= 400 && error.statusCode! < 500) {
+        if (error.statusCode != null &&
+            error.statusCode! >= 400 &&
+            error.statusCode! < 500) {
           rethrow;
         }
         await Future<void>.delayed(const Duration(seconds: 2));
@@ -647,6 +704,9 @@ class ApiClient {
   }) async {
     final uri = _baseUri.resolve(path);
     final headers = <String, String>{'Accept': 'application/json'};
+    if (!kIsWeb && _sessionToken != null) {
+      headers['Authorization'] = 'Bearer $_sessionToken';
+    }
     if (body != null) headers['Content-Type'] = 'application/json';
     final request = http.Request(method, uri)..headers.addAll(headers);
     if (body != null) request.body = jsonEncode(body);
@@ -655,6 +715,7 @@ class ApiClient {
           .send(request)
           .timeout(const Duration(seconds: 20));
       final response = await http.Response.fromStream(streamed);
+      _captureSessionToken(response);
       if (response.statusCode < 200 || response.statusCode >= 300) {
         dynamic decoded;
         if (response.body.isNotEmpty) {
@@ -689,6 +750,16 @@ class ApiClient {
     } catch (error) {
       throw ApiException('无法连接 Geek Monitor：$error');
     }
+  }
+
+  void _captureSessionToken(http.Response response) {
+    if (kIsWeb) return;
+    final cookie = response.headers['set-cookie']?.split(';').first;
+    if (cookie == null) return;
+    final separator = cookie.indexOf('=');
+    if (separator < 0) return;
+    final token = cookie.substring(separator + 1).trim();
+    _sessionToken = token.isEmpty ? null : token;
   }
 
   List<Map<String, dynamic>> _asMapList(dynamic value) =>

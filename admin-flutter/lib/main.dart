@@ -52,6 +52,12 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
 
   Future<void> _restore() async {
     try {
+      await _api.restoreBaseUrl();
+      if (!mounted) return;
+      setState(() {
+        _gate = _GateState.loading;
+        _startupError = null;
+      });
       final status = await _api.getInstallStatus();
       if (status['initialized'] != true) {
         setState(() => _gate = _GateState.setup);
@@ -66,10 +72,12 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
     } catch (error) {
       setState(() {
         _startupError = error.toString();
-        _gate = _GateState.unavailable;
+        _gate = _GateState.login;
       });
     }
   }
+
+  Future<void> _applyApiBaseUrl(String value) => _api.setBaseUrl(value);
 
   void _authenticated(Map<String, dynamic> session) {
     final user = session['user'];
@@ -152,10 +160,17 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
         _GateState.loading => const _LoadingPage(),
         _GateState.setup => _InstallPage(
           api: _api,
+          apiBaseUrl: _api.baseUrl,
+          onApplyApiBaseUrl: _applyApiBaseUrl,
+          onRetryConnection: _restore,
           onAuthenticated: _authenticated,
         ),
         _GateState.login => _LoginPage(
           api: _api,
+          apiBaseUrl: _api.baseUrl,
+          startupError: _startupError,
+          onApplyApiBaseUrl: _applyApiBaseUrl,
+          onRetryConnection: _restore,
           onAuthenticated: _authenticated,
         ),
         _GateState.dashboard => _DashboardShell(
@@ -163,16 +178,12 @@ class _GeekMonitorAppState extends State<GeekMonitorApp> {
           user: _user ?? const {},
           onLogout: _logout,
         ),
-        _GateState.unavailable => _UnavailablePage(
-          message: _startupError ?? '请确认服务已启动。',
-          onRetry: _restore,
-        ),
       },
     );
   }
 }
 
-enum _GateState { loading, setup, login, dashboard, unavailable }
+enum _GateState { loading, setup, login, dashboard }
 
 class _LoadingPage extends StatelessWidget {
   const _LoadingPage();
@@ -182,10 +193,171 @@ class _LoadingPage extends StatelessWidget {
       const Scaffold(body: Center(child: CircularProgressIndicator()));
 }
 
+class _ApiAddressSelector extends StatefulWidget {
+  const _ApiAddressSelector({
+    super.key,
+    required this.initialUrl,
+    required this.onApply,
+    required this.onConnect,
+  });
+
+  final String initialUrl;
+  final Future<void> Function(String value) onApply;
+  final Future<void> Function() onConnect;
+
+  @override
+  State<_ApiAddressSelector> createState() => _ApiAddressSelectorState();
+}
+
+class _ApiAddressSelectorState extends State<_ApiAddressSelector> {
+  static const _chinaUrl = 'https://geek-mintor.geekcorelab.cn';
+  static const _globalUrl = 'https://geek-mintor.geekcorelab.com';
+  static const _customOption = 'custom';
+
+  late String _selection = switch (widget.initialUrl) {
+    _chinaUrl => _chinaUrl,
+    _globalUrl => _globalUrl,
+    _ => _customOption,
+  };
+  late final _customUrl = TextEditingController(
+    text: _selection == _customOption ? widget.initialUrl : '',
+  );
+  String? _error;
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _customUrl.dispose();
+    super.dispose();
+  }
+
+  String? _normalizedUrl() {
+    if (_selection == _chinaUrl || _selection == _globalUrl) {
+      return _selection;
+    }
+    try {
+      return ApiClient.normalizeBaseUri(_customUrl.text).toString();
+    } on FormatException catch (error) {
+      _error = error.message;
+      return null;
+    }
+  }
+
+  Future<bool> apply() async {
+    final url = _normalizedUrl();
+    if (url == null) {
+      if (mounted) setState(() {});
+      return false;
+    }
+    if (_error != null && mounted) setState(() => _error = null);
+    await widget.onApply(url);
+    return true;
+  }
+
+  Future<void> _connect() async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      if (await apply()) await widget.onConnect();
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      const _FormLabel('API 地址'),
+      DropdownButtonFormField<String>(
+        initialValue: _selection,
+        decoration: const InputDecoration(
+          prefixIcon: Icon(Icons.cloud_outlined),
+        ),
+        items: const [
+          DropdownMenuItem(
+            value: _chinaUrl,
+            child: Text(
+              'geek-mintor.geekcorelab.cn',
+              style: TextStyle(fontSize: 13),
+            ),
+          ),
+          DropdownMenuItem(
+            value: _globalUrl,
+            child: Text(
+              'geek-mintor.geekcorelab.com',
+              style: TextStyle(fontSize: 13),
+            ),
+          ),
+          DropdownMenuItem(value: _customOption, child: Text('自定义地址')),
+        ],
+        onChanged: _busy
+            ? null
+            : (value) {
+                if (value == null) return;
+                setState(() {
+                  _selection = value;
+                  _error = null;
+                });
+              },
+      ),
+      if (_selection == _customOption) ...[
+        const SizedBox(height: 12),
+        TextFormField(
+          controller: _customUrl,
+          keyboardType: TextInputType.url,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: const InputDecoration(
+            hintText: 'https://api.example.com',
+            prefixIcon: Icon(Icons.link),
+          ),
+          onChanged: (_) {
+            if (_error != null) setState(() => _error = null);
+          },
+          onFieldSubmitted: (_) => _connect(),
+        ),
+      ],
+      if (_error != null) ...[
+        const SizedBox(height: 8),
+        Text(
+          _error!,
+          style: TextStyle(color: Theme.of(context).colorScheme.error),
+        ),
+      ],
+      Align(
+        alignment: Alignment.centerRight,
+        child: TextButton.icon(
+          onPressed: _busy ? null : _connect,
+          icon: _busy
+              ? const SizedBox.square(
+                  dimension: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.wifi_tethering_rounded),
+          label: Text(_busy ? '正在连接…' : '连接并检查地址'),
+        ),
+      ),
+    ],
+  );
+}
+
 class _InstallPage extends StatefulWidget {
-  const _InstallPage({required this.api, required this.onAuthenticated});
+  const _InstallPage({
+    required this.api,
+    required this.apiBaseUrl,
+    required this.onApplyApiBaseUrl,
+    required this.onRetryConnection,
+    required this.onAuthenticated,
+  });
 
   final ApiClient api;
+  final String apiBaseUrl;
+  final Future<void> Function(String value) onApplyApiBaseUrl;
+  final Future<void> Function() onRetryConnection;
   final ValueChanged<Map<String, dynamic>> onAuthenticated;
 
   @override
@@ -194,6 +366,7 @@ class _InstallPage extends StatefulWidget {
 
 class _InstallPageState extends State<_InstallPage> {
   final _formKey = GlobalKey<FormState>();
+  final _apiAddressKey = GlobalKey<_ApiAddressSelectorState>();
   late final _email = TextEditingController(
     text: _showDevCredentials ? 'admin@biliwind.com' : '',
   );
@@ -219,6 +392,7 @@ class _InstallPageState extends State<_InstallPage> {
 
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
+    if (!await _apiAddressKey.currentState!.apply()) return;
     setState(() {
       _busy = true;
       _error = null;
@@ -250,6 +424,13 @@ class _InstallPageState extends State<_InstallPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          _ApiAddressSelector(
+            key: _apiAddressKey,
+            initialUrl: widget.apiBaseUrl,
+            onApply: widget.onApplyApiBaseUrl,
+            onConnect: widget.onRetryConnection,
+          ),
+          const SizedBox(height: 20),
           const _FormLabel('管理员邮箱'),
           TextFormField(
             controller: _email,
@@ -350,9 +531,20 @@ class _InstallPageState extends State<_InstallPage> {
 }
 
 class _LoginPage extends StatefulWidget {
-  const _LoginPage({required this.api, required this.onAuthenticated});
+  const _LoginPage({
+    required this.api,
+    required this.apiBaseUrl,
+    required this.startupError,
+    required this.onApplyApiBaseUrl,
+    required this.onRetryConnection,
+    required this.onAuthenticated,
+  });
 
   final ApiClient api;
+  final String apiBaseUrl;
+  final String? startupError;
+  final Future<void> Function(String value) onApplyApiBaseUrl;
+  final Future<void> Function() onRetryConnection;
   final ValueChanged<Map<String, dynamic>> onAuthenticated;
 
   @override
@@ -361,6 +553,7 @@ class _LoginPage extends StatefulWidget {
 
 class _LoginPageState extends State<_LoginPage> {
   final _formKey = GlobalKey<FormState>();
+  final _apiAddressKey = GlobalKey<_ApiAddressSelectorState>();
   late final _email = TextEditingController(
     text: _showDevCredentials ? 'admin@biliwind.com' : '',
   );
@@ -393,6 +586,7 @@ class _LoginPageState extends State<_LoginPage> {
 
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
+    if (!await _apiAddressKey.currentState!.apply()) return;
     setState(() {
       _busy = true;
       _error = null;
@@ -423,6 +617,17 @@ class _LoginPageState extends State<_LoginPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          _ApiAddressSelector(
+            key: _apiAddressKey,
+            initialUrl: widget.apiBaseUrl,
+            onApply: widget.onApplyApiBaseUrl,
+            onConnect: widget.onRetryConnection,
+          ),
+          if (widget.startupError != null) ...[
+            const SizedBox(height: 12),
+            _InlineError('无法连接当前 API：${widget.startupError}'),
+          ],
+          const SizedBox(height: 20),
           const _FormLabel('管理员邮箱'),
           TextFormField(
             controller: _email,
@@ -766,48 +971,6 @@ class _InlineError extends StatelessWidget {
           ),
         ),
       ],
-    ),
-  );
-}
-
-class _UnavailablePage extends StatelessWidget {
-  const _UnavailablePage({required this.message, required this.onRetry});
-
-  final String message;
-  final VoidCallback onRetry;
-
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    body: Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 460),
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.cloud_off_outlined, size: 44, color: _blue),
-              const SizedBox(height: 16),
-              const Text(
-                '暂时无法连接监控服务',
-                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                message,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: _muted, height: 1.5),
-              ),
-              const SizedBox(height: 20),
-              FilledButton.icon(
-                onPressed: onRetry,
-                icon: const Icon(Icons.refresh),
-                label: const Text('重新连接'),
-              ),
-            ],
-          ),
-        ),
-      ),
     ),
   );
 }

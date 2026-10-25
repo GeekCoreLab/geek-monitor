@@ -1,17 +1,16 @@
-# geek_monitor_admin
+# Geek Monitor Admin
 
-A new Flutter project.
+Flutter client for the Geek Monitor API. The same application builds for Web, Linux desktop, and Android.
 
-## Getting Started
+## Local development
 
-This project is a starting point for a Flutter application.
+```sh
+flutter pub get
+flutter run -d linux --dart-define=API_BASE_URL=http://localhost:8080
+```
 
-A few resources to get you started if this is your first Flutter project:
+The sign-in and first-install screens let you select the `geek-mintor.geekcorelab.cn` or `.com` API, or enter a custom HTTP(S) API root. The selection is saved on the device. Native clients default to the `.cn` API; Web uses the origin that serves the client. The built-in server allows credentialed Web requests from those two hostnames. A custom Web API must allow the app's origin and credentials through CORS.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+## Release builds
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Pushing a `v*` tag matching the versions in `pubspec.yaml` and the server starts separate parallel jobs for Linux desktop packages (`.deb`, `.rpm`, and AppImage) and an Android release APK. The release is published after the server and both client jobs finish successfully.
