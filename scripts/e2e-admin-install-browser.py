@@ -68,11 +68,13 @@ def main() -> int:
                 "flt-semantics-placeholder[aria-label='Enable accessibility']"
             ).evaluate("element => element.click()")
             expect(page.get_by_text("开始监控你的服务", exact=True)).to_be_visible(timeout=30_000)
+            api_address = page.get_by_placeholder("https://api.example.com")
+            expect(api_address).to_have_value(base_url)
             fields = page.get_by_role("textbox")
-            email = fields.nth(0)
-            password = fields.nth(1)
-            confirmation = fields.nth(2)
-            project = fields.nth(3)
+            email = fields.nth(1)
+            password = fields.nth(2)
+            confirmation = fields.nth(3)
+            project = fields.nth(4)
             for field in (email, password, confirmation):
                 expect(field).to_have_value("")
 
@@ -90,8 +92,8 @@ def main() -> int:
             page.get_by_text("退出登录", exact=True).click()
             expect(page.get_by_text("欢迎回来", exact=True)).to_be_visible(timeout=10_000)
             login_fields = page.get_by_role("textbox")
-            login_email = login_fields.nth(0)
-            login_password = login_fields.nth(1)
+            login_email = login_fields.nth(1)
+            login_password = login_fields.nth(2)
             type_replacing(login_email, ADMIN_EMAIL)
             type_replacing(login_password, ADMIN_PASSWORD)
             page.get_by_text("登录控制台", exact=True).click()
