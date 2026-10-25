@@ -2,8 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geek_monitor_admin/api_client.dart';
 import 'package:geek_monitor_admin/main.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
   testWidgets('development setup submits the documented test credentials', (
     tester,
   ) async {
