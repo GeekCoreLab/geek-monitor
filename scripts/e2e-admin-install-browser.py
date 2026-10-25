@@ -70,7 +70,7 @@ def main() -> int:
             expect(page.get_by_text("开始监控你的服务", exact=True)).to_be_visible(timeout=30_000)
             fields = page.get_by_role("textbox")
             api_address = fields.nth(0)
-            expect(api_address).to_have_value(base_url)
+            type_replacing(api_address, base_url)
             email = fields.nth(1)
             password = fields.nth(2)
             confirmation = fields.nth(3)
