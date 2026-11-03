@@ -233,6 +233,16 @@ def main() -> int:
                 INSERT INTO metric_sample(batch_id, agent_id, resource_id, metric_name, labels, value, sampled_at, config_version, trusted)
                 VALUES (:'batch_id'::uuid, :'agent_id'::uuid, :'resource_id'::uuid, 'metric-resolution-e2e', '{"source":"test"}'::jsonb, 8,
                     now() - interval '1 day', 1, TRUE);
+                DO $$
+                DECLARE
+                    target_month DATE := date_trunc('month', (now() - interval '40 days') AT TIME ZONE 'UTC')::DATE;
+                    p_name TEXT := 'metric_rollup_' || to_char(target_month, 'YYYYMM');
+                BEGIN
+                    IF to_regclass('public.' || p_name) IS NULL THEN
+                        EXECUTE format('CREATE TABLE %I PARTITION OF metric_rollup FOR VALUES FROM (%L) TO (%L)',
+                            p_name, target_month, (target_month + INTERVAL '1 month')::DATE);
+                    END IF;
+                END $$;
                 INSERT INTO metric_rollup(resource_id, metric_name, labels, resolution_seconds, bucket_at, sample_count, sum_value, min_value, max_value)
                 VALUES (:'resource_id'::uuid, 'metric-resolution-e2e', '{"source":"test"}'::jsonb, 300,
                     date_bin(INTERVAL '5 minutes', now() - interval '10 days', TIMESTAMPTZ '1970-01-01 00:00:00+00'), 2, 40, 15, 25);
