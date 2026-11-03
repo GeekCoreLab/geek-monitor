@@ -35,14 +35,25 @@ const (
 )
 
 type agentConfig struct {
-	ServerURL       string `json:"serverUrl"`
-	AgentID         string `json:"agentId"`
-	ResourceID      string `json:"resourceId"`
-	Credential      string `json:"credential"`
-	BootID          string `json:"bootId"`
-	Sequence        int64  `json:"sequence"`
-	ConfigVersion   int    `json:"configVersion"`
-	IntervalSeconds int    `json:"intervalSeconds"`
+	ServerURL       string   `json:"serverUrl"`
+	ServerURLs      []string `json:"serverUrls,omitempty"`
+	AgentID         string   `json:"agentId"`
+	ResourceID      string   `json:"resourceId"`
+	Credential      string   `json:"credential"`
+	BootID          string   `json:"bootId"`
+	Sequence        int64    `json:"sequence"`
+	ConfigVersion   int      `json:"configVersion"`
+	IntervalSeconds int      `json:"intervalSeconds"`
+}
+
+func (c *agentConfig) GetAllServerURLs() []string {
+	if len(c.ServerURLs) > 0 {
+		return c.ServerURLs
+	}
+	if c.ServerURL != "" {
+		return []string{c.ServerURL}
+	}
+	return nil
 }
 
 type agentRuntimeConfig struct {
@@ -88,8 +99,39 @@ type collector struct {
 	clockSynced   bool
 }
 
+func parseServerURLs(raw ...string) ([]string, error) {
+	var urls []string
+	for _, s := range raw {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		for _, part := range strings.Split(s, ",") {
+			trimmed := strings.TrimRight(strings.TrimSpace(part), "/")
+			if trimmed == "" {
+				continue
+			}
+			parsedURL, err := url.Parse(trimmed)
+			if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "https" && !(parsedURL.Scheme == "http" && (parsedURL.Hostname() == "localhost" || parsedURL.Hostname() == "127.0.0.1" || parsedURL.Hostname() == "::1"))) {
+				return nil, fmt.Errorf("server URL %q must use HTTPS (HTTP is allowed only for localhost development)", trimmed)
+			}
+			found := false
+			for _, u := range urls {
+				if u == trimmed {
+					found = true
+					break
+				}
+			}
+			if !found {
+				urls = append(urls, trimmed)
+			}
+		}
+	}
+	return urls, nil
+}
+
 func main() {
-	serverURL := flag.String("server", "", "Geek Monitor base URL, for example https://monitor.example.com")
+	serverURL := flag.String("server", "", "Geek Monitor base URL(s), comma-separated for primary and backup (e.g. https://main.example.com,https://backup.example.com)")
+	backupServer := flag.String("backup-server", "", "Geek Monitor backup base URL(s), optional comma-separated")
 	configPath := flag.String("config", "/var/lib/geek-monitor/agent.json", "agent credential and state file")
 	enrollmentFile := flag.String("enrollment-token-file", "", "file containing a one-time enrollment token")
 	version := flag.Bool("version", false, "print agent version")
@@ -101,7 +143,15 @@ func main() {
 	if runtime.GOOS != "linux" {
 		fatal("this build supports Linux only")
 	}
-	config, err := loadOrRegister(*serverURL, *configPath, *enrollmentFile)
+	combinedServers := *serverURL
+	if *backupServer != "" {
+		if combinedServers != "" {
+			combinedServers += "," + *backupServer
+		} else {
+			combinedServers = *backupServer
+		}
+	}
+	config, err := loadOrRegister(combinedServers, *configPath, *enrollmentFile)
 	if err != nil {
 		fatal(err.Error())
 	}
@@ -119,6 +169,10 @@ func main() {
 }
 
 func loadOrRegister(serverURL, configPath, enrollmentFile string) (*agentConfig, error) {
+	parsedInputURLs, err := parseServerURLs(serverURL)
+	if err != nil && serverURL != "" {
+		return nil, err
+	}
 	if data, err := os.ReadFile(configPath); err == nil {
 		info, statErr := os.Stat(configPath)
 		if statErr != nil {
@@ -131,8 +185,25 @@ func loadOrRegister(serverURL, configPath, enrollmentFile string) (*agentConfig,
 		if err := json.Unmarshal(data, &config); err != nil {
 			return nil, fmt.Errorf("read agent state: %w", err)
 		}
-		if serverURL != "" && strings.TrimRight(serverURL, "/") != strings.TrimRight(config.ServerURL, "/") {
-			return nil, errors.New("configured server URL does not match saved agent state")
+		existingURLs := config.GetAllServerURLs()
+		if len(parsedInputURLs) > 0 {
+			matched := false
+			for _, inURL := range parsedInputURLs {
+				for _, exURL := range existingURLs {
+					if inURL == exURL {
+						matched = true
+						break
+					}
+				}
+				if matched {
+					break
+				}
+			}
+			if !matched && len(existingURLs) > 0 {
+				return nil, errors.New("configured server URL does not match saved agent state")
+			}
+			config.ServerURLs = parsedInputURLs
+			config.ServerURL = parsedInputURLs[0]
 		}
 		if config.AgentID == "" || config.Credential == "" || config.BootID == "" {
 			return nil, errors.New("agent state is incomplete")
@@ -141,12 +212,8 @@ func loadOrRegister(serverURL, configPath, enrollmentFile string) (*agentConfig,
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	if serverURL == "" || enrollmentFile == "" {
+	if len(parsedInputURLs) == 0 || enrollmentFile == "" {
 		return nil, errors.New("first run requires -server and -enrollment-token-file")
-	}
-	parsedURL, err := url.Parse(serverURL)
-	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "https" && !(parsedURL.Scheme == "http" && (parsedURL.Hostname() == "localhost" || parsedURL.Hostname() == "127.0.0.1" || parsedURL.Hostname() == "::1"))) {
-		return nil, errors.New("server URL must use HTTPS (HTTP is allowed only for localhost development)")
 	}
 	tokenInfo, err := os.Stat(enrollmentFile)
 	if err != nil {
@@ -160,48 +227,73 @@ func loadOrRegister(serverURL, configPath, enrollmentFile string) (*agentConfig,
 		return nil, err
 	}
 	client := &http.Client{Timeout: 15 * time.Second}
-	body, _ := json.Marshal(map[string]string{
+	bodyData, _ := json.Marshal(map[string]string{
 		"enrollmentToken": strings.TrimSpace(string(token)),
 		"hostname":        hostname(),
 		"operatingSystem": runtime.GOOS + "/" + runtime.GOARCH,
 		"agentVersion":    agentVersion,
 	})
-	response, err := client.Post(strings.TrimRight(serverURL, "/")+"/api/v1/agents/register", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("register agent: %w", err)
+
+	var lastErr error
+	var registeredConfig *agentConfig
+	for i, targetURL := range parsedInputURLs {
+		response, err := client.Post(targetURL+"/api/v1/agents/register", "application/json", bytes.NewReader(bodyData))
+		if err != nil {
+			lastErr = fmt.Errorf("register agent on %s: %w", targetURL, err)
+			if i < len(parsedInputURLs)-1 {
+				fmt.Fprintf(os.Stderr, "registration failed on %s: %v, trying backup server %s...\n", targetURL, err, parsedInputURLs[i+1])
+			}
+			continue
+		}
+		responseBody, err := io.ReadAll(io.LimitReader(response.Body, 32<<10))
+		response.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read registration response from %s: %w", targetURL, err)
+			continue
+		}
+		if response.StatusCode != http.StatusCreated {
+			lastErr = fmt.Errorf("registration failed on %s with HTTP %d: %s", targetURL, response.StatusCode, safeError(responseBody))
+			if (response.StatusCode >= 500 || response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusServiceUnavailable) && i < len(parsedInputURLs)-1 {
+				fmt.Fprintf(os.Stderr, "registration failed on %s with HTTP %d, trying backup server %s...\n", targetURL, response.StatusCode, parsedInputURLs[i+1])
+				continue
+			}
+			return nil, lastErr
+		}
+		var result struct {
+			AgentID       string `json:"agentId"`
+			ResourceID    string `json:"resourceId"`
+			Credential    string `json:"credential"`
+			ConfigVersion int    `json:"configVersion"`
+		}
+		if err := json.Unmarshal(responseBody, &result); err != nil {
+			return nil, fmt.Errorf("decode registration response: %w", err)
+		}
+		bootID, err := newUUID()
+		if err != nil {
+			return nil, err
+		}
+		registeredConfig = &agentConfig{
+			ServerURL:       parsedInputURLs[0],
+			ServerURLs:      parsedInputURLs,
+			AgentID:         result.AgentID,
+			ResourceID:      result.ResourceID,
+			Credential:      result.Credential,
+			BootID:          bootID,
+			ConfigVersion:   result.ConfigVersion,
+			IntervalSeconds: 30,
+		}
+		break
 	}
-	defer response.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 32<<10))
-	if err != nil {
-		return nil, err
+	if registeredConfig == nil {
+		return nil, lastErr
 	}
-	if response.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("registration failed with HTTP %d: %s", response.StatusCode, safeError(responseBody))
-	}
-	var result struct {
-		AgentID       string `json:"agentId"`
-		ResourceID    string `json:"resourceId"`
-		Credential    string `json:"credential"`
-		ConfigVersion int    `json:"configVersion"`
-	}
-	if err := json.Unmarshal(responseBody, &result); err != nil {
-		return nil, fmt.Errorf("decode registration response: %w", err)
-	}
-	bootID, err := newUUID()
-	if err != nil {
-		return nil, err
-	}
-	config := &agentConfig{
-		ServerURL: strings.TrimRight(serverURL, "/"), AgentID: result.AgentID, ResourceID: result.ResourceID,
-		Credential: result.Credential, BootID: bootID, ConfigVersion: result.ConfigVersion, IntervalSeconds: 30,
-	}
-	if err := saveConfig(configPath, config); err != nil {
+	if err := saveConfig(configPath, registeredConfig); err != nil {
 		return nil, fmt.Errorf("save agent state: %w", err)
 	}
 	if err := os.Remove(enrollmentFile); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "warning: remove consumed enrollment token file: %v\n", err)
 	}
-	return config, nil
+	return registeredConfig, nil
 }
 
 func run(config *agentConfig, configPath string) error {
@@ -239,39 +331,58 @@ func run(config *agentConfig, configPath string) error {
 }
 
 func pollConfig(ctx context.Context, client *http.Client, config *agentConfig, state *collector) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, config.ServerURL+"/api/v1/agents/"+config.AgentID+"/config", nil)
-	if err != nil {
-		return err
+	urls := config.GetAllServerURLs()
+	if len(urls) == 0 {
+		return errors.New("no server URLs configured")
 	}
-	request.Header.Set("Authorization", "Bearer "+config.Credential)
-	response, err := client.Do(request)
-	if err != nil {
-		return err
+	var lastErr error
+	for i, targetURL := range urls {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL+"/api/v1/agents/"+config.AgentID+"/config", nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		request.Header.Set("Authorization", "Bearer "+config.Credential)
+		response, err := client.Do(request)
+		if err != nil {
+			lastErr = fmt.Errorf("server %s unreachable: %w", targetURL, err)
+			if i < len(urls)-1 {
+				fmt.Fprintf(os.Stderr, "config sync failed on %s: %v, trying backup server %s...\n", targetURL, err, urls[i+1])
+			}
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		response.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read response from %s: %w", targetURL, err)
+			continue
+		}
+		if response.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("config request to %s failed with HTTP %d: %s", targetURL, response.StatusCode, safeError(data))
+			if response.StatusCode >= 500 && i < len(urls)-1 {
+				fmt.Fprintf(os.Stderr, "config sync on %s returned HTTP %d, trying backup server %s...\n", targetURL, response.StatusCode, urls[i+1])
+				continue
+			}
+			return lastErr
+		}
+		var received agentRuntimeConfig
+		if err := json.Unmarshal(data, &received); err != nil {
+			return err
+		}
+		serverTime, err := time.Parse(time.RFC3339Nano, received.ServerTime)
+		if err != nil {
+			return fmt.Errorf("invalid server time: %w", err)
+		}
+		state.serverOffset = serverTime.Sub(time.Now())
+		if received.AgentID != config.AgentID || received.ResourceID != config.ResourceID || received.ConfigVersion < 1 {
+			return errors.New("server returned a config for a different agent")
+		}
+		config.ConfigVersion = received.ConfigVersion
+		config.IntervalSeconds = clampInterval(received.CollectionIntervalSeconds)
+		state.clockSynced = true
+		return nil
 	}
-	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
-	if err != nil {
-		return err
-	}
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("config request failed with HTTP %d: %s", response.StatusCode, safeError(data))
-	}
-	var received agentRuntimeConfig
-	if err := json.Unmarshal(data, &received); err != nil {
-		return err
-	}
-	serverTime, err := time.Parse(time.RFC3339Nano, received.ServerTime)
-	if err != nil {
-		return fmt.Errorf("invalid server time: %w", err)
-	}
-	state.serverOffset = serverTime.Sub(time.Now())
-	if received.AgentID != config.AgentID || received.ResourceID != config.ResourceID || received.ConfigVersion < 1 {
-		return errors.New("server returned a config for a different agent")
-	}
-	config.ConfigVersion = received.ConfigVersion
-	config.IntervalSeconds = clampInterval(received.CollectionIntervalSeconds)
-	state.clockSynced = true
-	return nil
+	return lastErr
 }
 
 func collectAndQueue(config *agentConfig, configPath string, state *collector) error {
@@ -297,6 +408,10 @@ func collectAndQueue(config *agentConfig, configPath string, state *collector) e
 
 func deliverQueued(client *http.Client, config *agentConfig, configPath string) error {
 	path := queuePath(configPath)
+	urls := config.GetAllServerURLs()
+	if len(urls) == 0 {
+		return errors.New("no server URLs configured")
+	}
 	for replayed := 0; replayed < maxReplayBatchesPerCycle; replayed++ {
 		entry, remainder, err := readFirstQueueEntry(path)
 		if errors.Is(err, os.ErrNotExist) {
@@ -309,23 +424,43 @@ func deliverQueued(client *http.Client, config *agentConfig, configPath string) 
 		if err != nil {
 			return err
 		}
-		request, err := http.NewRequest(http.MethodPost, config.ServerURL+"/api/v1/agents/"+config.AgentID+"/batches", bytes.NewReader(body))
-		if err != nil {
-			return err
+		delivered := false
+		var lastErr error
+		for i, targetURL := range urls {
+			request, err := http.NewRequest(http.MethodPost, targetURL+"/api/v1/agents/"+config.AgentID+"/batches", bytes.NewReader(body))
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			request.Header.Set("Authorization", "Bearer "+config.Credential)
+			request.Header.Set("Content-Type", "application/json")
+			response, err := client.Do(request)
+			if err != nil {
+				lastErr = fmt.Errorf("server %s unreachable: %w", targetURL, err)
+				if i < len(urls)-1 {
+					fmt.Fprintf(os.Stderr, "batch delivery failed on %s: %v, trying backup server %s...\n", targetURL, err, urls[i+1])
+				}
+				continue
+			}
+			responseBody, err := io.ReadAll(io.LimitReader(response.Body, 32<<10))
+			response.Body.Close()
+			if err != nil {
+				lastErr = fmt.Errorf("read response from %s: %w", targetURL, err)
+				continue
+			}
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				lastErr = fmt.Errorf("batch request to %s failed with HTTP %d: %s", targetURL, response.StatusCode, safeError(responseBody))
+				if response.StatusCode >= 500 && i < len(urls)-1 {
+					fmt.Fprintf(os.Stderr, "batch request to %s returned HTTP %d, trying backup server %s...\n", targetURL, response.StatusCode, urls[i+1])
+					continue
+				}
+				return lastErr
+			}
+			delivered = true
+			break
 		}
-		request.Header.Set("Authorization", "Bearer "+config.Credential)
-		request.Header.Set("Content-Type", "application/json")
-		response, err := client.Do(request)
-		if err != nil {
-			return err
-		}
-		responseBody, err := io.ReadAll(io.LimitReader(response.Body, 32<<10))
-		response.Body.Close()
-		if err != nil {
-			return err
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return fmt.Errorf("batch request failed with HTTP %d: %s", response.StatusCode, safeError(responseBody))
+		if !delivered {
+			return lastErr
 		}
 		if err := replaceQueue(path, remainder); err != nil {
 			return err

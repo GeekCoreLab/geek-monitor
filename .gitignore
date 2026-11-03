@@ -33,6 +33,9 @@ nb-configuration.xml
 *.orig
 *.rej
 
+# Build artifacts
+dist/
+
 # Local environment
 .env
 __pycache__/

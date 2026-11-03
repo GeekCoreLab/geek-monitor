@@ -144,3 +144,110 @@ func queuedLineCount(lines [][]byte) int {
 	}
 	return count
 }
+
+func TestParseServerURLs(t *testing.T) {
+	urls, err := parseServerURLs("https://s1.example.com", "https://s2.example.com,https://s3.example.com/", "")
+	if err != nil {
+		t.Fatalf("parseServerURLs: %v", err)
+	}
+	expected := []string{"https://s1.example.com", "https://s2.example.com", "https://s3.example.com"}
+	if !reflect.DeepEqual(urls, expected) {
+		t.Fatalf("unexpected parsed URLs: got %v, want %v", urls, expected)
+	}
+}
+
+func TestLoadOrRegisterFailoverToBackupServer(t *testing.T) {
+	primaryFailed := false
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryFailed = true
+		http.Error(w, "server unavailable", http.StatusServiceUnavailable)
+	}))
+	defer primary.Close()
+
+	backupHit := false
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHit = true
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"agentId":       "agent-failover",
+			"resourceId":    "res-failover",
+			"credential":    "cred-failover",
+			"configVersion": 1,
+		})
+	}))
+	defer backup.Close()
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	tokenPath := filepath.Join(t.TempDir(), "enrollment.token")
+	if err := os.WriteFile(tokenPath, []byte("token-backup\n"), 0600); err != nil {
+		t.Fatalf("write enrollment token: %v", err)
+	}
+
+	config, err := loadOrRegister(primary.URL+","+backup.URL, configPath, tokenPath)
+	if err != nil {
+		t.Fatalf("register with failover: %v", err)
+	}
+	if !primaryFailed || !backupHit {
+		t.Fatalf("expected primary to fail and backup to be hit: primaryFailed=%v backupHit=%v", primaryFailed, backupHit)
+	}
+	if config.AgentID != "agent-failover" {
+		t.Fatalf("unexpected agentId: %+v", config)
+	}
+	allURLs := config.GetAllServerURLs()
+	if len(allURLs) != 2 || allURLs[0] != primary.URL || allURLs[1] != backup.URL {
+		t.Fatalf("unexpected stored server URLs: %v", allURLs)
+	}
+}
+
+func TestDeliverQueuedFailoverToBackupServer(t *testing.T) {
+	primaryHitCount := 0
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHitCount++
+		http.Error(w, "primary down", http.StatusBadGateway)
+	}))
+	defer primary.Close()
+
+	var backupReceived []int64
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var receivedBatch batch
+		if err := json.NewDecoder(r.Body).Decode(&receivedBatch); err != nil {
+			http.Error(w, "invalid", http.StatusBadRequest)
+			return
+		}
+		backupReceived = append(backupReceived, receivedBatch.Sequence)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backup.Close()
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	config := &agentConfig{
+		ServerURL:  primary.URL,
+		ServerURLs: []string{primary.URL, backup.URL},
+		AgentID:    "agent-test",
+		Credential: "credential-test",
+	}
+	entry := batch{
+		BootID: "boot-test", Sequence: 1, SampledAt: time.Now().UTC().Format(time.RFC3339Nano),
+		ConfigVersion: 1, ClockSynced: true, Metrics: []metric{{Name: "load_1m", Value: 1.0}},
+	}
+	if err := appendQueue(queuePath(configPath), entry); err != nil {
+		t.Fatalf("append queue: %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	if err := deliverQueued(client, config, configPath); err != nil {
+		t.Fatalf("deliverQueued failover: %v", err)
+	}
+
+	if primaryHitCount == 0 {
+		t.Fatal("expected primary server to be attempted first")
+	}
+	if len(backupReceived) != 1 || backupReceived[0] != 1 {
+		t.Fatalf("expected backup server to receive batch: got %v", backupReceived)
+	}
+	// Queue should be empty now
+	first, _, err := readFirstQueueEntry(queuePath(configPath))
+	if err != nil || first != nil {
+		t.Fatalf("queue should be empty after backup accepted: first=%+v, err=%v", first, err)
+	}
+}

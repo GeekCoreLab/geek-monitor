@@ -3169,9 +3169,13 @@ class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
   late final TextEditingController _serverController = TextEditingController(
     text: Uri.base.origin,
   );
+  late final TextEditingController _backupController = TextEditingController();
+  int _downloadSource = 0; // 0: 当前监控中心, 1: GitHub Releases
+  int _toolType = 0; // 0: curl, 1: wget
 
-  String? get _serverUrl {
-    final value = _serverController.text.trim();
+  static String? _normalizeUrl(String raw) {
+    final value = raw.trim();
+    if (value.isEmpty) return null;
     final uri = Uri.tryParse(value);
     final authorityIsSafe =
         uri != null &&
@@ -3200,13 +3204,62 @@ class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
         : normalized;
   }
 
-  String get _installCommand =>
-      'curl -fsSL $_agentInstallScriptUrl | sudo bash -s -- --server '
-      '${_shellQuote(_serverUrl!)}';
+  String? get _serverUrl => _normalizeUrl(_serverController.text);
+
+  List<String> get _backupUrls {
+    final raw = _backupController.text.trim();
+    if (raw.isEmpty) return const [];
+    final parts = raw.split(RegExp(r'[,;\s]+'));
+    final valid = <String>[];
+    for (final part in parts) {
+      if (part.isEmpty) continue;
+      final normalized = _normalizeUrl(part);
+      if (normalized != null && !valid.contains(normalized)) {
+        valid.add(normalized);
+      }
+    }
+    return valid;
+  }
+
+  String? get _allServersString {
+    final main = _serverUrl;
+    if (main == null) return null;
+    final backups = _backupUrls;
+    if (backups.isEmpty) return main;
+    return '$main,${backups.join(",")}';
+  }
+
+  String get _installCommand {
+    final servers = _allServersString;
+    if (servers == null) return '';
+    final isSite = _downloadSource == 0;
+    final scriptUrl = isSite
+        ? '$_serverUrl/api/v1/agent-downloads/install-agent.sh'
+        : _agentInstallScriptUrl;
+    final sourceArg = isSite ? 'site' : 'github';
+    if (_toolType == 0) {
+      return 'curl -fsSL ${_shellQuote(scriptUrl)} | sudo bash -s -- --source $sourceArg --server ${_shellQuote(servers)}';
+    } else {
+      return 'wget -qO- ${_shellQuote(scriptUrl)} | sudo bash -s -- --source $sourceArg --server ${_shellQuote(servers)}';
+    }
+  }
+
+  String get _interactiveManualCommand {
+    final isSite = _downloadSource == 0;
+    final scriptUrl = isSite
+        ? '${_serverUrl ?? "https://monitor.example.com"}/api/v1/agent-downloads/install-agent.sh'
+        : _agentInstallScriptUrl;
+    if (_toolType == 0) {
+      return 'curl -fsSL -O ${_shellQuote(scriptUrl)} && sudo bash install-agent.sh';
+    } else {
+      return 'wget -O install-agent.sh ${_shellQuote(scriptUrl)} && sudo bash install-agent.sh';
+    }
+  }
 
   @override
   void dispose() {
     _serverController.dispose();
+    _backupController.dispose();
     super.dispose();
   }
 
@@ -3224,7 +3277,7 @@ class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
     return AlertDialog(
       title: const Text('安装 Linux Agent'),
       content: SizedBox(
-        width: 560,
+        width: 620,
         child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -3243,36 +3296,129 @@ class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
                 controller: _serverController,
                 onChanged: (_) => setState(() {}),
                 decoration: const InputDecoration(
-                  labelText: '监控中心地址',
+                  labelText: '监控中心主地址',
                   hintText: 'https://monitor.example.com',
                   helperText: '目标主机必须能访问此地址；生产环境请使用 HTTPS。',
                 ),
                 keyboardType: TextInputType.url,
               ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _backupController,
+                onChanged: (_) => setState(() {}),
+                decoration: const InputDecoration(
+                  labelText: '备用监控地址（可选）',
+                  hintText: 'https://backup.example.com (多个以逗号分隔)',
+                  helperText: '当主地址无法上报或网络故障时，Agent 将自动切换至备用地址。',
+                ),
+                keyboardType: TextInputType.url,
+              ),
               const SizedBox(height: 14),
               const Text(
-                '在目标 Linux 主机执行以下命令。命令不含注册令牌；运行时会在终端隐藏提示输入。',
-                style: TextStyle(fontSize: 12, height: 1.5),
+                '二进制下载源：',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  ChoiceChip(
+                    label: const Text('从当前监控中心下载（推荐）'),
+                    selected: _downloadSource == 0,
+                    onSelected: (selected) {
+                      if (selected) setState(() => _downloadSource = 0);
+                    },
+                  ),
+                  const SizedBox(width: 8),
+                  ChoiceChip(
+                    label: const Text('从 GitHub Releases 下载'),
+                    selected: _downloadSource == 1,
+                    onSelected: (selected) {
+                      if (selected) setState(() => _downloadSource = 1);
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  const Text(
+                    '命令行下载工具：',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(width: 8),
+                  ChoiceChip(
+                    label: const Text('curl'),
+                    selected: _toolType == 0,
+                    onSelected: (selected) {
+                      if (selected) setState(() => _toolType = 0);
+                    },
+                  ),
+                  const SizedBox(width: 8),
+                  ChoiceChip(
+                    label: const Text('wget'),
+                    selected: _toolType == 1,
+                    onSelected: (selected) {
+                      if (selected) setState(() => _toolType = 1);
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                '一键安装命令（在目标 Linux 主机执行）：',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 6),
               if (serverUrl == null)
                 const Text(
-                  '请输入 HTTPS 地址；HTTP 仅允许 localhost、127.0.0.1 或 ::1。',
+                  '请输入有效的 HTTPS 监控中心主地址；HTTP 仅允许 localhost、127.0.0.1 或 ::1。',
                   style: TextStyle(color: _red, fontSize: 11),
                 )
               else
-                SelectableText(
-                  _installCommand,
-                  style: const TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 11,
-                    height: 1.5,
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: SelectableText(
+                    _installCommand,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 11,
+                      color: Color(0xFFE2E8F0),
+                      height: 1.5,
+                    ),
                   ),
                 ),
               const SizedBox(height: 8),
-              const Text(
-                '安装脚本从 GitHub 最新 Release 下载 Linux amd64/arm64 二进制并校验 SHA-256，然后创建受限系统账号和 systemd 服务。',
-                style: TextStyle(color: _muted, fontSize: 11, height: 1.45),
+              Text(
+                _downloadSource == 0
+                    ? '说明：从当前监控站点直接下载二进制及校验哈希，无需访问公网 GitHub。执行命令后会在终端提示输入注册令牌。'
+                    : '说明：从 GitHub Releases 下载最新发行版二进制并校验哈希。若目标主机国内网络连接 GitHub 受限，建议使用当前监控站点下载。',
+                style: const TextStyle(color: _muted, fontSize: 11, height: 1.45),
+              ),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: _canvas,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFFE2E8F0)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.info_outline, size: 16, color: _blue),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '支持交互式向导：执行 $_interactiveManualCommand 即可进入终端向导，按提示完成配置。',
+                        style: const TextStyle(fontSize: 11, color: _ink),
+                      ),
+                    ),
+                  ],
+                ),
               ),
               const Divider(height: 24),
               const Text(
@@ -3280,9 +3426,22 @@ class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 6),
-              SelectableText(
-                widget.token,
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF1F5F9),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: SelectableText(
+                  widget.token,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: _ink,
+                  ),
+                ),
               ),
             ],
           ),
@@ -3292,9 +3451,9 @@ class _AgentEnrollmentDialogState extends State<_AgentEnrollmentDialog> {
         TextButton.icon(
           onPressed: serverUrl == null
               ? null
-              : () => _copy(_installCommand, '安装命令已复制'),
+              : () => _copy(_installCommand, '一键安装命令已复制'),
           icon: const Icon(Icons.terminal_rounded, size: 17),
-          label: const Text('复制安装命令'),
+          label: const Text('复制一键命令'),
         ),
         TextButton.icon(
           onPressed: () => _copy(widget.token, '注册令牌已复制，请安全传递'),
