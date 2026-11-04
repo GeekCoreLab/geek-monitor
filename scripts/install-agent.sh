@@ -105,10 +105,7 @@ while (($#)); do
   esac
 done
 
-# If executed via pipe (e.g. curl ... | sudo bash), reconnect stdin to terminal
-if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
-  exec </dev/tty
-fi
+# Stdin must remain intact for piped bash execution (e.g. curl ... | sudo bash -s)
 
 # Ensure root permissions
 if ((EUID != 0)); then
@@ -141,9 +138,38 @@ download_file() {
   fi
 }
 
+# Helper for interactive prompt reading from /dev/tty if available
+read_input() {
+  local prompt_msg="$1"
+  local target_var="$2"
+  local silent="${3:-0}"
+  local val=""
+
+  if [[ -n "$prompt_msg" ]]; then
+    printf "%s" "$prompt_msg"
+  fi
+
+  local -a read_opts=(-r)
+  if ((silent == 1)); then
+    read_opts+=(-s)
+  fi
+
+  if { true </dev/tty; } 2>/dev/null; then
+    IFS= read "${read_opts[@]}" val </dev/tty || true
+  else
+    IFS= read "${read_opts[@]}" val 2>/dev/null || true
+  fi
+
+  if ((silent == 1)); then
+    printf '\n'
+  fi
+
+  printf -v "$target_var" '%s' "$val"
+}
+
 # Determine if we should enter interactive wizard
 can_interactive=0
-if [[ -t 0 || -r /dev/tty ]] && ((non_interactive == 0)); then
+if ({ true </dev/tty; } 2>/dev/null || [[ -t 0 ]]) && ((non_interactive == 0)); then
   can_interactive=1
 fi
 
@@ -159,8 +185,7 @@ if [[ -z "$server_url" ]]; then
     exit 2
   fi
   while true; do
-    printf "[1/4] 请输入监控中心主地址 (例如 https://monitor.example.com): "
-    read -r input_server
+    read_input "[1/4] 请输入监控中心主地址 (例如 https://monitor.example.com): " input_server
     input_server="$(echo "$input_server" | tr -d ' ')"
     if [[ -z "$input_server" ]]; then
       echo "  提示: 监控中心地址不能为空"
@@ -193,8 +218,7 @@ primary_server="${primary_server%/}"
 
 # 2. Backup servers prompt
 if [[ -z "$backup_servers" ]] && ((can_interactive == 1)) && [[ "$server_url" != *","* ]]; then
-  printf "[2/4] 请输入备用监控中心地址 (可选，多个以逗号分隔，直接回车跳过): "
-  read -r input_backups
+  read_input "[2/4] 请输入备用监控中心地址 (可选，多个以逗号分隔，直接回车跳过): " input_backups
   input_backups="$(echo "$input_backups" | tr -d ' ')"
   if [[ -n "$input_backups" ]]; then
     IFS=',' read -ra BACKUP_LIST <<< "$input_backups"
@@ -223,8 +247,7 @@ if [[ -z "$download_source" ]]; then
     echo "[3/4] 请选择 Agent 二进制下载源:"
     echo "  1) 从当前监控中心下载 [推荐，无需公网访问 GitHub]"
     echo "  2) 从 GitHub Releases 下载"
-    printf "请选择 [1/2] (默认: 1): "
-    read -r choice_source
+    read_input "请选择 [1/2] (默认: 1): " choice_source
     case "$choice_source" in
       2) download_source="github" ;;
       *) download_source="site" ;;
@@ -241,17 +264,11 @@ fi
 
 # 4. Enrollment token prompt
 if [[ -z "$enrollment_token" ]]; then
-  if [[ ! -r /dev/tty && ! -t 0 ]]; then
+  if ! { true </dev/tty; } 2>/dev/null && [[ ! -t 0 ]]; then
     echo "错误: 需要交互终端输入一次性注册令牌，或使用 --token 参数传递" >&2
     exit 1
   fi
-  printf "[4/4] 请输入一次性注册令牌 (输入内容已隐藏): "
-  if [[ -r /dev/tty ]]; then
-    IFS= read -r -s enrollment_token </dev/tty || true
-  else
-    IFS= read -r -s enrollment_token || true
-  fi
-  printf '\n'
+  read_input "[4/4] 请输入一次性注册令牌 (输入内容已隐藏): " enrollment_token 1
 fi
 
 enrollment_token="$(echo "$enrollment_token" | tr -d ' \r\n')"
@@ -285,8 +302,7 @@ echo "----------------------------------------------------------"
 if [[ -s /var/lib/geek-monitor/agent.json ]]; then
   echo "警告: /var/lib/geek-monitor/agent.json 已存在已有注册状态。"
   if ((can_interactive == 1)); then
-    printf "是否覆盖并重新注册? [y/N]: "
-    read -r confirm_overwrite
+    read_input "是否覆盖并重新注册? [y/N]: " confirm_overwrite
     if [[ "$confirm_overwrite" != "y" && "$confirm_overwrite" != "Y" ]]; then
       echo "操作已取消。"
       exit 0
