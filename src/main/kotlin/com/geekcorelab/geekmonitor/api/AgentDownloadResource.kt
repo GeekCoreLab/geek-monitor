@@ -38,7 +38,7 @@ class AgentDownloadResource {
         }
 
         if (filename == "install-agent.sh") {
-            val scriptFile = findFile("install-agent.sh", listOf(binaryDir, "dist", "scripts"))
+            val scriptFile = findFile("install-agent.sh", if (binaryDir != "dist" && binaryDir.isNotBlank()) listOf(binaryDir, "scripts") else listOf(binaryDir, "dist", "scripts"))
             if (scriptFile != null && scriptFile.exists() && scriptFile.isFile) {
                 return Response.ok(scriptFile)
                     .type("text/x-shellscript; charset=utf-8")
@@ -59,7 +59,7 @@ class AgentDownloadResource {
         }
 
         if (filename == "SHA256SUMS") {
-            val sumsFile = findFile("SHA256SUMS", listOf(binaryDir, "dist"))
+            val sumsFile = findFile("SHA256SUMS", if (binaryDir != "dist" && binaryDir.isNotBlank()) listOf(binaryDir) else listOf(binaryDir, "dist"))
             if (sumsFile != null && sumsFile.exists() && sumsFile.isFile) {
                 return Response.ok(sumsFile)
                     .type("text/plain; charset=utf-8")
@@ -73,7 +73,7 @@ class AgentDownloadResource {
                 .build()
         }
 
-        val binaryFile = findFile(filename, listOf(binaryDir, "dist", "agent"))
+        val binaryFile = findFile(filename, if (binaryDir != "dist" && binaryDir.isNotBlank()) listOf(binaryDir) else listOf(binaryDir, "dist", "agent"))
         if (binaryFile != null && binaryFile.exists() && binaryFile.isFile) {
             return Response.ok(binaryFile)
                 .type(MediaType.APPLICATION_OCTET_STREAM)
@@ -105,7 +105,7 @@ class AgentDownloadResource {
     private fun generateSha256Sums(): String {
         val lines = mutableListOf<String>()
         val targets = listOf("geek-monitor-agent-linux-amd64", "geek-monitor-agent-linux-arm64", "install-agent.sh")
-        val dirs = listOf(binaryDir, "dist", "scripts", "agent")
+        val dirs = if (binaryDir != "dist" && binaryDir.isNotBlank()) listOf(binaryDir) else listOf(binaryDir, "dist", "scripts", "agent")
         for (target in targets) {
             val file = findFile(target, dirs)
             if (file != null && file.exists() && file.isFile) {
