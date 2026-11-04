@@ -3600,7 +3600,7 @@ class _MetricsDialogState extends State<_MetricsDialog> {
                                   Map<String, dynamic>.from(point as Map),
                             )
                             .toList();
-                        return _MetricChartCard(
+                        return MetricChartCard(
                           metricName: item['metricName'] as String? ?? '',
                           labels: labels,
                           points: points,
@@ -3622,8 +3622,60 @@ class _MetricsDialogState extends State<_MetricsDialog> {
   }
 }
 
-class _MetricChartCard extends StatelessWidget {
-  const _MetricChartCard({
+String _formatMetricValue(String metricName, double value) {
+  if (metricName.endsWith('_percent')) {
+    return '${value.toStringAsFixed(1)}%';
+  }
+  if (metricName.contains('bytes_per_second')) {
+    if (value >= 1024 * 1024 * 1024) {
+      return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB/s';
+    }
+    if (value >= 1024 * 1024) {
+      return '${(value / (1024 * 1024)).toStringAsFixed(2)} MB/s';
+    }
+    if (value >= 1024) {
+      return '${(value / 1024).toStringAsFixed(1)} KB/s';
+    }
+    return '${value.toStringAsFixed(0)} B/s';
+  }
+  if (metricName.endsWith('_bytes')) {
+    if (value >= 1024 * 1024 * 1024) {
+      return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+    }
+    if (value >= 1024 * 1024) {
+      return '${(value / (1024 * 1024)).toStringAsFixed(2)} MB';
+    }
+    if (value >= 1024) {
+      return '${(value / 1024).toStringAsFixed(1)} KB';
+    }
+    return '${value.toStringAsFixed(0)} B';
+  }
+  if (metricName.startsWith('load_')) {
+    return value.toStringAsFixed(2);
+  }
+  if (value == value.roundToDouble()) {
+    return '${value.toInt()}';
+  }
+  return value.toStringAsFixed(2);
+}
+
+class _MetricPointData {
+  const _MetricPointData({
+    required this.time,
+    required this.average,
+    required this.minimum,
+    required this.maximum,
+    required this.sampleCount,
+  });
+  final DateTime time;
+  final double average;
+  final double minimum;
+  final double maximum;
+  final int sampleCount;
+}
+
+class MetricChartCard extends StatefulWidget {
+  const MetricChartCard({
     required this.metricName,
     required this.labels,
     required this.points,
@@ -3635,13 +3687,98 @@ class _MetricChartCard extends StatelessWidget {
   final int stepSeconds;
 
   @override
+  State<MetricChartCard> createState() => _MetricChartCardState();
+}
+
+class _MetricChartCardState extends State<MetricChartCard> {
+  int? _hoveredIndex;
+
+  List<_MetricPointData> _parsePoints() {
+    final list = <_MetricPointData>[];
+    for (final point in widget.points) {
+      final time = DateTime.tryParse(point['bucketAt'] as String? ?? '');
+      final avg = (point['average'] as num?)?.toDouble();
+      final min = (point['minimum'] as num?)?.toDouble() ?? avg;
+      final max = (point['maximum'] as num?)?.toDouble() ?? avg;
+      final count = (point['sampleCount'] as num?)?.toInt() ?? 1;
+      if (time != null && avg != null && avg.isFinite) {
+        list.add(_MetricPointData(
+          time: time.toLocal(),
+          average: avg,
+          minimum: min ?? avg,
+          maximum: max ?? avg,
+          sampleCount: count,
+        ));
+      }
+    }
+    return list;
+  }
+
+  void _updateHover(Offset localPosition, double chartLeft, double chartWidth, List<_MetricPointData> parsed) {
+    if (parsed.isEmpty || chartWidth <= 0) {
+      if (_hoveredIndex != null) setState(() => _hoveredIndex = null);
+      return;
+    }
+    final relativeX = (localPosition.dx - chartLeft).clamp(0.0, chartWidth);
+    final ratio = relativeX / chartWidth;
+    final start = parsed.first.time.millisecondsSinceEpoch;
+    final end = parsed.last.time.millisecondsSinceEpoch;
+    final span = end - start;
+    if (span <= 0) {
+      setState(() => _hoveredIndex = 0);
+      return;
+    }
+    final targetTime = start + (span * ratio).round();
+    int bestIndex = 0;
+    int minDiff = (parsed[0].time.millisecondsSinceEpoch - targetTime).abs();
+    for (int i = 1; i < parsed.length; i++) {
+      final diff = (parsed[i].time.millisecondsSinceEpoch - targetTime).abs();
+      if (diff < minDiff) {
+        minDiff = diff;
+        bestIndex = i;
+      }
+    }
+    if (_hoveredIndex != bestIndex) {
+      setState(() => _hoveredIndex = bestIndex);
+    }
+  }
+
+  String _formatDateTime(DateTime dt) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    return '${dt.year}-${twoDigits(dt.month)}-${twoDigits(dt.day)} ${twoDigits(dt.hour)}:${twoDigits(dt.minute)}:${twoDigits(dt.second)}';
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final label = labels.entries
+    final label = widget.labels.entries
         .map((entry) => '${entry.key}: ${entry.value}')
         .join(' · ');
+    final parsed = _parsePoints();
+
+    double? curVal;
+    double? minVal;
+    double? maxVal;
+    double? avgVal;
+    _MetricPointData? activePoint;
+
+    if (parsed.isNotEmpty) {
+      minVal = parsed.map((e) => e.minimum).reduce((a, b) => a < b ? a : b);
+      maxVal = parsed.map((e) => e.maximum).reduce((a, b) => a > b ? a : b);
+      final sum = parsed.map((e) => e.average).reduce((a, b) => a + b);
+      avgVal = sum / parsed.length;
+
+      if (_hoveredIndex != null && _hoveredIndex! >= 0 && _hoveredIndex! < parsed.length) {
+        activePoint = parsed[_hoveredIndex!];
+        curVal = activePoint.average;
+      } else {
+        activePoint = parsed.last;
+        curVal = activePoint.average;
+      }
+    }
+
     return Card(
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 11, 14, 9),
+        padding: const EdgeInsets.fromLTRB(14, 11, 14, 10),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -3649,7 +3786,7 @@ class _MetricChartCard extends StatelessWidget {
               children: [
                 Expanded(
                   child: Text(
-                    _metricName(metricName),
+                    _metricName(widget.metricName),
                     style: const TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w700,
@@ -3663,15 +3800,85 @@ class _MetricChartCard extends StatelessWidget {
                   ),
               ],
             ),
+            const SizedBox(height: 6),
+            if (parsed.isNotEmpty && curVal != null)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF8FAFC),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFFEDF2F7)),
+                ),
+                child: Wrap(
+                  alignment: WrapAlignment.spaceBetween,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 12,
+                  runSpacing: 4,
+                  children: [
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _hoveredIndex != null ? '选定点数值: ' : '最新数值: ',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: _hoveredIndex != null ? _blue : _muted,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          _formatMetricValue(widget.metricName, curVal),
+                          style: const TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w800,
+                            color: _blue,
+                          ),
+                        ),
+                        if (activePoint != null) ...[
+                          const SizedBox(width: 6),
+                          Text(
+                            '(${_formatDateTime(activePoint.time)})',
+                            style: const TextStyle(fontSize: 10, color: _muted),
+                          ),
+                        ],
+                      ],
+                    ),
+                    if (maxVal != null && minVal != null && avgVal != null)
+                      Text(
+                        '最高: ${_formatMetricValue(widget.metricName, maxVal)} · 最低: ${_formatMetricValue(widget.metricName, minVal)} · 平均: ${_formatMetricValue(widget.metricName, avgVal)}',
+                        style: const TextStyle(fontSize: 10, color: _muted),
+                      ),
+                  ],
+                ),
+              ),
             const SizedBox(height: 8),
             SizedBox(
-              height: 140,
-              child: CustomPaint(
-                painter: _MetricChartPainter(
-                  points: points,
-                  stepSeconds: stepSeconds,
-                ),
-                child: const SizedBox.expand(),
+              height: 160,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  const leftMargin = 52.0;
+                  const rightMargin = 12.0;
+                  final chartWidth = (constraints.maxWidth - leftMargin - rightMargin < 10.0) ? 10.0 : (constraints.maxWidth - leftMargin - rightMargin);
+                  return MouseRegion(
+                    cursor: SystemMouseCursors.precise,
+                    onHover: (event) => _updateHover(event.localPosition, leftMargin, chartWidth, parsed),
+                    onExit: (_) => setState(() => _hoveredIndex = null),
+                    child: GestureDetector(
+                      onTapDown: (details) => _updateHover(details.localPosition, leftMargin, chartWidth, parsed),
+                      onPanUpdate: (details) => _updateHover(details.localPosition, leftMargin, chartWidth, parsed),
+                      onPanEnd: (_) => setState(() => _hoveredIndex = null),
+                      child: CustomPaint(
+                        painter: _MetricChartPainter(
+                          metricName: widget.metricName,
+                          points: parsed,
+                          stepSeconds: widget.stepSeconds,
+                          hoveredIndex: _hoveredIndex,
+                        ),
+                        child: const SizedBox.expand(),
+                      ),
+                    ),
+                  );
+                },
               ),
             ),
           ],
@@ -3682,98 +3889,209 @@ class _MetricChartCard extends StatelessWidget {
 }
 
 class _MetricChartPainter extends CustomPainter {
-  _MetricChartPainter({required this.points, required this.stepSeconds});
-  final List<Map<String, dynamic>> points;
+  _MetricChartPainter({
+    required this.metricName,
+    required this.points,
+    required this.stepSeconds,
+    this.hoveredIndex,
+  });
+  final String metricName;
+  final List<_MetricPointData> points;
   final int stepSeconds;
+  final int? hoveredIndex;
 
   @override
   void paint(Canvas canvas, Size size) {
-    const left = 8.0;
-    const right = 8.0;
-    const top = 8.0;
-    const bottom = 8.0;
+    const left = 52.0;
+    const right = 12.0;
+    const top = 10.0;
+    const bottom = 22.0;
     final chart = Rect.fromLTRB(
       left,
       top,
       size.width - right,
       size.height - bottom,
     );
+
+    if (points.isEmpty) return;
+
+    final start = points.first.time;
+    final end = points.last.time;
+    var minValue = points.map((e) => e.average).reduce((a, b) => a < b ? a : b);
+    var maxValue = points.map((e) => e.average).reduce((a, b) => a > b ? a : b);
+    if (minValue == maxValue) {
+      minValue = (minValue - 1 < 0.0) ? 0.0 : (minValue - 1);
+      maxValue += 1;
+    }
+    if (metricName.endsWith('_percent') && minValue > 0 && minValue < 20) {
+      minValue = 0;
+    }
+
+    final span = maxValue - minValue;
+    final duration = end.difference(start).inMilliseconds;
+
     final gridPaint = Paint()
-      ..color = const Color(0xFFE8EDF2)
+      ..color = const Color(0xFFE2E8F0)
       ..strokeWidth = 1;
+
     for (var index = 0; index <= 3; index++) {
       final y = chart.top + chart.height * index / 3;
       canvas.drawLine(Offset(chart.left, y), Offset(chart.right, y), gridPaint);
+
+      final val = maxValue - span * index / 3;
+      final textSpan = TextSpan(
+        text: _formatMetricValue(metricName, val),
+        style: const TextStyle(
+          color: Color(0xFF64748B),
+          fontSize: 9,
+          fontWeight: FontWeight.w500,
+        ),
+      );
+      final tp = TextPainter(
+        text: textSpan,
+        textAlign: TextAlign.right,
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: left - 6);
+      tp.paint(canvas, Offset(chart.left - tp.width - 6, y - tp.height / 2));
     }
-    final parsed = <(DateTime, double)>[];
-    for (final point in points) {
-      final time = DateTime.tryParse(point['bucketAt'] as String? ?? '');
-      final value = (point['average'] as num?)?.toDouble();
-      if (time != null && value != null && value.isFinite) {
-        parsed.add((time, value));
-      }
+
+    String formatHm(DateTime dt) {
+      String twoDigits(int n) => n.toString().padLeft(2, '0');
+      return '${twoDigits(dt.month)}-${twoDigits(dt.day)} ${twoDigits(dt.hour)}:${twoDigits(dt.minute)}';
     }
-    if (parsed.isEmpty) {
-      return;
-    }
-    final start = parsed.first.$1;
-    final end = parsed.last.$1;
-    var minValue = parsed
-        .map((value) => value.$2)
-        .reduce((a, b) => a < b ? a : b);
-    var maxValue = parsed
-        .map((value) => value.$2)
-        .reduce((a, b) => a > b ? a : b);
-    if (minValue == maxValue) {
-      minValue -= 1;
-      maxValue += 1;
-    }
-    final span = maxValue - minValue;
-    final duration = end.difference(start).inMilliseconds;
-    Offset position((DateTime, double) item) {
+
+    final startTp = TextPainter(
+      text: TextSpan(
+        text: formatHm(start),
+        style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 9),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    startTp.paint(canvas, Offset(chart.left, chart.bottom + 4));
+
+    final endTp = TextPainter(
+      text: TextSpan(
+        text: formatHm(end),
+        style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 9),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    endTp.paint(canvas, Offset(chart.right - endTp.width, chart.bottom + 4));
+
+    Offset position(_MetricPointData item) {
       final x = duration <= 0
           ? chart.center.dx
           : chart.left +
-                chart.width *
-                    item.$1.difference(start).inMilliseconds /
-                    duration;
-      final y = chart.bottom - chart.height * (item.$2 - minValue) / span;
+              chart.width *
+                  item.time.difference(start).inMilliseconds /
+                  duration;
+      final y = chart.bottom - chart.height * (item.average - minValue) / span;
       return Offset(x, y);
     }
 
     final linePaint = Paint()
       ..color = _blue
-      ..strokeWidth = 2.2
+      ..strokeWidth = 2.0
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
+
+    final fillPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          _blue.withValues(alpha: 0.20),
+          _blue.withValues(alpha: 0.02),
+        ],
+      ).createShader(chart)
+      ..style = PaintingStyle.fill;
+
     final pointPaint = Paint()
       ..color = _blue
       ..style = PaintingStyle.fill;
+
     var path = Path();
-    var priorTime = parsed.first.$1;
+    var areaPath = Path();
+    var priorTime = points.first.time;
     var hasSegment = false;
-    for (var index = 0; index < parsed.length; index++) {
-      final item = parsed[index];
+    Offset? segmentStart;
+
+    for (var index = 0; index < points.length; index++) {
+      final item = points[index];
       final current = position(item);
-      final gap = item.$1.difference(priorTime).inSeconds;
+      final gap = item.time.difference(priorTime).inSeconds;
+
       if (index == 0 || gap > stepSeconds * 1.5) {
-        if (hasSegment) canvas.drawPath(path, linePaint);
+        if (hasSegment && segmentStart != null) {
+          areaPath.lineTo(position(points[index - 1]).dx, chart.bottom);
+          areaPath.lineTo(segmentStart.dx, chart.bottom);
+          areaPath.close();
+          canvas.drawPath(areaPath, fillPaint);
+          canvas.drawPath(path, linePaint);
+        }
+        segmentStart = current;
         path = Path()..moveTo(current.dx, current.dy);
+        areaPath = Path()..moveTo(current.dx, current.dy);
         hasSegment = false;
       } else {
         path.lineTo(current.dx, current.dy);
+        areaPath.lineTo(current.dx, current.dy);
         hasSegment = true;
       }
-      canvas.drawCircle(current, 2.4, pointPaint);
-      priorTime = item.$1;
+
+      if (points.length <= 80) {
+        canvas.drawCircle(current, 2.0, pointPaint);
+      }
+      priorTime = item.time;
     }
-    if (hasSegment) canvas.drawPath(path, linePaint);
+
+    if (hasSegment && segmentStart != null) {
+      areaPath.lineTo(position(points.last).dx, chart.bottom);
+      areaPath.lineTo(segmentStart.dx, chart.bottom);
+      areaPath.close();
+      canvas.drawPath(areaPath, fillPaint);
+      canvas.drawPath(path, linePaint);
+    }
+
+    if (hoveredIndex != null && hoveredIndex! >= 0 && hoveredIndex! < points.length) {
+      final hoveredItem = points[hoveredIndex!];
+      final targetOffset = position(hoveredItem);
+
+      final crosshairPaint = Paint()
+        ..color = _blue.withValues(alpha: 0.4)
+        ..strokeWidth = 1.2
+        ..style = PaintingStyle.stroke;
+      canvas.drawLine(
+        Offset(targetOffset.dx, chart.top),
+        Offset(targetOffset.dx, chart.bottom),
+        crosshairPaint,
+      );
+
+      final outerRingPaint = Paint()
+        ..color = _blue.withValues(alpha: 0.25)
+        ..style = PaintingStyle.fill;
+      canvas.drawCircle(targetOffset, 6.5, outerRingPaint);
+
+      final innerCirclePaint = Paint()
+        ..color = Colors.white
+        ..style = PaintingStyle.fill;
+      canvas.drawCircle(targetOffset, 3.5, innerCirclePaint);
+
+      final innerBorderPaint = Paint()
+        ..color = _blue
+        ..strokeWidth = 2.0
+        ..style = PaintingStyle.stroke;
+      canvas.drawCircle(targetOffset, 3.5, innerBorderPaint);
+    }
   }
 
   @override
   bool shouldRepaint(covariant _MetricChartPainter oldDelegate) =>
-      oldDelegate.points != points || oldDelegate.stepSeconds != stepSeconds;
+      oldDelegate.points != points ||
+      oldDelegate.stepSeconds != stepSeconds ||
+      oldDelegate.hoveredIndex != hoveredIndex ||
+      oldDelegate.metricName != metricName;
 }
 
 String _metricName(String value) => switch (value) {
@@ -6862,6 +7180,15 @@ class _ProjectCredentialDialogState extends State<_ProjectCredentialDialog> {
   );
 }
 
+List<String> availableMonitorTypesForResource(String resourceType) => switch (resourceType) {
+  'HOST' => const ['METRIC_THRESHOLD', 'TCP', 'HTTP', 'TLS', 'DNS'],
+  'DATABASE' => const ['POSTGRESQL', 'MYSQL', 'REDIS', 'METRIC_THRESHOLD'],
+  'HEARTBEAT' => const ['HEARTBEAT'],
+  'WEBSITE' => const ['HTTP', 'TLS', 'DNS', 'TCP'],
+  'SERVICE' => const ['TCP', 'HTTP', 'DNS', 'TLS'],
+  _ => const ['HTTP', 'TCP', 'DNS', 'TLS'],
+};
+
 class _MonitorDialog extends StatefulWidget {
   const _MonitorDialog({
     required this.api,
@@ -6877,6 +7204,27 @@ class _MonitorDialog extends StatefulWidget {
 }
 
 class _MonitorDialogState extends State<_MonitorDialog> {
+
+  void _suggestInheritedProperties(Map<String, dynamic> res) {
+    final resName = (res['name'] as String? ?? '').trim();
+    if (resName.isNotEmpty) {
+      if (_name.text.isEmpty) {
+        _name.text = '$resName - ${_monitorTypeName(_type)}';
+      }
+      if (_type != 'METRIC_THRESHOLD' && _type != 'HEARTBEAT' && _target.text.isEmpty) {
+        if (_type == 'HTTP') {
+          if (resName.startsWith('http://') || resName.startsWith('https://')) {
+            _target.text = resName;
+          } else {
+            _target.text = 'https://$resName';
+          }
+        } else {
+          _target.text = resName;
+        }
+      }
+    }
+  }
+
   final _formKey = GlobalKey<FormState>();
   late String _type = widget.existing?['type'] as String? ?? 'HTTP';
   late String _resourceId =
@@ -6988,6 +7336,17 @@ class _MonitorDialogState extends State<_MonitorDialog> {
   @override
   void initState() {
     super.initState();
+    if (widget.existing == null) {
+      final currentRes = widget.resources.firstWhere(
+        (resource) => resource['id'] == _resourceId,
+        orElse: () => widget.resources.first,
+      );
+      final available = availableMonitorTypesForResource(currentRes['type'] as String? ?? '');
+      if (!available.contains(_type)) {
+        _type = available.first;
+      }
+      _suggestInheritedProperties(currentRes);
+    }
     _reloadProjectCredentials();
   }
 
@@ -7291,7 +7650,20 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     .toList(),
                 onChanged: (value) {
                   if (value == null) return;
-                  setState(() => _resourceId = value);
+                  final nextRes = widget.resources.firstWhere(
+                    (resource) => resource['id'] == value,
+                    orElse: () => const <String, dynamic>{},
+                  );
+                  setState(() {
+                    _resourceId = value;
+                    final available = availableMonitorTypesForResource(nextRes['type'] as String? ?? '');
+                    if (!available.contains(_type)) {
+                      _changeType(available.first);
+                    }
+                    if (widget.existing == null) {
+                      _suggestInheritedProperties(nextRes);
+                    }
+                  });
                   _reloadProjectCredentials();
                 },
               ),
@@ -7299,71 +7671,33 @@ class _MonitorDialogState extends State<_MonitorDialog> {
               DropdownButtonFormField<String>(
                 initialValue: _type,
                 decoration: const InputDecoration(labelText: '检查类型'),
-                items: widget.existing?['type'] == 'HEARTBEAT'
-                    ? const [
-                        DropdownMenuItem(
-                          value: 'HEARTBEAT',
-                          child: Text('心跳任务'),
-                        ),
-                      ]
-                    : const {
-                        'POSTGRESQL',
-                        'MYSQL',
-                        'REDIS',
-                      }.contains(widget.existing?['type'])
-                    ? [
-                        DropdownMenuItem(
-                          value: widget.existing!['type'] as String,
-                          child: Text(
-                            _monitorTypeName(
-                              widget.existing!['type'] as String,
-                            ),
-                          ),
-                        ),
-                      ]
-                    : [
-                        const DropdownMenuItem(
-                          value: 'HTTP',
-                          child: Text('HTTP/HTTPS'),
-                        ),
-                        const DropdownMenuItem(
-                          value: 'TCP',
-                          child: Text('TCP 端口'),
-                        ),
-                        const DropdownMenuItem(
-                          value: 'DNS',
-                          child: Text('DNS 记录'),
-                        ),
-                        const DropdownMenuItem(
-                          value: 'TLS',
-                          child: Text('TLS 证书'),
-                        ),
-                        const DropdownMenuItem(
-                          value: 'METRIC_THRESHOLD',
-                          child: Text('主机指标阈值'),
-                        ),
-                        const DropdownMenuItem(
-                          value: 'POSTGRESQL',
-                          child: Text('PostgreSQL'),
-                        ),
-                        const DropdownMenuItem(
-                          value: 'MYSQL',
-                          child: Text('MySQL'),
-                        ),
-                        const DropdownMenuItem(
-                          value: 'REDIS',
-                          child: Text('Redis'),
-                        ),
-                        if (widget.existing == null)
-                          const DropdownMenuItem(
-                            value: 'HEARTBEAT',
-                            child: Text('心跳任务'),
-                          ),
-                      ],
-                onChanged: (value) {
-                  if (value == null) return;
-                  _changeType(value);
-                },
+                items: (widget.existing != null
+                    ? [_type]
+                    : availableMonitorTypesForResource(
+                        (widget.resources.firstWhere(
+                              (r) => r['id'] == _resourceId,
+                              orElse: () => const <String, dynamic>{},
+                            )['type'] as String? ??
+                            ''),
+                      ))
+                    .map(
+                      (type) => DropdownMenuItem(
+                        value: type,
+                        child: Text(_monitorTypeName(type)),
+                      ),
+                    )
+                    .toList(),
+                onChanged: widget.existing != null
+                    ? null
+                    : (value) {
+                        if (value == null) return;
+                        _changeType(value);
+                        final currentRes = widget.resources.firstWhere(
+                          (r) => r['id'] == _resourceId,
+                          orElse: () => const <String, dynamic>{},
+                        );
+                        _suggestInheritedProperties(currentRes);
+                      },
               ),
               const SizedBox(height: 11),
               TextFormField(
@@ -7560,7 +7894,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                     ],
                   ),
                 ),
-              ] else if (_type != 'HEARTBEAT') ...[
+              ] else if (_type != 'HEARTBEAT' && _type != 'METRIC_THRESHOLD') ...[
                 TextFormField(
                   controller: _target,
                   keyboardType: TextInputType.url,
@@ -7748,30 +8082,35 @@ class _MonitorDialogState extends State<_MonitorDialog> {
                   ),
                 ),
                 const SizedBox(height: 11),
-                DropdownButtonFormField<String>(
-                  initialValue: _metricName,
-                  decoration: const InputDecoration(labelText: '监控指标'),
-                  items: _thresholdMetricNames
-                      .map(
-                        (metric) => DropdownMenuItem(
-                          value: metric,
-                          child: Text(_metricDisplayName(metric)),
-                        ),
-                      )
-                      .toList(),
-                  onChanged: (value) {
-                    if (value == null) return;
-                    final compatibleResource = widget.resources.firstWhere(
-                      (resource) =>
-                          resource['type'] == _metricResourceType(value),
+                Builder(
+                  builder: (context) {
+                    final currentRes = widget.resources.firstWhere(
+                      (r) => r['id'] == _resourceId,
                       orElse: () => const <String, dynamic>{},
                     );
-                    setState(() {
-                      _metricName = value;
-                      if (compatibleResource.isNotEmpty) {
-                        _resourceId = compatibleResource['id'] as String;
-                      }
-                    });
+                    final isDb = currentRes['type'] == 'DATABASE';
+                    final allowedMetrics = _thresholdMetricNames
+                        .where((m) => isDb ? _isDatabaseMetric(m) : !_isDatabaseMetric(m))
+                        .toList();
+                    final selectedMetric = allowedMetrics.contains(_metricName)
+                        ? _metricName
+                        : (allowedMetrics.isNotEmpty ? allowedMetrics.first : _metricName);
+                    return DropdownButtonFormField<String>(
+                      initialValue: selectedMetric,
+                      decoration: const InputDecoration(labelText: '监控指标'),
+                      items: allowedMetrics
+                          .map(
+                            (metric) => DropdownMenuItem(
+                              value: metric,
+                              child: Text(_metricDisplayName(metric)),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (value) {
+                        if (value == null) return;
+                        setState(() => _metricName = value);
+                      },
+                    );
                   },
                 ),
                 const SizedBox(height: 11),
@@ -8069,7 +8408,7 @@ class _MonitorDialogState extends State<_MonitorDialog> {
         type: _type,
         resourceId: _resourceId,
         name: _name.text.trim(),
-        target: _target.text.trim(),
+        target: _type == 'METRIC_THRESHOLD' || _type == 'HEARTBEAT' ? '' : _target.text.trim(),
         method: _method,
         allowPostNoSideEffects: _allowPostNoSideEffects,
         credentialId: _credentialId,

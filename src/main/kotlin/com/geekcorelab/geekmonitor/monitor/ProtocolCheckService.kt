@@ -207,7 +207,7 @@ class ProtocolCheckService {
             } ?: return result("UNKNOWN", "AGENT_NOT_ACTIVE", "Agent 已吊销或不存在")
             val ageSeconds = Duration.between(lastSeenAt, checkedAt).seconds.coerceAtLeast(0)
             if (ageSeconds > AGENT_OFFLINE_AFTER_SECONDS) {
-                result("DOWN", "AGENT_OFFLINE", "Agent 已有 $ageSeconds 秒未上报；依赖该 Agent 的指标缺报事件已抑制")
+                result("DOWN", "AGENT_OFFLINE", "Agent 已有 $ageSeconds 秒未上报，主机可能已失联或停止运行")
             } else {
                 result("UP", null, "Agent 最近一次上报于 $ageSeconds 秒前")
             }
@@ -313,13 +313,13 @@ class ProtocolCheckService {
                         statement.executeQuery().use { rows -> rows.next(); rows.getTimestamp(1)?.toInstant() }
                     }
                     if (agentLastSeen == null) {
-                        return result("UNKNOWN", "AGENT_NOT_REGISTERED", "尚未注册有效 Agent，指标缺报事件已抑制")
+                        return result("DOWN", "AGENT_NOT_REGISTERED", "主机尚未注册有效 Agent，无法采集指标数据")
                     }
                     val agentAgeSeconds = Duration.between(agentLastSeen, checkedAt).seconds.coerceAtLeast(0)
                     if (agentAgeSeconds > AGENT_OFFLINE_AFTER_SECONDS) {
-                        return result("UNKNOWN", "AGENT_OFFLINE", "Agent 已有 $agentAgeSeconds 秒未上报，指标缺报事件已抑制")
+                        return result("DOWN", "AGENT_OFFLINE", "Agent 已有 $agentAgeSeconds 秒未上报，主机可能已失联或停止工作")
                     }
-                    return result("UNKNOWN", "METRIC_DATA_INSUFFICIENT", "指标样本覆盖不足或窗口内存在过大空洞，无法评估阈值")
+                    return result("DOWN", "METRIC_DATA_INSUFFICIENT", "指标样本长时间未上报或窗口内存在过大空洞，视为采集异常")
                 }
 
                 val breached = series.any { sampleSeries -> when (operator) {
