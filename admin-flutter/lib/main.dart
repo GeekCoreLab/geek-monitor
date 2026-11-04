@@ -3676,6 +3676,7 @@ class _MetricPointData {
 
 class MetricChartCard extends StatefulWidget {
   const MetricChartCard({
+    super.key,
     required this.metricName,
     required this.labels,
     required this.points,
