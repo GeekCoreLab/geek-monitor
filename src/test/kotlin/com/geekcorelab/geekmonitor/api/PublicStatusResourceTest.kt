@@ -44,6 +44,33 @@ class PublicStatusResourceTest {
     }
 
     @Test
+    fun `public responses include connect-src self in Content-Security-Policy header`() {
+        val resourceId = UUID.randomUUID()
+        val projectId = UUID.randomUUID()
+        val mockData = listOf(
+            MockRow(
+                id = resourceId,
+                name = "核心 API 服务",
+                tags = """["生产环境"]""",
+                healthStatus = "UP",
+                paused = false,
+                type = "HTTP",
+                enabled = true,
+                currentState = "UP",
+            ),
+        )
+        val resource = PublicStatusResource().apply {
+            dataSource = mockDataSource(mockData)
+            objectMapper = ObjectMapper()
+        }
+        val response = resource.data(projectId.toString(), null)
+        assertEquals(200, response.status)
+        val csp = response.headers.getFirst("Content-Security-Policy")?.toString()
+        assertNotNull(csp)
+        assertTrue(csp!!.contains("connect-src 'self'"), "CSP should permit connect-src 'self', got: $csp")
+    }
+
+    @Test
     fun `returns 404 for invalid project id`() {
         val resource = PublicStatusResource().apply {
             dataSource = mockDataSource(emptyList())
@@ -63,7 +90,7 @@ class PublicStatusResourceTest {
             MockRow(
                 id = resourceId,
                 name = "核心 API 服务",
-                tags = "[\"生产环境\"]",
+                tags = """["生产环境"]""",
                 healthStatus = "UP",
                 paused = false,
                 type = "HTTP",

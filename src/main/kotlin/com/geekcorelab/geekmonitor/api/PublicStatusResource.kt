@@ -70,7 +70,7 @@ class PublicStatusResource {
         .type(mediaType)
         .header("Cache-Control", "no-store")
         .header("X-Content-Type-Options", "nosniff")
-        .header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+        .header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
         .header("Referrer-Policy", "no-referrer")
         .header("X-Robots-Tag", "noindex, nofollow")
         .build()
