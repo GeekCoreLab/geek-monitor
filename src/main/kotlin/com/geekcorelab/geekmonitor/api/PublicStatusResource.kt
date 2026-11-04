@@ -9,6 +9,7 @@ import jakarta.inject.Inject
 import jakarta.ws.rs.GET
 import jakarta.ws.rs.Path
 import jakarta.ws.rs.PathParam
+import jakarta.ws.rs.QueryParam
 import jakarta.ws.rs.Produces
 import jakarta.ws.rs.core.MediaType
 import jakarta.ws.rs.core.Response
@@ -30,26 +31,38 @@ class PublicStatusResource {
     @GET
     @Path("/{projectId}")
     @Produces(MediaType.TEXT_HTML)
-    fun page(@PathParam("projectId") projectIdText: String): Response {
+    fun page(
+        @PathParam("projectId") projectIdText: String,
+        @QueryParam("range") rangeText: String?,
+    ): Response {
         val projectId = runCatching { UUID.fromString(projectIdText) }.getOrNull()
             ?: return unavailable()
-        val snapshot = loadStatus(projectId) ?: return unavailable()
+        val range = PublicRange.from(rangeText)
+        val snapshot = loadStatus(projectId, range) ?: return unavailable()
         val body = template.data("groups", snapshot.groups)
             .data("projectId", projectId.toString())
             .data("updatedAt", snapshot.updatedAt)
             .data("historyStart", snapshot.historyStart)
             .data("historyEnd", snapshot.historyEnd)
-            .data("count", snapshot.count).render()
+            .data("count", snapshot.count)
+            .data("range", snapshot.range)
+            .data("historyHeading", snapshot.historyHeading)
+            .data("historyAriaSuffix", snapshot.historyAriaSuffix)
+            .render()
         return publicResponse(body, MediaType.TEXT_HTML)
     }
 
     @GET
     @Path("/{projectId}/data")
     @Produces(MediaType.APPLICATION_JSON)
-    fun data(@PathParam("projectId") projectIdText: String): Response {
+    fun data(
+        @PathParam("projectId") projectIdText: String,
+        @QueryParam("range") rangeText: String?,
+    ): Response {
         val projectId = runCatching { UUID.fromString(projectIdText) }.getOrNull()
             ?: return unavailableJson()
-        val snapshot = loadStatus(projectId) ?: return unavailableJson()
+        val range = PublicRange.from(rangeText)
+        val snapshot = loadStatus(projectId, range) ?: return unavailableJson()
         return publicResponse(objectMapper.writeValueAsString(snapshot), MediaType.APPLICATION_JSON)
     }
 
@@ -62,12 +75,12 @@ class PublicStatusResource {
         .header("X-Robots-Tag", "noindex, nofollow")
         .build()
 
-    private fun loadStatus(projectId: UUID): PublicStatusData? {
+    internal fun loadStatus(projectId: UUID, range: PublicRange = PublicRange.RANGE_24H): PublicStatusData? {
         val resources = linkedMapOf<UUID, PublicResource>()
         val now = Instant.now()
-        val currentSlotStart = Instant.ofEpochSecond(now.epochSecond / SLOT_SECONDS * SLOT_SECONDS)
-        val historyStartAt = currentSlotStart.minusSeconds((HISTORY_SLOTS - 1L) * SLOT_SECONDS)
-        val historyEndAt = currentSlotStart.plusSeconds(SLOT_SECONDS)
+        val currentSlotStart = Instant.ofEpochSecond(now.epochSecond / range.slotSeconds * range.slotSeconds)
+        val historyStartAt = currentSlotStart.minusSeconds((range.slots - 1L) * range.slotSeconds)
+        val historyEndAt = currentSlotStart.plusSeconds(range.slotSeconds)
         val historyTotals = mutableMapOf<UUID, MutableMap<Instant, PublicSlotTotals>>()
         val maintenanceWindows = mutableListOf<PublicMaintenanceWindow>()
         dataSource.connection.use { connection ->
@@ -95,9 +108,10 @@ class PublicStatusResource {
                 }
             }
             if (resources.isNotEmpty()) {
+                val intervalLiteral = if (range == PublicRange.RANGE_30D) "2 hours" else "1 hour"
                 connection.prepareStatement(
                     """SELECT m.resource_id,
-                              date_bin(INTERVAL '2 hours', a.bucket_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS slot_at,
+                              date_bin(INTERVAL '$intervalLiteral', a.bucket_at, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS slot_at,
                               SUM(a.up_seconds) AS up_seconds, SUM(a.degraded_seconds) AS degraded_seconds,
                               SUM(a.down_seconds) AS down_seconds
                        FROM availability_rollup a
@@ -168,9 +182,9 @@ class PublicStatusResource {
                 resource.state = "MAINTENANCE"
                 resource.status = "维护中"
             }
-            resource.history = (0 until HISTORY_SLOTS).map { offset ->
-                val slot = historyStartAt.plusSeconds(offset * SLOT_SECONDS)
-                val slotEnd = minOf(slot.plusSeconds(SLOT_SECONDS), now)
+            resource.history = (0 until range.slots).map { offset ->
+                val slot = historyStartAt.plusSeconds(offset * range.slotSeconds)
+                val slotEnd = minOf(slot.plusSeconds(range.slotSeconds), now)
                 val maintenance = maintenanceWindows.any { window ->
                     (window.resourceId == null || window.resourceId == resourceId) &&
                         window.startsAt < slotEnd && window.effectiveEndsAt > slot
@@ -193,6 +207,9 @@ class PublicStatusResource {
             historyStart = SCALE_TIME.format(historyStartAt),
             historyEnd = SCALE_TIME.format(now),
             count = resources.size,
+            range = range.code,
+            historyHeading = range.heading,
+            historyAriaSuffix = range.ariaLabelSuffix,
         )
     }
 
@@ -237,14 +254,42 @@ class PublicStatusResource {
     )
 
     companion object {
-        private const val HISTORY_DAYS = 30
-        private const val HISTORY_SLOTS = HISTORY_DAYS * 12
-        private const val SLOT_SECONDS = 2L * 60 * 60
         private val PUBLIC_WINDOW_STATUSES = setOf("ACTIVE", "SCHEDULED")
         private val DISPLAY_TIME = DateTimeFormatter.ofPattern("yyyy年M月d日 HH:mm", Locale.CHINA)
             .withZone(ZoneId.of("Asia/Shanghai"))
         private val SCALE_TIME = DateTimeFormatter.ofPattern("M月d日 HH:mm", Locale.CHINA)
             .withZone(ZoneId.of("Asia/Shanghai"))
+    }
+}
+
+enum class PublicRange(
+    val code: String,
+    val label: String,
+    val heading: String,
+    val ariaLabelSuffix: String,
+    val slots: Int,
+    val slotSeconds: Long,
+) {
+    RANGE_24H(
+        code = "24h",
+        label = "24 小时",
+        heading = "过去 24 小时 · 每格 1 小时",
+        ariaLabelSuffix = "过去 24 小时的状态历史，每格 1 小时",
+        slots = 24,
+        slotSeconds = 3600L,
+    ),
+    RANGE_30D(
+        code = "30d",
+        label = "30 天",
+        heading = "过去 30 天 · 每格 2 小时",
+        ariaLabelSuffix = "过去 30 天的状态历史，每格 2 小时",
+        slots = 360,
+        slotSeconds = 7200L,
+    );
+
+    companion object {
+        fun from(value: String?): PublicRange =
+            if (value != null && value.trim().equals("30d", ignoreCase = true)) RANGE_30D else RANGE_24H
     }
 }
 
@@ -257,6 +302,9 @@ data class PublicStatusData(
     val historyStart: String,
     val historyEnd: String,
     val count: Int,
+    val range: String,
+    val historyHeading: String,
+    val historyAriaSuffix: String,
 )
 @TemplateData
 data class PublicResource(val name: String, val tags: List<String>, var state: String, var status: String,

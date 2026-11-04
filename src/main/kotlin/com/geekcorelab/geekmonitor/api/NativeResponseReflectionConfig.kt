@@ -35,6 +35,7 @@ import io.quarkus.runtime.annotations.RegisterForReflection
         AuditLogPageResponse::class,
         RetentionPolicy::class,
         PublicStatusData::class,
+        PublicRange::class,
         PublicGroup::class,
         PublicResource::class,
         PublicMethod::class,
